@@ -39,6 +39,8 @@
     Install only for Cursor.
 .PARAMETER Gemini
     Install only for Gemini CLI. With no agent switch, every detected agent is installed.
+.PARAMETER Antigravity
+    Install only for Google Antigravity.
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +53,8 @@ param(
     [switch]$Claude,
     [switch]$Codex,
     [switch]$Cursor,
-    [switch]$Gemini
+    [switch]$Gemini,
+    [switch]$Antigravity
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,12 +89,15 @@ Write-Host "Rogue Security (Windows)" -ForegroundColor Cyan
 # every supported agent. claude/codex ship a CLI on PATH; Cursor's `cursor` command is
 # opt-in, so detection also accepts %USERPROFILE%\.cursor. An explicitly selected CLI
 # agent still needs its binary; Cursor is a plain file copy, so it installs regardless.
-$explicit = $Claude -or $Codex -or $Cursor -or $Gemini
+# Antigravity has no `antigravity` binary on PATH — detect the `agy` CLI or its data
+# dirs under %USERPROFILE%\.gemini (IDE and/or manual-CLI installs).
+$explicit = $Claude -or $Codex -or $Cursor -or $Gemini -or $Antigravity
 if ($explicit) {
     $hasClaude = [bool]$Claude
     $hasCodex  = [bool]$Codex
     $hasCursor = [bool]$Cursor
     $hasGemini = [bool]$Gemini
+    $hasAntigravity = [bool]$Antigravity
     if ($hasClaude -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
         Die "-Claude requested but the 'claude' CLI is not on PATH. Install Claude Code (https://claude.com/code) first."
     }
@@ -101,13 +107,17 @@ if ($explicit) {
     if ($hasGemini -and -not (Get-Command gemini -ErrorAction SilentlyContinue)) {
         Die "-Gemini requested but the 'gemini' CLI is not on PATH. Install Gemini CLI (https://geminicli.com) first."
     }
+    if ($hasAntigravity -and -not ((Get-Command agy -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.gemini\antigravity*')))) {
+        Die "-Antigravity requested but no Antigravity install was detected (looked for: agy CLI, %USERPROFILE%\.gemini\antigravity*). Install Google Antigravity first."
+    }
 } else {
     $hasClaude = [bool](Get-Command claude -ErrorAction SilentlyContinue)
     $hasCodex  = [bool](Get-Command codex  -ErrorAction SilentlyContinue)
     $hasCursor = [bool](Get-Command cursor -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.cursor'))
     $hasGemini = [bool](Get-Command gemini -ErrorAction SilentlyContinue)
-    if (-not ($hasClaude -or $hasCodex -or $hasCursor -or $hasGemini)) {
-        Die "No supported coding agent found (looked for: claude, codex, cursor, gemini). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), or Gemini CLI (https://geminicli.com) first."
+    $hasAntigravity = [bool](Get-Command agy -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.gemini\antigravity*'))
+    if (-not ($hasClaude -or $hasCodex -or $hasCursor -or $hasGemini -or $hasAntigravity)) {
+        Die "No supported coding agent found (looked for: claude, codex, cursor, gemini, antigravity). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), or Google Antigravity first."
     }
 }
 # Claude shells out to git to clone the marketplace; git is required only for it.
@@ -327,6 +337,70 @@ if ($hasGemini) {
         Warn2 'Gemini skips untrusted hooks - open /hooks in Gemini CLI and trust the Rogue entries once, then restart Gemini CLI.'
     } catch {
         Warn2 "Gemini extension not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Antigravity has no marketplace-add command. Like Gemini, the release tarball's
+# top dir IS the plugin (manifest at its root — see scripts/build-release.sh), so
+# download it, extract with `tar` (bundled in Windows 10+), and copy it into the
+# IDE's global plugin dir (%USERPROFILE%\.gemini\config\plugins\rogue). If the
+# `agy` CLI is present, also register it natively (uninstall-then-install so a
+# re-run upgrades); otherwise, if a manual-CLI plugins dir exists, copy there too.
+# Non-fatal: a failed Antigravity install must not abort the run.
+if ($hasAntigravity) {
+    Write-Host ""
+    Write-Host "Rogue Security - Google Antigravity" -ForegroundColor Cyan
+    $asset = 'rogue-plugin-antigravity.tar.gz'
+    if ($env:ROGUE_PLUGIN_VERSION) {
+        $url = "https://github.com/$PluginRepo/releases/download/$($env:ROGUE_PLUGIN_VERSION)/$asset"
+    } else {
+        $url = "https://github.com/$PluginRepo/releases/latest/download/$asset"
+    }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rogue-antigravity-" + [System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        Log "Downloading plugin $asset"
+        $tarball = Join-Path $tmp 'p.tar.gz'
+        Invoke-WebRequest -Uri $url -OutFile $tarball -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        & tar -xzf $tarball -C $tmp
+        if ($LASTEXITCODE -ne 0) { throw "Could not extract the Antigravity plugin tarball (is 'tar' available?)." }
+        $src = Get-ChildItem -Path $tmp -Recurse -File -Filter 'plugin.json' |
+            Where-Object { Test-Path (Join-Path $_.Directory.FullName 'hooks.json') } |
+            Select-Object -First 1
+        if (-not $src) { throw "Antigravity plugin manifest missing in download." }
+        $srcDir = $src.Directory.FullName
+
+        # IDE global copy.
+        $ideDir = Join-Path $env:USERPROFILE '.gemini\config\plugins\rogue'
+        if (Test-Path $ideDir) { Remove-Item -Recurse -Force $ideDir }
+        New-Item -ItemType Directory -Path $ideDir -Force | Out-Null
+        Copy-Item -Recurse -Force (Join-Path $srcDir '*') $ideDir
+        Ok "Plugin installed -> $ideDir"
+
+        # CLI: native install if `agy` is present, else manual copy if the CLI dir exists.
+        if (Get-Command agy -ErrorAction SilentlyContinue) {
+            try { & agy plugin uninstall rogue 2>&1 | Out-Null } catch {}
+            & agy plugin install $srcDir 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Ok "Plugin installed via agy plugin install"
+            } else {
+                Warn2 "agy plugin install failed. Run 'agy plugin install $srcDir' to see the error."
+            }
+        } else {
+            $cliPlugins = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\plugins'
+            if (Test-Path $cliPlugins) {
+                $cliDir = Join-Path $cliPlugins 'rogue'
+                if (Test-Path $cliDir) { Remove-Item -Recurse -Force $cliDir }
+                New-Item -ItemType Directory -Path $cliDir -Force | Out-Null
+                Copy-Item -Recurse -Force (Join-Path $srcDir '*') $cliDir
+                Ok "Plugin installed -> $cliDir"
+            }
+        }
+        Warn2 'Fully quit and reopen Antigravity, then run /rogue:status to verify.'
+    } catch {
+        Warn2 "Antigravity plugin not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
     } finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     }

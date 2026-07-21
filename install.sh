@@ -29,6 +29,7 @@
 #   --codex                install only for OpenAI Codex
 #   --cursor               install only for Cursor
 #   --gemini               install only for Gemini CLI
+#   --antigravity          install only for Google Antigravity
 #                          (no agent flag = auto-detect and install for every agent found)
 #   --api-key=KEY          same as ROGUE_API_KEY
 #   --actor-email=EMAIL    same as ROGUE_ACTOR_EMAIL
@@ -103,12 +104,13 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 # main() detects each agent via `have_cmd <bin>` and runs its installer. Add an
 # agent = one detect line in main() + one `<id>_install_plugin` function.
 #
-#   id        label          detect                installer
-#   ────────  ─────────────  ────────────────────  ──────────────
-#   claude    Claude Code    command:claude        install_claude   ← implemented
-#   codex     Codex CLI      command:codex         install_codex    ← implemented
-#   cursor    Cursor         command:cursor|~/.cursor  install_cursor ← implemented
-#   gemini    Gemini CLI     command:gemini        install_gemini   ← implemented
+#   id           label                detect                        installer
+#   ───────────  ───────────────────  ────────────────────────────  ──────────────
+#   claude       Claude Code          command:claude                install_claude       ← implemented
+#   codex        Codex CLI            command:codex                 install_codex        ← implemented
+#   cursor       Cursor               command:cursor|~/.cursor      install_cursor       ← implemented
+#   gemini       Gemini CLI           command:gemini                install_gemini       ← implemented
+#   antigravity  Google Antigravity   command:agy|~/.gemini/antigravity*  install_antigravity ← implemented
 #
 # Claude and Codex install via their native plugin CLIs (which git-clone the
 # marketplace). Cursor has NO plugin CLI — install is a file copy into
@@ -116,7 +118,9 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 # and copies the plugin tree (see cursor_install_plugin). Gemini HAS a native
 # extension CLI but expects the manifest at a source root — so gemini_install_extension
 # downloads the release tarball (whose top dir IS the extension) and runs
-# `gemini extensions install <dir>` (see gemini_install_extension).
+# `gemini extensions install <dir>` (see gemini_install_extension). Antigravity is
+# a copy-a-directory install (into ~/.gemini/config/plugins/rogue) PLUS the native
+# `agy plugin install` when the `agy` CLI is present (see antigravity_install_plugin).
 
 # ── Marketplace + plugin install (Claude) ─────────────────────────────────────
 claude_install_plugin() {
@@ -264,6 +268,66 @@ gemini_install_extension() {
   else
     warn "gemini extensions install failed. Run 'gemini extensions install $src' to see the error."
     return 1
+  fi
+}
+
+# ── Copy-a-directory install (Google Antigravity) ─────────────────────────────
+# Antigravity has no marketplace-add command. Like Gemini, the release tarball's
+# top dir IS the plugin (manifest at its root — see scripts/build-release.sh), so
+# we download it, extract it, and copy it into the IDE's global plugin dir
+# (~/.gemini/config/plugins/rogue). If the `agy` CLI is present we additionally
+# register it natively (uninstall-then-install so a re-run upgrades); otherwise,
+# if a manual-CLI plugins dir exists, copy there too. Returns non-zero (never
+# `die`s) so a missing asset can't abort a run that already installed other agents.
+antigravity_install_plugin() {
+  local tmp asset url src ide_dir cli_dir
+  asset="rogue-plugin-antigravity.tar.gz"
+  if [ -n "${ROGUE_PLUGIN_VERSION:-}" ]; then
+    url="https://github.com/${ROGUE_PLUGIN_REPO}/releases/download/${ROGUE_PLUGIN_VERSION}/${asset}"
+  else
+    url="https://github.com/${ROGUE_PLUGIN_REPO}/releases/latest/download/${asset}"
+  fi
+
+  tmp="$(mktemp -d)" || { warn "Could not create a temp dir for the Antigravity download."; return 1; }
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  note "Downloading plugin ${C_DIM}${asset}${C_RESET}"
+  if ! curl -fsSL --max-time 60 -o "$tmp/p.tar.gz" "$url"; then
+    warn "Antigravity plugin asset not available yet ($url) — skipping Antigravity. Re-run the installer once it's published."
+    return 1
+  fi
+  mkdir -p "$tmp/extract"
+  tar -xzf "$tmp/p.tar.gz" -C "$tmp/extract" \
+    || { warn "Could not extract the Antigravity plugin tarball — skipping Antigravity."; return 1; }
+
+  # The tarball stages a top dir (rogue-plugin-antigravity/) whose ROOT is the plugin.
+  src="$(find "$tmp/extract" -maxdepth 2 -type f -name plugin.json -exec dirname {} \; | head -1)"
+  [ -n "$src" ] && [ -f "$src/hooks.json" ] \
+    || { warn "Antigravity plugin manifest missing in download — skipping Antigravity."; return 1; }
+
+  # IDE global copy.
+  ide_dir="$HOME/.gemini/config/plugins/${PLUGIN_NAME}"
+  mkdir -p "$(dirname "$ide_dir")"
+  rm -rf "$ide_dir"
+  mkdir -p "$ide_dir"
+  cp -R "$src/." "$ide_dir/"
+  ok "Plugin installed → ${C_DIM}$ide_dir${C_RESET}"
+
+  # CLI: native install if `agy` is present, else manual copy if the CLI dir exists.
+  if have_cmd agy; then
+    agy plugin uninstall "$PLUGIN_NAME" >/dev/null 2>&1 || true
+    if agy plugin install "$src" >/dev/null 2>&1; then
+      ok "Plugin installed via ${C_DIM}agy plugin install${C_RESET}"
+    else
+      warn "agy plugin install failed. Run 'agy plugin install $src' to see the error."
+    fi
+  elif [ -d "$HOME/.gemini/antigravity-cli/plugins" ]; then
+    cli_dir="$HOME/.gemini/antigravity-cli/plugins/${PLUGIN_NAME}"
+    rm -rf "$cli_dir"
+    mkdir -p "$cli_dir"
+    cp -R "$src/." "$cli_dir/"
+    ok "Plugin installed → ${C_DIM}$cli_dir${C_RESET}"
   fi
 }
 
@@ -524,10 +588,18 @@ install_gemini() {
   fi
 }
 
+install_antigravity() {
+  printf '\n%sRogue Security%s — Google Antigravity\n' "$C_TEAL" "$C_RESET" >&2
+  # Non-fatal: a failed Antigravity install must not abort the run (see antigravity_install_plugin).
+  if antigravity_install_plugin; then
+    note "Fully quit and reopen Antigravity, then run ${C_DIM}/rogue:status${C_RESET} to verify."
+  fi
+}
+
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 # Accepts `--flag=value` and `--flag value`. Sets the same globals the env knobs
 # do, so the rest of the script is flag-agnostic. CLI flags override env vars.
-usage() { sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,41p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; }
 
 parse_args() {
   while [ "$#" -gt 0 ]; do
@@ -545,6 +617,7 @@ parse_args() {
       --codex)           WANT="$WANT codex" ;;
       --cursor)          WANT="$WANT cursor" ;;
       --gemini)          WANT="$WANT gemini" ;;
+      --antigravity)     WANT="$WANT antigravity" ;;
       --non-interactive) NON_INTERACTIVE=1 ;;
       --no-statusline)   ROGUE_NO_STATUSLINE=1 ;;
       -h|--help)         usage; exit 0 ;;
@@ -569,17 +642,23 @@ main() {
         codex)  have_cmd codex  || die "--codex requested but the 'codex' CLI is not on PATH. Install OpenAI Codex first." ;;
         cursor) : ;;
         gemini) have_cmd gemini || die "--gemini requested but the 'gemini' CLI is not on PATH. Install Gemini CLI (https://geminicli.com) first." ;;
+        antigravity)
+          { have_cmd agy || [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.gemini/antigravity-ide" ] || [ -d "$HOME/.gemini/antigravity-cli" ]; } \
+            || die "--antigravity requested but no Antigravity install was detected (looked for: agy CLI, ~/.gemini/antigravity*). Install Google Antigravity first." ;;
       esac
     done
   else
     # Auto-detect every supported agent. claude/codex ship a CLI on PATH; Cursor's
     # `cursor` shell command is opt-in, so also accept the presence of ~/.cursor.
+    # Antigravity has no `antigravity` binary on PATH — detect the `agy` CLI or its
+    # data dirs under ~/.gemini (IDE and/or manual-CLI installs).
     agents=""
     have_cmd claude && agents="$agents claude"
     have_cmd codex  && agents="$agents codex"
     { have_cmd cursor || [ -d "$HOME/.cursor" ]; } && agents="$agents cursor"
     have_cmd gemini && agents="$agents gemini"
-    [ -n "$agents" ] || die "No supported coding agent found (looked for: claude, codex, cursor, gemini). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), or Gemini CLI (https://geminicli.com) first."
+    { have_cmd agy || [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.gemini/antigravity-ide" ] || [ -d "$HOME/.gemini/antigravity-cli" ]; } && agents="$agents antigravity"
+    [ -n "$agents" ] || die "No supported coding agent found (looked for: claude, codex, cursor, gemini, antigravity). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), or Google Antigravity first."
   fi
 
   # Credentials once — every plugin reads the shared ~/.rogue-env.
@@ -587,10 +666,11 @@ main() {
 
   for a in $agents; do
     case "$a" in
-      claude) install_claude ;;
-      codex)  install_codex ;;
-      cursor) install_cursor ;;
-      gemini) install_gemini ;;
+      claude)      install_claude ;;
+      codex)       install_codex ;;
+      cursor)      install_cursor ;;
+      gemini)      install_gemini ;;
+      antigravity) install_antigravity ;;
     esac
   done
 
