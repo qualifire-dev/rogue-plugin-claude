@@ -209,6 +209,117 @@ function Wait-TranscriptFlush {
     }
 }
 
+# ── Subagent re-attribution (mirrors hook.sh's reattribute_subagent) ───────
+# An Antigravity subagent runs as its own conversation and its events carry no
+# parent reference, so persisted verbatim they orphan into a separate audit
+# session. The link is in the PARENT transcript's INVOKE_SUBAGENT row (which
+# lists the spawned conversationIds); the parent id IS that transcript's
+# directory name. That row is written before the subagent's first hook can fire,
+# so no flush retry is needed. Subagent ids are ordinary UUIDs — indistinguish-
+# able from a main conversation — so the verdict is cached per conversation BOTH
+# ways ('main' for ordinary ones) to keep it at one scan per conversation.
+# Fail-open: unresolved → payload untouched.
+$subagentId = ''
+$subagentName = ''
+$brainDir = $env:ROGUE_ANTIGRAVITY_BRAIN_DIR
+if (-not $brainDir) { $brainDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\brain' }
+$submapDir = $env:ROGUE_ANTIGRAVITY_SUBMAP_DIR
+if (-not $submapDir) { $submapDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'antigravity-submap' }
+
+function Get-SubagentDisplayName {
+    # Primary: the spawning call. invoke_subagent's args carry a `Role` per
+    # subagent and the INVOKE_SUBAGENT result row lists the conversationIds in
+    # the SAME order, so the name is the Nth Role for the id at position N. This
+    # is the only source available for a subagent's EARLY events.
+    # Fallback: messages/<uuid>.json {"sender": <child>, "renderDetails":
+    # {"messageTitle": "Message from <Role> (<TypeName>)"}} — richer, but only
+    # written once the subagent has reported back.
+    # Mirrors hook.sh's subagent_role_name / subagent_message_name.
+    param([string]$ParentId, [string]$SubId)
+    try {
+        $pd = Join-Path $brainDir $ParentId
+        $tf = Join-Path (Join-Path (Join-Path $pd '.system_generated') 'logs') 'transcript_full.jsonl'
+        if (Test-Path -LiteralPath $tf) {
+            $ids = @()
+            $roles = @()
+            foreach ($line in (Get-Content -LiteralPath $tf -ErrorAction SilentlyContinue)) {
+                if ($line -like '*"INVOKE_SUBAGENT"*') {
+                    # The ids sit inside the row's JSON-STRING content, so their
+                    # quotes are backslash-escaped — match the bare UUID.
+                    foreach ($mm in [regex]::Matches($line, 'conversationId[^0-9a-f]*([0-9a-f-]{36})')) {
+                        $ids += $mm.Groups[1].Value
+                    }
+                }
+                if ($line -like '*"invoke_subagent"*') {
+                    foreach ($rm in [regex]::Matches($line, '"Role"\s*:\s*"([^"]*)"')) {
+                        $roles += $rm.Groups[1].Value
+                    }
+                }
+            }
+            $idx = [Array]::IndexOf($ids, $SubId)
+            if ($idx -ge 0 -and $idx -lt $roles.Count) { return $roles[$idx] }
+        }
+        $md = Join-Path (Join-Path $pd '.system_generated') 'messages'
+        if (-not (Test-Path -LiteralPath $md)) { return '' }
+        foreach ($mf in Get-ChildItem -LiteralPath $md -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+            $txt = Get-Content -Raw -LiteralPath $mf.FullName -ErrorAction SilentlyContinue
+            if (-not $txt -or $txt -notmatch [regex]::Escape($SubId)) { continue }
+            $t = [regex]::Match($txt, '"messageTitle"\s*:\s*"([^"]*)"')
+            if ($t.Success) { return ($t.Groups[1].Value -replace '^Message from ', '') }
+        }
+    } catch {}
+    return ''
+}
+
+function Resolve-SubagentParent {
+    # Returns the parent conversation id, or '' when $SubId was not spawned as a
+    # subagent. The INVOKE_SUBAGENT filter is required: a conversation id also
+    # appears inside other conversations' CONVERSATION_HISTORY summaries, which
+    # must NOT be read as a parent link.
+    param([string]$SubId)
+    try {
+        if (-not (Test-Path -LiteralPath $brainDir)) { return '' }
+        foreach ($d in Get-ChildItem -LiteralPath $brainDir -Directory -ErrorAction SilentlyContinue) {
+            if ($d.Name -eq $SubId) { continue }
+            $tf = Join-Path (Join-Path (Join-Path $d.FullName '.system_generated') 'logs') 'transcript_full.jsonl'
+            if (-not (Test-Path -LiteralPath $tf)) { continue }
+            $hit = Select-String -LiteralPath $tf -SimpleMatch -Pattern '"INVOKE_SUBAGENT"' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Line -match [regex]::Escape($SubId) } | Select-Object -First 1
+            if ($hit) { return $d.Name }
+        }
+    } catch {}
+    return ''
+}
+
+try {
+    $cm = [regex]::Match($payload, '"conversationId"\s*:\s*"([^"]*)"')
+    if ($cm.Success -and $cm.Groups[1].Value) {
+        $cid = $cm.Groups[1].Value
+        $cacheFile = Join-Path $submapDir $cid
+        $map = $null
+        if (Test-Path -LiteralPath $cacheFile) {
+            $map = @(Get-Content -LiteralPath $cacheFile -ErrorAction SilentlyContinue)
+        } else {
+            $parent = Resolve-SubagentParent $cid
+            if ($parent) { $map = @($parent, (Get-SubagentDisplayName $parent $cid)) } else { $map = @('main') }
+            try {
+                if (-not (Test-Path -LiteralPath $submapDir)) { New-Item -ItemType Directory -Path $submapDir -Force | Out-Null }
+                Set-Content -LiteralPath $cacheFile -Value $map -Encoding UTF8
+            } catch {}
+        }
+        if ($map -and $map.Count -ge 1 -and $map[0] -and $map[0] -ne 'main') {
+            $subagentId = $cid
+            if ($map.Count -ge 2) { $subagentName = [string]$map[1] }
+            # Normalize to compact form, tolerating whitespace around the colon.
+            $payload = [regex]::Replace(
+                $payload,
+                '"conversationId"\s*:\s*"' + [regex]::Escape($cid) + '"',
+                '"conversationId":"' + $map[0] + '"')
+            Log "subagent=$cid parent=$($map[0]) name=$(Sanitize $subagentName)"
+        }
+    }
+} catch { Dbg "subagent re-attribution failed: $($_.Exception.Message)" }
+
 if ($EventName -eq 'PreInvocation' -or $EventName -eq 'PostInvocation' -or $EventName -eq 'Stop') {
     try {
         $m = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"')
@@ -254,6 +365,14 @@ $headers = @{
     'x-rogue-event'       = $EventName
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
+}
+# Subagent headers ride ONLY re-attributed events: enrichFromHeaders tags every
+# canonical message with subagent_id/subagent_name (aidr_message columns) so the
+# rows are distinguishable inside the parent's transcript. Omitted entirely — not
+# sent empty — on main-agent events. Mirrors hook.sh.
+if ($subagentId) {
+    $headers['x-rogue-subagent-id'] = $subagentId
+    $headers['x-rogue-subagent-name'] = $subagentName
 }
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 $resp = ''

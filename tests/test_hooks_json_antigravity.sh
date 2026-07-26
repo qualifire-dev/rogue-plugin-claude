@@ -50,26 +50,49 @@ if got != EXPECTED_EVENTS:
 
 MATCHER_REQUIRED = {"PreToolUse", "PostToolUse"}
 
-for event, groups in hooks.items():
-    if not isinstance(groups, list) or not groups:
+# The two event kinds take DIFFERENT array shapes, and getting it wrong is a
+# fatal parse error for the whole file (all five events go dead while the CLI
+# keeps running normally):
+#   matcher events     -> [ { "matcher": ".*", "hooks": [ <handler>, ... ] } ]
+#   matcher-less events-> [ <handler>, ... ]                  (FLAT, no wrapper)
+# Wrapping a matcher-less event in { "hooks": [...] } yields
+#   invalid hook "rogue": command hook must specify 'command'
+# so this lint pins the flat shape. See plugins/antigravity/CLAUDE.md.
+def handler_groups(event, arr):
+    """Yield (where, handlers) pairs for one event's registration array."""
+    if event in MATCHER_REQUIRED:
+        for gi, g in enumerate(arr):
+            where = f"[{event}][{gi}]"
+            if not isinstance(g, dict):
+                fail(f"{where} must be a {{matcher, hooks}} object")
+                continue
+            if g.get("matcher") != ".*":
+                fail(f"{where} matcher must be '.*', got {g.get('matcher')!r}")
+            entries = g.get("hooks")
+            if not isinstance(entries, list):
+                fail(f"{where} 'hooks' must be an array")
+                continue
+            yield where, entries
+        return
+
+    # Matcher-less: the array itself is the handler list.
+    for hi, h in enumerate(arr):
+        if not isinstance(h, dict):
+            fail(f"[{event}][{hi}] must be a handler object")
+            continue
+        if "hooks" in h:
+            fail(f"[{event}][{hi}] must be a FLAT handler, not a {{'hooks': [...]}} group "
+                 "(Antigravity rejects the nested form and drops the whole file)")
+        if "matcher" in h:
+            fail(f"[{event}][{hi}] must not carry a matcher, got {h.get('matcher')!r}")
+    yield f"[{event}]", arr
+
+for event, arr in hooks.items():
+    if not isinstance(arr, list) or not arr:
         fail(f"[{event}] must be a non-empty array")
         continue
 
-    for gi, g in enumerate(groups):
-        where_g = f"[{event}][{gi}]"
-
-        if event in MATCHER_REQUIRED:
-            if g.get("matcher") != ".*":
-                fail(f"{where_g} matcher must be '.*', got {g.get('matcher')!r}")
-        else:
-            if "matcher" in g:
-                fail(f"{where_g} must not carry a matcher, got {g.get('matcher')!r}")
-
-        entries = g.get("hooks")
-        if not isinstance(entries, list):
-            fail(f"{where_g} 'hooks' must be an array")
-            continue
-
+    for where_g, entries in handler_groups(event, arr):
         if len(entries) != 2:
             fail(f"{where_g} must have exactly 2 handlers, got {len(entries)}")
 
@@ -118,7 +141,11 @@ if failures:
         print(f"  - {f}")
     sys.exit(1)
 
-total = sum(len(g["hooks"]) for gs in hooks.values() for g in gs)
+total = sum(
+    len(g["hooks"]) if event in MATCHER_REQUIRED else 1
+    for event, gs in hooks.items()
+    for g in gs
+)
 print(f"OK: {total} hook commands across {len(hooks)} events pass the antigravity hooks.json lint")
 EOF
 status=$?

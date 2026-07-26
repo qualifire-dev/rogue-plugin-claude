@@ -44,6 +44,8 @@ run_dispatcher() {
     ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
     ROGUE_LOG_FILE="$tmp_home/hook.log" \
     ROGUE_FORCE_UNAME="${ROGUE_FORCE_UNAME:-}" \
+    ROGUE_ANTIGRAVITY_BRAIN_DIR="${ROGUE_ANTIGRAVITY_BRAIN_DIR:-}" \
+    ROGUE_ANTIGRAVITY_SUBMAP_DIR="${ROGUE_ANTIGRAVITY_SUBMAP_DIR:-}" \
     "$SH" "$HOOK" "$1" <<< "$2" > "$OUT_FILE"
   rc=$?
   set -e
@@ -229,10 +231,12 @@ fi
 rm -rf "$STAGE"
 
 # ── Case 9: PreInvocation transcript-tail enrichment (augment_with_transcript) ─
+# Fixture rows use the real transcript_full.jsonl schema (source/type/step_index,
+# no `role` key) — see plugins/antigravity/CLAUDE.md.
 TDIR="$(mktemp -d)"
 printf '%s\n' \
-  '{"type":"user.message","timestamp":"2026-07-20T09:00:00.000Z","data":{"content":"hi"}}' \
-  '{"type":"assistant.message","timestamp":"2026-07-20T09:00:02.000Z","data":{"content":"ANTIGRAVITY final"}}' \
+  '{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-07-20T09:00:00Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}' \
+  '{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-07-20T09:00:02Z","content":"ANTIGRAVITY final"}' \
   > "$TDIR/transcript.jsonl"
 restart_mock '{}'
 PAYLOAD=$(printf '{"invocationNum":1,"transcriptPath":"%s"}' "$TDIR/transcript.jsonl")
@@ -249,19 +253,121 @@ case "$decoded" in
 esac
 rm -rf "$TDIR"
 
-# ── Case 10: PreToolUse does NOT get transcript enrichment ─────────────────
+# ── Case 10: the tool events do NOT get transcript enrichment ──────────────
+# PreToolUse: the call's args are already inline and the result row does not
+# exist yet. PostToolUse: Antigravity IGNORES this event's output entirely (its
+# contract accepts only `{}`; deny / injectSteps / terminationBehavior were all
+# verified no-ops), so a finding raised on the tool result here could not stop
+# it reaching the model. Tool output is instead read from the transcript on the
+# following PostInvocation, which CAN terminate the loop first. Enriching either
+# tool event would pay the flush wait + a ~350KB body on every tool call for
+# nothing. See plugins/antigravity/CLAUDE.md.
 TDIR="$(mktemp -d)"
-printf '%s\n' '{"type":"assistant.message","data":{"content":"should not appear"}}' > "$TDIR/transcript.jsonl"
-restart_mock '{}'
-PAYLOAD=$(printf '{"toolName":"bash","transcriptPath":"%s"}' "$TDIR/transcript.jsonl")
-set +e; run_dispatcher PreToolUse "$PAYLOAD"; LAST_RC=$?; set -e
-assert_eq "$LAST_RC" "0" "PreToolUse with transcriptPath still exits 0"
-body=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE")
-case "$body" in
-  *transcriptTailB64*) echo "FAIL [PreToolUse tail]: PreToolUse should not be enriched; body=<$body>" >&2; exit 1 ;;
-  *) echo "  ok: PreToolUse body is not enriched with transcript tail" ;;
-esac
+printf '%s\n' '{"step_index":3,"source":"MODEL","type":"RUN_COMMAND","content":"should not appear"}' > "$TDIR/transcript.jsonl"
+for ev in PreToolUse PostToolUse; do
+  restart_mock '{}'
+  PAYLOAD=$(printf '{"stepIdx":3,"toolCall":{"name":"run_command","args":{"CommandLine":"id"}},"transcriptPath":"%s"}' "$TDIR/transcript.jsonl")
+  set +e; run_dispatcher "$ev" "$PAYLOAD"; LAST_RC=$?; set -e
+  assert_eq "$LAST_RC" "0" "$ev with transcriptPath still exits 0"
+  body=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE")
+  case "$body" in
+    *transcriptTailB64*) echo "FAIL [$ev tail]: $ev must not be enriched; body=<$body>" >&2; exit 1 ;;
+    *) echo "  ok: $ev body is not enriched with transcript tail" ;;
+  esac
+done
 rm -rf "$TDIR"
+
+# ── Case 12: subagent re-attribution ───────────────────────────────────────
+# A subagent's events arrive with its OWN conversationId and no parent
+# reference, so persisted verbatim they orphan into a separate audit session.
+# The dispatcher resolves the parent from the INVOKE_SUBAGENT row in some
+# parent transcript (the parent id IS that transcript's directory name),
+# rewrites conversationId, and tags the event with the x-rogue-subagent-*
+# headers the backend's enrichFromHeaders turns into subagent_id/subagent_name.
+PARENT="11111111-1111-1111-1111-111111111111"
+CHILD="22222222-2222-2222-2222-222222222222"
+OTHER="33333333-3333-3333-3333-333333333333"
+TB="$(mktemp -d)"
+mkdir -p "$TB/$PARENT/.system_generated/logs" "$TB/$PARENT/.system_generated/messages" \
+         "$TB/$OTHER/.system_generated/logs"
+# The spawn record: ids appear inside the row's JSON-string content, so the
+# quotes around them are escaped — the dispatcher must not rely on bare quoting.
+printf '%s\n' \
+  '{"step_index":20,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"invoke_subagent","args":{"Subagents":[{"Role":"Poet for AAPL","TypeName":"Poet"}]}}]}' \
+  "{\"step_index\":21,\"source\":\"MODEL\",\"type\":\"INVOKE_SUBAGENT\",\"content\":\"Created the following subagents:\\n{\\n  \\\"conversationId\\\":  \\\"$CHILD\\\"\\n}\"}" \
+  > "$TB/$PARENT/.system_generated/logs/transcript_full.jsonl"
+printf '{"sender": "%s", "recipient": "%s", "renderDetails": {"messageTitle": "Message from Poet for AAPL (Poet)"}}\n' \
+  "$CHILD" "$PARENT" > "$TB/$PARENT/.system_generated/messages/msg1.json"
+# A DIFFERENT conversation that merely mentions the child id in its
+# CONVERSATION_HISTORY summary — must never be read as a parent link.
+printf '%s\n' \
+  "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"CONVERSATION_HISTORY\",\"content\":\"## Conversation $CHILD: Poems\"}" \
+  > "$TB/$OTHER/.system_generated/logs/transcript_full.jsonl"
+
+TSM="$(mktemp -d)"
+restart_mock '{}'
+PAYLOAD=$(printf '{"conversationId":"%s","invocationNum":1,"initialNumSteps":1}' "$CHILD")
+set +e
+ROGUE_ANTIGRAVITY_BRAIN_DIR="$TB" ROGUE_ANTIGRAVITY_SUBMAP_DIR="$TSM" \
+  run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?
+set -e
+assert_eq "$LAST_RC" "0" "subagent re-attribution exits 0"
+got=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["body"])["conversationId"])' "$HEADERS_FILE")
+assert_eq "$got" "$PARENT" "subagent conversationId is rewritten to the parent"
+assert_header "x-rogue-subagent-id"   "$CHILD"                  "x-rogue-subagent-id names the subagent"
+assert_header "x-rogue-subagent-name" "Poet for AAPL"           "x-rogue-subagent-name is the spawn-time Role (available on early events)"
+assert_eq "$(sed -n '1p' "$TSM/$CHILD")" "$PARENT" "parent is cached for the subagent"
+
+# ── Case 13: a main-agent conversation is untouched and sends no headers ────
+# Its id is in no INVOKE_SUBAGENT row. Verdict is cached as 'main' so an
+# ordinary conversation scans once, not on all ~18 events of every turn.
+restart_mock '{}'
+PAYLOAD=$(printf '{"conversationId":"%s","invocationNum":1,"initialNumSteps":1}' "$PARENT")
+set +e
+ROGUE_ANTIGRAVITY_BRAIN_DIR="$TB" ROGUE_ANTIGRAVITY_SUBMAP_DIR="$TSM" \
+  run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?
+set -e
+assert_eq "$LAST_RC" "0" "main-agent event exits 0"
+got=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["body"])["conversationId"])' "$HEADERS_FILE")
+assert_eq "$got" "$PARENT" "main-agent conversationId is left alone"
+assert_no_header "x-rogue-subagent-id"   "no x-rogue-subagent-id on a main-agent event"
+assert_no_header "x-rogue-subagent-name" "no x-rogue-subagent-name on a main-agent event"
+assert_eq "$(cat "$TSM/$PARENT")" "main" "main-agent verdict is cached"
+
+# ── Case 14: a CONVERSATION_HISTORY mention is not a parent link ────────────
+# $OTHER's transcript names $CHILD but has no INVOKE_SUBAGENT row, and $OTHER
+# itself was never spawned — so it must resolve to 'main', not to a parent.
+TSM2="$(mktemp -d)"
+restart_mock '{}'
+PAYLOAD=$(printf '{"conversationId":"%s","invocationNum":1}' "$OTHER")
+set +e
+ROGUE_ANTIGRAVITY_BRAIN_DIR="$TB" ROGUE_ANTIGRAVITY_SUBMAP_DIR="$TSM2" \
+  run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?
+set -e
+assert_eq "$(cat "$TSM2/$OTHER")" "main" "a CONVERSATION_HISTORY mention is not treated as a spawn"
+assert_no_header "x-rogue-subagent-id" "no subagent header from a history mention"
+
+# ── Case 15: re-attribution survives alongside transcript enrichment ────────
+# Both stdin mutations apply to the same event; the rewrite must happen BEFORE
+# the tail is appended (augment_with_transcript re-closes the JSON by hand).
+mkdir -p "$TB/$CHILD/.system_generated/logs"
+printf '%s\n' '{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nAAPL\n</USER_REQUEST>"}' \
+  > "$TB/$CHILD/.system_generated/logs/transcript_full.jsonl"
+restart_mock '{}'
+PAYLOAD=$(printf '{"conversationId":"%s","invocationNum":1,"initialNumSteps":1,"transcriptPath":"%s"}' \
+  "$CHILD" "$TB/$CHILD/.system_generated/logs/transcript_full.jsonl")
+set +e
+ROGUE_ANTIGRAVITY_BRAIN_DIR="$TB" ROGUE_ANTIGRAVITY_SUBMAP_DIR="$TSM" \
+  run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?
+set -e
+assert_eq "$LAST_RC" "0" "re-attribution + enrichment exits 0"
+both=$(python3 -c '
+import json,sys,base64
+b=json.loads(json.load(open(sys.argv[1]))["body"])
+print(b["conversationId"], "transcriptTailB64" in b, "AAPL" in base64.b64decode(b.get("transcriptTailB64","")).decode("utf-8","replace"))
+' "$HEADERS_FILE")
+assert_eq "$both" "$PARENT True True" "body has the parent id AND a decodable tail"
+rm -rf "$TB" "$TSM" "$TSM2"
 
 echo
 echo "All antigravity hook.sh tests passed (SH=$SH)."

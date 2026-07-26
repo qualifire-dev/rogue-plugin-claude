@@ -6,9 +6,10 @@
 # Reads one Antigravity hook event JSON on stdin, POSTs it to the rogue-api
 # /hooks/antigravity route, and relays the native Antigravity decision shape
 # verbatim on stdout. PURE RELAY: no block-detection regex, no local modal.
-# The only stdin enrichment is PreInvocation/PostInvocation/Stop, which append
+# There are exactly TWO stdin mutations: PreInvocation/PostInvocation/Stop append
 # the transcript tail (see augment_with_transcript) so the backend can read
-# recent turn content.
+# recent turn content, and a subagent's events get their conversationId rewritten
+# to the parent's (see reattribute_subagent).
 #
 # FAIL-OPEN IS SAFETY-CRITICAL. PreToolUse must always resolve to an explicit
 # decision — never a bare `{}` — so `fail_open_default` emits
@@ -114,6 +115,135 @@ augment_with_transcript() {
   printf '%s,"transcriptTailB64":"%s"}' "${_body%\}}" "$_b64"
 }
 
+# ── Subagent re-attribution ────────────────────────────────────────────────
+# An Antigravity subagent (define_subagent → invoke_subagent) runs as its OWN
+# conversation: its PreInvocation/PreToolUse/PostToolUse/PostInvocation/Stop all
+# arrive with conversationId = the subagent's own id and carry NO parent
+# reference (verified: the payload has no parentConversationId / agentId field).
+# Persisted verbatim they become an ORPHANED audit session instead of appearing
+# in the conversation that spawned them.
+#
+# The link lives in the PARENT's transcript: the `invoke_subagent` tool RESULT
+# row (type INVOKE_SUBAGENT) lists each spawned conversationId, and the parent
+# conversation id IS that transcript's directory name. That row is written when
+# the tool completes — i.e. before the subagent's first hook can fire — so a
+# plain lookup suffices and no flush retry is needed.
+#
+# Unlike Copilot (whose subagent ids are `toolu_…`/`call_…`, distinguishable at a
+# glance), an Antigravity subagent id is an ordinary UUID — there is no way to
+# tell from the payload whether a lookup is even worth doing. So the verdict is
+# cached per conversation, BOTH ways: a "main" marker for ordinary conversations
+# stops them re-scanning on every one of their ~18 events per turn. One scan per
+# conversation, ~25ms.
+#
+# Fail-open: unresolved → body untouched (today's orphaned behaviour, never
+# worse).
+SUBAGENT_ID=""
+SUBAGENT_NAME=""
+BRAIN_DIR="${ROGUE_ANTIGRAVITY_BRAIN_DIR:-$HOME/.gemini/antigravity-cli/brain}"
+SUBMAP_DIR="${ROGUE_ANTIGRAVITY_SUBMAP_DIR:-$HOME/.rogue/antigravity-submap}"
+
+# Display name from the spawning call: `invoke_subagent`'s args carry a `Role`
+# per subagent ("Cat Rhymer"), and the INVOKE_SUBAGENT result row lists the
+# conversationIds in the SAME order (verified — the 1st id's own prompt is the
+# 1st Prompt). So the name is the Nth Role where N is the id's position. This is
+# available at spawn time, which matters: it is the only source present for a
+# subagent's EARLY events.
+#
+# Caveat: with two `invoke_subagent` calls in one conversation the two lists are
+# read in file order, which is not step order (see the sort in
+# decodeTranscriptTail's counterpart), so positions could misalign. That affects
+# only the display name — `x-rogue-subagent-id` is always exact.
+# $1 = parent conversation id, $2 = subagent conversation id.
+subagent_role_name() {
+  _tf="$BRAIN_DIR/$1/.system_generated/logs/transcript_full.jsonl"
+  [ -r "$_tf" ] || return 0
+  # Position of $2 among the spawned ids. The ids sit inside the row's
+  # JSON-STRING content, so their quotes are backslash-escaped — match the bare
+  # UUID rather than a quoted one.
+  _idx=$(grep '"INVOKE_SUBAGENT"' "$_tf" 2>/dev/null \
+    | grep -o 'conversationId[^0-9a-f]*[0-9a-f-]\{36\}' \
+    | grep -o '[0-9a-f-]\{36\}' \
+    | grep -n "^$2\$" 2>/dev/null | head -1 | cut -d: -f1)
+  [ -n "$_idx" ] || return 0
+  grep '"invoke_subagent"' "$_tf" 2>/dev/null \
+    | grep -o '"Role":"[^"]*"' \
+    | sed -n "${_idx}p" \
+    | sed 's/^"Role":"//; s/"$//'
+}
+
+# Fallback display name, from the parent's delivered-message records:
+# messages/<uuid>.json carries {"sender": <child>, "renderDetails":
+# {"messageTitle": "Message from <Role> (<TypeName>)"}}. Only exists once the
+# subagent has reported back, so this is the late-but-richer source.
+# $1 = parent conversation id, $2 = subagent conversation id.
+subagent_message_name() {
+  _md="$BRAIN_DIR/$1/.system_generated/messages"
+  [ -d "$_md" ] || return 0
+  for _mf in "$_md"/*.json; do
+    [ -r "$_mf" ] || continue
+    grep -q "\"$2\"" "$_mf" 2>/dev/null || continue
+    sed -n 's/.*"messageTitle"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_mf" 2>/dev/null \
+      | sed 's/^Message from //' | head -1
+    return 0
+  done
+}
+
+# $1 = parent conversation id, $2 = subagent conversation id.
+subagent_display_name() {
+  _nm=$(subagent_role_name "$1" "$2")
+  [ -n "$_nm" ] || _nm=$(subagent_message_name "$1" "$2")
+  printf '%s' "$_nm"
+}
+
+# Echo "<parentConversationId>\n<displayName>" when $1 was spawned as a subagent.
+# Two-stage on purpose: the broad grep prunes to candidate files in one process
+# (fast), then the INVOKE_SUBAGENT filter rejects the false positives — a
+# conversation id also appears inside other conversations' CONVERSATION_HISTORY
+# summaries, which must NOT be read as a parent link.
+resolve_subagent_parent() {
+  _sub="$1"
+  [ -d "$BRAIN_DIR" ] || return 1
+  for _f in $(grep -l "$_sub" "$BRAIN_DIR"/*/.system_generated/logs/transcript_full.jsonl 2>/dev/null); do
+    grep '"INVOKE_SUBAGENT"' "$_f" 2>/dev/null | grep -q "$_sub" || continue
+    _pd=${_f%/.system_generated/logs/transcript_full.jsonl}
+    _parent=${_pd##*/}
+    [ -n "$_parent" ] && [ "$_parent" != "$_sub" ] || continue
+    printf '%s\n%s' "$_parent" "$(subagent_display_name "$_parent" "$_sub")"
+    return 0
+  done
+  return 1
+}
+
+# Rewrite BODY's subagent conversationId to its parent and set SUBAGENT_ID/NAME.
+reattribute_subagent() {
+  _cid=$(printf '%s' "$BODY" | sed -n 's/.*"conversationId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$_cid" ] || return
+
+  _cache_file="$SUBMAP_DIR/$_cid"
+  _map=""
+  if [ -r "$_cache_file" ]; then
+    _map=$(cat "$_cache_file" 2>/dev/null)
+    [ "$_map" = "main" ] && return          # known ordinary conversation
+  else
+    _map=$(resolve_subagent_parent "$_cid") || _map=""
+    mkdir -p "$SUBMAP_DIR" 2>/dev/null
+    # Cache the negative too, so an ordinary conversation scans only once.
+    printf '%s' "${_map:-main}" > "$_cache_file" 2>/dev/null
+  fi
+  [ -n "$_map" ] && [ "$_map" != "main" ] || return
+
+  _parent=$(printf '%s' "$_map" | sed -n '1p')
+  SUBAGENT_NAME=$(printf '%s' "$_map" | sed -n '2p')
+  [ -n "$_parent" ] || return
+  SUBAGENT_ID="$_cid"
+  # Tolerate whitespace around the key/colon (a pretty-printed payload) and
+  # normalize to compact form; a non-matching rewrite would leave the body
+  # orphaned even though the parent was resolved.
+  BODY=$(printf '%s' "$BODY" | sed "s/\"conversationId\"[[:space:]]*:[[:space:]]*\"$_cid\"/\"conversationId\":\"$_parent\"/")
+  log "subagent=$_cid parent=$_parent name=$(sanitize "$SUBAGENT_NAME")"
+}
+
 # Not configured: never POST without a key. Emit the per-event fail-open
 # default so PreToolUse still resolves to an explicit allow decision.
 if [ -z "${ROGUE_API_KEY:-}" ]; then
@@ -144,6 +274,11 @@ if [ "$EVENT" = "PreInvocation" ]; then
   esac
 fi
 
+# Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON
+# object by hand, so mutating conversationId afterwards would have to skip past
+# the appended base64 blob.
+reattribute_subagent
+
 case "$EVENT" in
   PreInvocation|PostInvocation|Stop) BODY="$(augment_with_transcript "$BODY")" ;;
 esac
@@ -152,11 +287,22 @@ esac
 # transport failure curl exits non-zero and the code is 000. Relay the body
 # ONLY on a clean HTTP 200 so an error page (401/404/500) is never handed to
 # Antigravity as a decision.
+# Subagent headers ride ONLY re-attributed events: the backend's
+# enrichFromHeaders tags every canonical message of the event with
+# subagent_id/subagent_name (aidr_message columns) so the rows are
+# distinguishable inside the parent's transcript. Passed via a positional set so
+# they are omitted entirely — not sent empty — on main-agent events.
+set --
+if [ -n "$SUBAGENT_ID" ]; then
+  set -- -H "x-rogue-subagent-id: $SUBAGENT_ID" -H "x-rogue-subagent-name: $SUBAGENT_NAME"
+fi
+
 RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "x-rogue-event: $EVENT" \
   -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
   -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+  "$@" \
   -H 'Content-Type: application/json' \
   --data-binary @- --max-time 15 -w '\n%{http_code}')
 RC=$?
