@@ -9,9 +9,11 @@
 # narrow OUT-OF-BAND exception: a userPromptSubmitted block inside JetBrains,
 # which the IDE honors but renders nowhere, so we additionally show a local
 # alert (see in_jetbrains_ide / notify_block) while still relaying the body
-# unchanged. The only stdin enrichment is agentStop/subagentStop, which append
-# the transcript tail (see augment_with_transcript) so the backend can read the
-# final message.
+# unchanged. There are exactly TWO stdin enrichments: a re-attributed subagent
+# event gets its sessionId rewritten plus agentId/agentNameB64 added (see
+# reattribute_subagent / augment_with_agent_tag), and agentStop/subagentStop
+# additionally get the transcript tail appended (see augment_with_transcript) so
+# the backend can read the final message.
 #
 # Copilot selects the `bash` command on macOS/Linux and the `powershell` command
 # on Windows (see hooks.json), so — unlike the Claude bridge — there is no
@@ -219,8 +221,9 @@ augment_with_transcript() {
 # `subagent.started` line records this id as its toolCallId/agentId — and the
 # parent session id IS that transcript's directory name. Resolve it and rewrite
 # the outgoing sessionId so the subagent's turns land in the right session,
-# tagged via the x-rogue-agent-* headers. Fail-open: unresolved → leave the
-# body untouched (i.e. today's orphaned behavior — never worse).
+# tagged with the agentId/agentNameB64 BODY fields (see augment_with_agent_tag —
+# the tag used to travel as x-rogue-agent-* headers). Fail-open: unresolved →
+# leave the body untouched (i.e. today's orphaned behavior — never worse).
 SUBAGENT_ID=""
 SUBAGENT_NAME=""
 COPILOT_STATE_DIR="${ROGUE_COPILOT_STATE_DIR:-$HOME/.copilot/session-state}"
@@ -286,6 +289,70 @@ reattribute_subagent() {
   log "subagent=$_sid parent=$_parent name=$(sanitize "$SUBAGENT_NAME")"
 }
 
+# Add the subagent tag to the BODY of a re-attributed event: "agentId" (the bare
+# tool-call id) and "agentNameB64" (base64 of the UTF-8 display name). The name is
+# arbitrary vendor text — one '"' or '\' would corrupt the payload — so it travels
+# base64-encoded, the same trick as transcriptTailB64; base64 has no JSON-special
+# characters, so appending it by re-closing the object is safe. Omitted when the
+# name is unknown. The backend reads both fields off the payload (they used to
+# ride as x-rogue-agent-* headers).
+#
+# TWO mutation paths, and they must agree byte-for-byte on a compact payload
+# (tests/test_hook_sh_copilot.sh asserts exactly that, since only one path runs on
+# any given machine):
+#   1. jq when it is on PATH (macOS 26 ships /usr/bin/jq) — a real JSON edit.
+#      NOTE jq re-serializes, so a pretty-printed vendor payload comes back
+#      compacted; semantically identical, and Copilot sends compact JSON.
+#   2. otherwise the same string concat used for transcriptTailB64 — no parse, so
+#      the vendor's bytes are preserved exactly.
+# Fail-open everywhere: a bad id, a jq failure, or a body that is not an object
+# returns the body unchanged (we lose attribution, never the relay).
+# $1 = body; echoes the (possibly tagged) body.
+augment_with_agent_tag() {
+  _body="$1"
+  # The id is a bare token from Copilot (toolu_… / call_…). Anything outside the
+  # token charset is not one — skip BOTH fields rather than risk a corrupt body.
+  case "$SUBAGENT_ID" in
+    ''|*[!A-Za-z0-9_-]*) printf '%s' "$_body"; return ;;
+  esac
+  _nb64=""
+  if [ -n "$SUBAGENT_NAME" ]; then
+    _nb64=$(printf '%s' "$SUBAGENT_NAME" | base64 2>/dev/null | tr -d '\r\n')
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    if [ -n "$_nb64" ]; then
+      _out=$(printf '%s' "$_body" | jq -c --arg id "$SUBAGENT_ID" --arg nb64 "$_nb64" \
+        '. + {agentId:$id,agentNameB64:$nb64}' 2>/dev/null)
+    else
+      _out=$(printf '%s' "$_body" | jq -c --arg id "$SUBAGENT_ID" \
+        '. + {agentId:$id}' 2>/dev/null)
+    fi
+    # Only trust a complete object back; anything else (invalid JSON in, jq error,
+    # a non-object payload) falls through to the concat path.
+    case "$_out" in
+      '{'*'}') printf '%s' "$_out"; return ;;
+    esac
+  fi
+
+  # Trim trailing whitespace (a pretty-printed payload can end in spaces or a
+  # newline after the closing brace) so the single-'}' strip lands on the real
+  # closing brace — mirrors augment_with_transcript / hook.ps1's $payload.TrimEnd().
+  _body="${_body%"${_body##*[![:space:]]}"}"
+  case "$_body" in
+    *'}') : ;;
+    *) printf '%s' "$1"; return ;;   # not an object → leave it alone
+  esac
+  _pre="${_body%\}}"
+  # An empty object needs no separator ({} → {"agentId":…}); jq produces the same.
+  if [ "$_pre" = "{" ]; then _sep=""; else _sep=","; fi
+  if [ -n "$_nb64" ]; then
+    printf '%s%s"agentId":"%s","agentNameB64":"%s"}' "$_pre" "$_sep" "$SUBAGENT_ID" "$_nb64"
+  else
+    printf '%s%s"agentId":"%s"}' "$_pre" "$_sep" "$SUBAGENT_ID"
+  fi
+}
+
 # Not configured: emit the SessionStart hint (so the user knows to run setup) or a
 # clean allow for every other event. Never POST without a key.
 if [ -z "${ROGUE_API_KEY:-}" ]; then
@@ -307,6 +374,11 @@ BODY="$(cat)"
 # Re-attribute a subagent's event to its parent session BEFORE any tail
 # augmentation (a subagent agentStop has no transcriptPath, so augment no-ops).
 reattribute_subagent
+# Tag the (now correctly-attributed) body so the backend can mark these rows as a
+# subagent's. Before the tail append, so the field order is stable across events.
+if [ -n "$SUBAGENT_ID" ]; then
+  BODY="$(augment_with_agent_tag "$BODY")"
+fi
 case "$EVENT" in
   agentStop|subagentStop) BODY="$(augment_with_transcript "$BODY")" ;;
 esac
@@ -314,30 +386,18 @@ esac
 # Capture body + HTTP status. -w appends a final line "<code>"; on any transport
 # failure curl exits non-zero and the code is 000. Relay the body ONLY on a clean
 # HTTP 200 so an error page (401/404/500) is never handed to Copilot as a decision.
-# Subagent events carry two extra headers so the backend can tag the
-# (now correctly-attributed) rows; main-agent events send neither. The HEADERS are
-# x-rogue-agent-* (matching the backend's agentId/agentName fields and
-# aidr_message.agent_id/agent_name); the local SUBAGENT_* variables keep Copilot's
-# own terminology, since Copilot is what calls these subagents.
-if [ -n "$SUBAGENT_ID" ]; then
-  RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
-    -H "x-rogue-api-key: $ROGUE_API_KEY" \
-    -H "x-rogue-event: $EVENT" \
-    -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
-    -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
-    -H "x-rogue-agent-id: $SUBAGENT_ID" \
-    -H "x-rogue-agent-name: $SUBAGENT_NAME" \
-    -H 'Content-Type: application/json' \
-    --data-binary @- --max-time 15 -w '\n%{http_code}')
-else
-  RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
-    -H "x-rogue-api-key: $ROGUE_API_KEY" \
-    -H "x-rogue-event: $EVENT" \
-    -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
-    -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
-    -H 'Content-Type: application/json' \
-    --data-binary @- --max-time 15 -w '\n%{http_code}')
-fi
+# The subagent tag rides in the BODY (agentId/agentNameB64 — see
+# augment_with_agent_tag), so every event POSTs the same four headers. The local
+# SUBAGENT_* variables keep Copilot's own terminology, since Copilot is what calls
+# these subagents; the wire field names match the backend's agentId/agentName and
+# the aidr_message.agent_id/agent_name columns they land in.
+RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
+  -H "x-rogue-api-key: $ROGUE_API_KEY" \
+  -H "x-rogue-event: $EVENT" \
+  -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
+  -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- --max-time 15 -w '\n%{http_code}')
 RC=$?
 CODE=$(printf '%s' "$RAW" | tail -n1)
 BODY=$(printf '%s' "$RAW" | sed '$d')

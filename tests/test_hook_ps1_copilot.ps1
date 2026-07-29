@@ -6,7 +6,8 @@
 # the CLAUDE plugin's shell-quoting decoder (ConvertFrom-ShellQuoted) and the
 # cross-bridge round-trip of ~/.rogue-env. This one covers the Copilot-only
 # JetBrains silent-block alert — the single out-of-band exception to pure relay —
-# and must stay in lockstep with tests/test_hook_sh_copilot.sh cases 4b-4e.
+# and must stay in lockstep with tests/test_hook_sh_copilot.sh cases 4b-4e, plus
+# the subagent body tag (Add-AgentTag), in lockstep with that file's cases 14-16.
 #
 # These are the ONLY automated checks that ever execute hook.ps1's alert code:
 # a parse or logic error there is not a graceful degradation, because the
@@ -172,6 +173,66 @@ Clear-AlertEnv
 $env:COPILOT_CLI_BINARY_VERSION = '1.0.75'
 Assert-True (-not (Test-JetBrainsIde)) 'fallback: version SET + no markers => not IDE'
 Clear-AlertEnv
+
+# ── Add-AgentTag: the subagent body tag ────────────────────────────────────
+# A re-attributed subagent event gets agentId + agentNameB64 added to the POST
+# body (the tag used to ride as x-rogue-agent-* headers). Mirrors hook.sh's
+# augment_with_agent_tag and tests/test_hook_sh_copilot.sh cases 14-16 — the two
+# dispatchers must emit the SAME bytes, so the expected literals here are the same
+# ones asserted there.
+$BODY = '{"sessionId":"p1","toolName":"bash"}'
+
+Assert-Eq (Add-AgentTag $BODY 'call_A' 'Task Agent') `
+    '{"sessionId":"p1","toolName":"bash","agentId":"call_A","agentNameB64":"VGFzayBBZ2VudA=="}' `
+    'tag adds agentId + base64 display name'
+
+# The point of base64: a display name is arbitrary vendor text, and a raw '"' or
+# '\' concatenated into the body would corrupt the JSON. Mirrors sh case 14b.
+Assert-Eq (Add-AgentTag $BODY 'call_NASTYNAME' ('Task "Agent" ' + $BS + ' v2')) `
+    '{"sessionId":"p1","toolName":"bash","agentId":"call_NASTYNAME","agentNameB64":"VGFzayAiQWdlbnQiIFwgdjI="}' `
+    'a name with " and \ is base64-encoded, not concatenated raw'
+
+# An unknown name omits the field entirely rather than shipping an empty string.
+Assert-Eq (Add-AgentTag $BODY 'call_A' '') `
+    '{"sessionId":"p1","toolName":"bash","agentId":"call_A"}' `
+    'empty display name omits agentNameB64'
+Assert-Eq (Add-AgentTag $BODY 'call_A' $null) `
+    '{"sessionId":"p1","toolName":"bash","agentId":"call_A"}' `
+    'null display name omits agentNameB64'
+
+# Fail-open: the id is a bare Copilot token, so anything outside [A-Za-z0-9_-]
+# skips BOTH fields — losing attribution is fine, a corrupt body is not.
+Assert-Eq (Add-AgentTag $BODY 'call_"evil' 'n') $BODY 'a quote in the id skips the tag'
+Assert-Eq (Add-AgentTag $BODY ('call' + $BS + 'x') 'n') $BODY 'a backslash in the id skips the tag'
+Assert-Eq (Add-AgentTag $BODY 'call A' 'n') $BODY 'a space in the id skips the tag'
+Assert-Eq (Add-AgentTag $BODY '' 'n') $BODY 'an empty id skips the tag'
+Assert-Eq (Add-AgentTag 'not json at all' 'call_A' 'n') 'not json at all' 'a non-object body is left alone'
+
+# Only ONE '}' is stripped (TrimEnd('}') would eat both and corrupt this body),
+# and trailing whitespace is trimmed first so the strip lands on the real brace.
+Assert-Eq (Add-AgentTag '{"a":{"b":1}}' 'call_A' $null) `
+    '{"a":{"b":1},"agentId":"call_A"}' 'a body ending in "}}" keeps its nested object'
+Assert-Eq (Add-AgentTag "{`"a`":1}`n" 'call_A' $null) `
+    '{"a":1,"agentId":"call_A"}' 'trailing newline is trimmed before the brace strip'
+# An empty object needs no comma separator.
+Assert-Eq (Add-AgentTag '{}' 'call_A' $null) '{"agentId":"call_A"}' 'an empty object gets no stray comma'
+
+# ── Add-AgentTag: jq path == concat path ───────────────────────────────────
+# jq is used when it is on PATH (macOS 26 ships /usr/bin/jq) and the string concat
+# otherwise. Only one runs on a given machine, so what keeps the untested path
+# honest is that both emit the same bytes. Force the concat path by emptying PATH.
+$prevPath = $env:PATH
+try {
+    $env:PATH = ''
+    $concat = Add-AgentTag $BODY 'call_A' 'Task Agent'
+} finally { $env:PATH = $prevPath }
+Assert-Eq $concat '{"sessionId":"p1","toolName":"bash","agentId":"call_A","agentNameB64":"VGFzayBBZ2VudA=="}' `
+    'concat path (no jq on PATH) emits the documented bytes'
+if (Get-Command jq -ErrorAction SilentlyContinue) {
+    Assert-Eq (Add-AgentTag $BODY 'call_A' 'Task Agent') $concat 'jq path and concat path are byte-identical'
+} else {
+    Write-Host '  skip: jq not installed — jq path not exercised'
+}
 
 if ($fails -gt 0) {
     Write-Host ""
