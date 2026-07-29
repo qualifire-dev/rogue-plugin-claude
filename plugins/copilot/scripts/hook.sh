@@ -45,6 +45,79 @@ log() {
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 
+# ── JetBrains silent-block alert ───────────────────────────────────────────
+# Copilot's JetBrains harness HONORS a userPromptSubmitted block
+# ({"decision":"block","reason":R}) but renders NOTHING for it — no reason, no
+# row: the chat just goes dead (verified 2026-07-28 on PyCharm 2026.2 /
+# github-copilot-intellij 1.14.1; `reason`, `message`, `systemMessage`,
+# `displayMessage`, `userMessage` and `additionalContext` were all probed and
+# none surfaced). The terminal CLI prints "! <reason>" natively, and every other
+# blocking event (preToolUse deny, postToolUse, agentStop) renders in BOTH
+# surfaces — so this one narrow case is the sole exception to the pure-relay
+# rule, and the alert is gated to it. Without it the user cannot see WHY the
+# turn died, nor learn the `rgx!` escape hatch. Remove once JetBrains renders
+# the reason natively (tracked upstream), exactly as Claude's modal was removed
+# once Claude Desktop rendered blocks itself.
+#
+# Detected surface (measured hook env, both harnesses set COPILOT_CLI=1):
+#   terminal CLI : parent process `copilot`,  COPILOT_CLI_BINARY_VERSION set
+#   JetBrains    : parent process `copilot-language-server` (the IDE embeds the
+#                  CLI harness), COPILOT_CLI_BINARY_VERSION unset, PKG_EXECPATH
+#                  and GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE set.
+# Walk a few levels because hooks.json invokes us through a shell.
+in_jetbrains_ide() {
+  _p=$PPID
+  _n=0
+  while [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null && [ "$_n" -lt 5 ]; do
+    case "$(ps -o comm= -p "$_p" 2>/dev/null)" in
+      *copilot-language-server*) return 0 ;;
+      *copilot)                  return 1 ;;
+    esac
+    _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+    _n=$((_n + 1))
+  done
+  # Fallback when ps is unavailable/restricted: the env shape still separates them.
+  [ -z "${COPILOT_CLI_BINARY_VERSION:-}" ] &&
+    [ -n "${PKG_EXECPATH:-}${GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE:-}" ]
+}
+
+# Fire a modal alert carrying the block reason — the same `display alert as
+# critical` the Claude plugin used before Claude Desktop rendered blocks itself
+# (see git history: plugins/rogue/scripts/security-alert.sh). A banner was tried
+# first and rejected: osascript posts it as *Script Editor*, complete with a
+# "Show" button that opens Script Editor's iCloud folder.
+# ALWAYS DETACHED: a modal waits for the click, so running it inline would stall
+# the dispatcher until dismissed. Backgrounded, it can never change our exit code
+# or delay the relay — which matters on this fail-open-critical path.
+# ROGUE_IDE_ALERT=0 disables; ROGUE_IDE_ALERT_DRYRUN=1 logs without alerting.
+notify_block() {
+  [ "${ROGUE_IDE_ALERT:-1}" = "0" ] && return 0
+  _msg=$(sanitize "$1" | head -c 400)
+  [ -n "$_msg" ] || _msg="Prompt blocked by Rogue Security."
+  log "ide_alert=fired"
+  [ "${ROGUE_IDE_ALERT_DRYRUN:-0}" = "1" ] && return 0
+  # API reasons carry literal "\n" (backslash + n, straight from the JSON
+  # string). Convert to real newlines FIRST — AppleScript accepts them inside a
+  # double-quoted literal — then escape backslashes and quotes for that literal.
+  _msg=$(printf '%s' "$_msg" | awk '{gsub(/\\n/,"\n")}1')
+  _esc=$(printf '%s' "$_msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  if command -v osascript >/dev/null 2>&1; then
+    # NEVER wrap this in `tell application "System Events"` (as the deleted
+    # Claude security-alert.sh did): a cross-app tell is an Automation request,
+    # so macOS attributes it to the HOST app and prompts ""PyCharm" wants access
+    # to control "System Events"" on first block — a consent dialog in front of a
+    # security alert, which many users will simply deny, silently killing the
+    # alert forever. A bare `display alert` needs no permission; `activate`
+    # targets osascript ITSELF (also permission-free) and brings it to the front.
+    ( nohup osascript -e 'activate' \
+        -e "display alert \"Rogue Security\" message \"$_esc\" as critical buttons {\"Dismiss\"} default button \"Dismiss\" giving up after 30" \
+        >/dev/null 2>&1 & ) 2>/dev/null
+  elif command -v notify-send >/dev/null 2>&1; then
+    ( nohup notify-send -u critical "Rogue Security — prompt blocked" "$_msg" >/dev/null 2>&1 & ) 2>/dev/null
+  fi
+  return 0
+}
+
 # agentStop / subagentStop carry no message content inline — only a
 # transcriptPath pointing at the session's events.jsonl. Append the last ~256KB
 # of that file, base64-encoded, as "transcriptTailB64" so the backend can extract
@@ -238,6 +311,24 @@ if [ "$RC" -ne 0 ] || [ "$CODE" != "200" ] || [ -z "$BODY" ]; then
   echo '{}'
   exit 0
 fi
+
+# The ONE case Copilot renders nowhere: a userPromptSubmitted block inside
+# JetBrains (see in_jetbrains_ide). Surface the reason out-of-band, then relay
+# unchanged — the response itself is never rewritten.
+case "$EVENT" in
+  userPromptSubmitted)
+    case "$BODY" in
+      *'"decision"'*'"block"'*)
+        if in_jetbrains_ide; then
+          _reason=$(printf '%s' "$BODY" \
+            | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | sed 's/\\n/ /g')
+          notify_block "$_reason"
+        fi
+        ;;
+    esac
+    ;;
+esac
 
 # rogue-api already returns the correct native Copilot shape (allow "{}" for
 # audit-only events like sessionStart); relay it verbatim.

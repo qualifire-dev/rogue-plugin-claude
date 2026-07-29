@@ -347,5 +347,67 @@ $respHead = if ($resp.Length -gt 400) { $resp.Substring(0, 400) } else { $resp }
 Log "raw=$(Sanitize $respHead)"
 
 if (-not $resp) { Write-Raw '{}'; exit 0 }
+
+# ── JetBrains silent-block alert (mirrors hook.sh notify_block) ────────────
+# JetBrains honors a userPromptSubmitted block but renders NOTHING for it, so
+# the chat dies with no reason and no `rgx!` hint. Every other blocking event
+# renders natively in both surfaces, so this lone case is the sole exception to
+# pure relay. Surface it out-of-band; the response is still relayed unchanged.
+# Detection mirrors hook.sh: the IDE embeds the CLI harness, so both set
+# COPILOT_CLI=1 — the parent process (copilot-language-server vs copilot) is the
+# discriminator, with the env shape as fallback. Balloon tip via NotifyIcon:
+# non-modal and present on PS 5.1 without any module dependency.
+function Test-JetBrainsIde {
+    try {
+        $p = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+        for ($i = 0; $i -lt 5 -and $p; $i++) {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction Stop
+            if (-not $proc) { break }
+            if ($proc.Name -like '*copilot-language-server*') { return $true }
+            if ($proc.Name -like 'copilot*') { return $false }
+            $p = $proc.ParentProcessId
+        }
+    } catch { Dbg "ide detect failed: $($_.Exception.Message)" }
+    return (-not $env:COPILOT_CLI_BINARY_VERSION -and
+            ($env:PKG_EXECPATH -or $env:GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE))
+}
+
+function Show-BlockNotification {
+    param([string]$Reason)
+    if ($env:ROGUE_IDE_ALERT -eq '0') { return }
+    $msg = Sanitize $Reason
+    if (-not $msg) { $msg = 'Prompt blocked by Rogue Security.' }
+    if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }  # matches hook.sh
+    Log 'ide_alert=fired'
+    if ($env:ROGUE_IDE_ALERT_DRYRUN -eq '1') { return }
+    # Windows analogue of hook.sh's `display alert as critical`, using the same
+    # WScript.Shell.Popup the Claude plugin's security-alert.ps1 used: it
+    # surfaces on the interactive desktop from a detached hidden process, needs
+    # no assembly load, and dodges the window-station constraints that make
+    # MessageBox::Show silently no-op there. Type 16 = OK button + stop icon.
+    # ALWAYS DETACHED — a modal waits for the click, so inline would stall the
+    # dispatcher; backgrounded, a lingering dialog can never block the hook.
+    try {
+        $safe = ($msg -replace '\\n', "`n") -replace "'", "''"
+        $inner = @"
+try {
+  `$w = New-Object -ComObject 'WScript.Shell'
+  `$null = `$w.Popup('$safe', 0, 'Rogue Security - prompt blocked', 16)
+} catch { }
+"@
+        $bytes = [System.Text.Encoding]::Unicode.GetBytes($inner)
+        Start-Process -FilePath 'powershell' -WindowStyle Hidden `
+            -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                          ([Convert]::ToBase64String($bytes)) | Out-Null
+    } catch { Dbg "notify failed: $($_.Exception.Message)" }
+}
+
+if ($EventName -eq 'userPromptSubmitted' -and
+    $resp -match '"decision"\s*:\s*"block"' -and (Test-JetBrainsIde)) {
+    $reason = ''
+    if ($resp -match '"reason"\s*:\s*"([^"]*)"') { $reason = $Matches[1] -replace '\\n', ' ' }
+    Show-BlockNotification $reason
+}
+
 Write-Raw $resp
 exit 0

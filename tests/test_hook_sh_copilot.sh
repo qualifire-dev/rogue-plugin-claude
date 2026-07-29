@@ -49,7 +49,9 @@ run_dispatcher() {
     "$SH" "$HOOK" "$1" <<< "$2" > "$OUT_FILE"
   rc=$?
   set -e
-  rm -rf "$tmp_home"
+  LAST_HOME="$tmp_home"
+  # KEEP_HOME=1 preserves the run's HOME so a caller can assert on hook.log.
+  [ "${KEEP_HOME:-0}" = "1" ] || rm -rf "$tmp_home"
   return $rc
 }
 
@@ -117,6 +119,70 @@ restart_mock '{}'
 run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
 out=$(cat "$OUT_FILE")
 assert_eq "$out" "{}" "userPromptSubmitted allow relayed"
+
+# ── Case 4b: JetBrains silent-block alert ──────────────────────────────────
+# JetBrains honors a userPromptSubmitted block but renders nothing for it, so
+# the dispatcher fires an out-of-band notification — ONLY there, ONLY for that
+# event, and never altering the relayed body. DRYRUN logs instead of notifying.
+# Surface is simulated via the env fallback in in_jetbrains_ide (the ancestry
+# walk finds no copilot process under the test runner).
+BLOCK='{"decision":"block","reason":"Coding Agent Security: PROMPT_INJECTION"}'
+
+restart_mock "$BLOCK"
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
+out=$(cat "$OUT_FILE"); log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+assert_eq "$out" "$BLOCK" "IDE block still relayed verbatim (alert is out-of-band)"
+case "$log_txt" in
+  *ide_alert=fired*) echo "ok: IDE userPromptSubmitted block fires the alert" ;;
+  *) echo "FAIL: IDE userPromptSubmitted block did not fire the alert"; exit 1 ;;
+esac
+
+# Terminal CLI renders "! <reason>" itself — alerting there would double-notify.
+restart_mock "$BLOCK"
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION=1.0.75 PKG_EXECPATH='' \
+  run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
+log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+case "$log_txt" in
+  *ide_alert=fired*) echo "FAIL: alert fired on the terminal CLI surface"; exit 1 ;;
+  *) echo "ok: no alert on the terminal CLI surface" ;;
+esac
+
+# preToolUse deny renders natively in BOTH surfaces — no alert even in the IDE.
+restart_mock '{"permissionDecision":"deny","permissionDecisionReason":"nope"}'
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher preToolUse '{"toolName":"bash"}'
+log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+case "$log_txt" in
+  *ide_alert=fired*) echo "FAIL: alert fired for a natively-rendered preToolUse deny"; exit 1 ;;
+  *) echo "ok: no alert for preToolUse deny (Copilot renders it)" ;;
+esac
+
+# An allow must never alert, IDE or not.
+restart_mock '{}'
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher userPromptSubmitted '{"prompt":"hello"}'
+log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+case "$log_txt" in
+  *ide_alert=fired*) echo "FAIL: alert fired on an allow"; exit 1 ;;
+  *) echo "ok: no alert on an allow" ;;
+esac
+
+# ROGUE_IDE_ALERT=0 is an escape hatch for users who don't want the popup.
+restart_mock "$BLOCK"
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT=0 ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
+out=$(cat "$OUT_FILE"); log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+assert_eq "$out" "$BLOCK" "ROGUE_IDE_ALERT=0 still relays the block verbatim"
+case "$log_txt" in
+  *ide_alert=fired*) echo "FAIL: ROGUE_IDE_ALERT=0 did not suppress the alert"; exit 1 ;;
+  *) echo "ok: ROGUE_IDE_ALERT=0 suppresses the alert" ;;
+esac
 
 # ── Case 5: unconfigured (no API key) → {} without calling server ──────────
 TMP_HOME="$(mktemp -d)"
