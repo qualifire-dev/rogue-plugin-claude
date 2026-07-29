@@ -379,6 +379,13 @@ if ($hasCopilot) {
     if (-not $installed) { Die "copilot plugin install failed. Run 'copilot plugin install $PluginName@$CopilotMarketplaceName' to see the error." }
     Ok 'Plugin installed'
     Warn2 'Copilot skips untrusted hooks - open /hooks in Copilot CLI and trust the Rogue entries once.'
+    # Mirrors install.sh: Rogue reaches JetBrains only through Copilot's
+    # CLI/Agent provider. The IDE's built-in "Local" agent runs its own hook
+    # engine that refuses plugin-provided hooks (zero coverage), and no hook ever
+    # runs there to warn from - the installer is the only place we can say it.
+    if ($env:APPDATA -and (Test-Path -LiteralPath (Join-Path $env:APPDATA 'JetBrains'))) {
+        Warn2 "In JetBrains, pick Copilot's CLI/Agent provider - the built-in Local agent ignores installed plugins, so Rogue would see nothing."
+    }
 }
 
 Write-Host @"

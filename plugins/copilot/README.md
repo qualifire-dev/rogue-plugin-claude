@@ -29,6 +29,34 @@ plugins), not the single-Node model used for Gemini CLI. On Windows, Copilot
 prefers PowerShell 7+ but falls back to Windows PowerShell 5.1 — `hook.ps1` stays
 5.1-compatible.
 
+## JetBrains
+
+Rogue covers JetBrains through Copilot's **CLI/Agent** provider, which embeds the
+same hook engine as the terminal CLI (`copilot-language-server` reads
+`~/.copilot/installed-plugins`, so the plugin you installed above is already
+active — there is no separate IDE-side install).
+
+> ⚠️ **Select the CLI/Agent provider.** With the IDE's built-in **Local** agent
+> selected, the IDE runs its *own* hook engine, which reads only
+> `<git-root>/.github/hooks/**/*.json`, supports 4 events, discards hook
+> decisions, and refuses plugin-provided hooks outright ("Refusing to execute
+> hook from untrusted workspace folder"). That means **zero Rogue coverage** —
+> nothing is observed and nothing can be blocked. `/rogue:status` is unreachable
+> there too, so there is no in-IDE warning we can show you.
+
+**Blocked-prompt alert.** JetBrains honors a blocked prompt but renders nothing
+for it — the chat simply goes dead, with no reason and no hint about the `rgx!`
+override. So on that one case the dispatcher also shows a local desktop alert
+carrying the reason (`display alert` on macOS, `notify-send` on Linux,
+`WScript.Shell.Popup` on Windows). It is the only thing either dispatcher ever
+does beyond relaying the backend's response, and it is scoped tightly: prompt
+blocks only, JetBrains only — every other decision (a denied tool call, a
+withheld tool result, a blocked reply) already renders natively in both the IDE
+and the terminal, and never alerts.
+
+Set `ROGUE_IDE_ALERT=0` in `~/.rogue-env` to turn the alert off. Blocks are still
+enforced — they just become invisible in JetBrains again.
+
 ## Install
 
 ```

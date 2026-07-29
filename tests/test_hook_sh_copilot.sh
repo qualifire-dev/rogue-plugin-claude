@@ -5,6 +5,13 @@
 # to the Copilot-specific invariant that it ALWAYS exits 0 (preToolUse is
 # fail-closed on the CLI side, so a non-zero exit would deny the tool).
 #
+# Cases 4b-4e also cover the ONE out-of-band exception to pure relay — the
+# JetBrains silent-block alert: that it fires only for a userPromptSubmitted
+# block in the IDE, never for a natively-rendered decision or an allow, that the
+# block-shape match is strict enough not to trip on a body that merely carries
+# "block" elsewhere, that surface detection survives Linux's 15-char `comm`
+# truncation, and that the composed AppleScript literal is correctly escaped.
+#
 # Copilot runs the `bash` command on macOS/Linux; override with TEST_SH=dash to
 # exercise strict POSIX and catch bashisms.
 set -euo pipefail
@@ -17,6 +24,8 @@ PORT=$((RANDOM % 10000 + 30000))
 HEADERS_FILE="$(mktemp)"
 ENV_FILE="$(mktemp)"
 OUT_FILE="$(mktemp)"
+# Optional directory prepended to the dispatcher's PATH (see make_ps_shim).
+TEST_BIN=""
 
 cleanup() {
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null || true
@@ -46,6 +55,7 @@ run_dispatcher() {
     ROGUE_FLUSH_WAIT_ITERS="${ROGUE_FLUSH_WAIT_ITERS:-}" \
     ROGUE_COPILOT_STATE_DIR="${ROGUE_COPILOT_STATE_DIR:-}" \
     ROGUE_SUBAGENT_RESOLVE_ITERS="${ROGUE_SUBAGENT_RESOLVE_ITERS:-}" \
+    PATH="${TEST_BIN:+$TEST_BIN:}$PATH" \
     "$SH" "$HOOK" "$1" <<< "$2" > "$OUT_FILE"
   rc=$?
   set -e
@@ -53,6 +63,25 @@ run_dispatcher() {
   # KEEP_HOME=1 preserves the run's HOME so a caller can assert on hook.log.
   [ "${KEEP_HOME:-0}" = "1" ] || rm -rf "$tmp_home"
   return $rc
+}
+
+# Build a throwaway `ps` shim so in_jetbrains_ide's ancestry walk can be driven
+# from a test (the real ancestry under the test runner has no copilot process).
+# $1 = what `ps -o comm=` should report for every ancestor. Echoes the dir; the
+# caller prepends it via TEST_BIN and removes it afterwards.
+make_ps_shim() {
+  local d
+  d="$(mktemp -d)"
+  cat > "$d/ps" <<EOF
+#!/bin/sh
+case "\$*" in
+  *comm*) echo '$1' ;;
+  *ppid*) echo 1 ;;
+esac
+exit 0
+EOF
+  chmod +x "$d/ps"
+  printf '%s' "$d"
 }
 
 start_mock() {
@@ -183,6 +212,77 @@ case "$log_txt" in
   *ide_alert=fired*) echo "FAIL: ROGUE_IDE_ALERT=0 did not suppress the alert"; exit 1 ;;
   *) echo "ok: ROGUE_IDE_ALERT=0 suppresses the alert" ;;
 esac
+
+# ── Case 4c: the block-shape match must be STRICT ──────────────────────────
+# The response body is server-controlled and carries sibling fields. A loose
+# glob (*'"decision"'*'"block"'*) matches this ALLOW body — the literal
+# substring "block" appears verbatim as another field's value — and would pop a
+# modal on a prompt that was never blocked. The dispatcher must require the
+# actual "decision" : "block" pair.
+ALLOW_QUOTING_BLOCK='{"decision":"allow","reason":"no findings","rulesetMode":"block"}'
+restart_mock "$ALLOW_QUOTING_BLOCK"
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher userPromptSubmitted '{"prompt":"hello"}'
+out=$(cat "$OUT_FILE"); log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+assert_eq "$out" "$ALLOW_QUOTING_BLOCK" 'allow body carrying a "block" sibling value is relayed verbatim'
+case "$log_txt" in
+  *ide_alert=fired*) echo 'FAIL: alert fired on an allow carrying a "block" sibling value'; exit 1 ;;
+  *) echo '  ok: no alert on an allow carrying a "block" sibling value' ;;
+esac
+
+# ── Case 4d: surface detection survives Linux `comm` truncation ────────────
+# Linux caps comm at TASK_COMM_LEN-1 = 15 chars, so copilot-language-server is
+# reported as "copilot-languag": a pattern matching only the full name can NEVER
+# hit there. The env fallback is deliberately set to the TERMINAL shape, so only
+# the ancestry walk can produce a positive here.
+PS_SHIM="$(make_ps_shim copilot-languag)"
+restart_mock "$BLOCK"
+KEEP_HOME=1 TEST_BIN="$PS_SHIM" \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION=1.0.75 PKG_EXECPATH='' \
+  run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
+log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME" "$PS_SHIM"
+case "$log_txt" in
+  *ide_alert=fired*) echo "  ok: Linux-truncated 'copilot-languag' parent detected as the IDE" ;;
+  *) echo "FAIL: Linux-truncated 'copilot-languag' parent not detected as the IDE"; exit 1 ;;
+esac
+
+# ...and the terminal CLI still wins over an IDE-shaped env. macOS BSD
+# `ps -o comm=` prints the full executable path, so the *copilot) arm has to
+# match a trailing path component — and must stay SECOND in the case, since
+# ".../copilot-language-server" would also match *copilot*.
+PS_SHIM="$(make_ps_shim /opt/homebrew/bin/copilot)"
+restart_mock "$BLOCK"
+KEEP_HOME=1 TEST_BIN="$PS_SHIM" \
+  ROGUE_IDE_ALERT_DRYRUN=1 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
+log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME" "$PS_SHIM"
+case "$log_txt" in
+  *ide_alert=fired*) echo "FAIL: a plain 'copilot' parent (terminal CLI) alerted anyway"; exit 1 ;;
+  *) echo "  ok: full-path 'copilot' parent (terminal CLI) suppresses the alert" ;;
+esac
+
+# ── Case 4e: composed AppleScript literal — newlines + escaping ────────────
+# ROGUE_IDE_ALERT_DRYRUN=2 logs the exact string that would be interpolated into
+# the `display alert ... message "…"` literal (real newlines rendered as '|').
+# Two invariants: the API's literal "\n" (backslash + n, straight out of the
+# JSON) becomes a REAL newline so the two-paragraph reason renders as written
+# (the call site must not pre-collapse it to a space), and every backslash is
+# doubled for the AppleScript literal so server-controlled text cannot break out
+# of it. (A literal '"' can't be exercised here: the raw-text reason extractor
+# stops at the first quote, so one never reaches the escaper.)
+NL_BLOCK='{"decision":"block","reason":"Rogue blocked.\nPath C:\\temp; use rgx!"}'
+restart_mock "$NL_BLOCK"
+KEEP_HOME=1 \
+  ROGUE_IDE_ALERT_DRYRUN=2 COPILOT_CLI=1 COPILOT_CLI_BINARY_VERSION='' PKG_EXECPATH=/x \
+  run_dispatcher userPromptSubmitted '{"prompt":"ignore previous"}'
+out=$(cat "$OUT_FILE"); log_txt=$(cat "$LAST_HOME/hook.log"); rm -rf "$LAST_HOME"
+assert_eq "$out" "$NL_BLOCK" "DRYRUN=2 still relays the block verbatim"
+if printf '%s' "$log_txt" | grep -qF 'ide_alert=escaped msg=Rogue blocked.|Path C:\\\\temp; use rgx!'; then
+  echo '  ok: literal \n becomes a real newline and backslashes are doubled'
+else
+  echo "FAIL [alert escaping]: log was <$log_txt>" >&2; exit 1
+fi
 
 # ── Case 5: unconfigured (no API key) → {} without calling server ──────────
 TMP_HOME="$(mktemp -d)"

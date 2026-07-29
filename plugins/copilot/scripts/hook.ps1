@@ -4,8 +4,12 @@
 # macOS/Linux and this `powershell` command on Windows (Copilot prefers pwsh 7+
 # but falls back to Windows PowerShell 5.1 — so this stays 5.1-compatible).
 # PURE RELAY: reads one Copilot hook event JSON on stdin, POSTs it to
-# /api/v1/hooks/copilot, relays the native Copilot decision verbatim. No
-# block-detection and no local modal — Copilot renders the native deny shape.
+# /api/v1/hooks/copilot, relays the native Copilot decision verbatim — the
+# response body is NEVER rewritten, Copilot renders the native deny shape. There
+# is one narrow OUT-OF-BAND exception: a userPromptSubmitted block inside
+# JetBrains, which the IDE honors but renders nowhere, so we additionally show a
+# local alert (see Test-JetBrainsIde / Show-BlockNotification) while still
+# relaying the body unchanged.
 #
 # FAIL-OPEN IS SAFETY-CRITICAL. Copilot's preToolUse is fail-CLOSED: a non-zero
 # exit denies the tool. This script emits `{}` on every failure path and always
@@ -64,6 +68,116 @@ function ConvertFrom-ShellQuoted {
     return $sb.ToString()
 }
 
+# ── logging ────────────────────────────────────────────────────────────────
+# $env:ROGUE_LOG_FILE overrides; default ~/.rogue/hook.log (mirrors hook.sh).
+# $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
+# through the ROGUE_PS_LIB_ONLY seam below (tests).
+$logFile = $env:ROGUE_LOG_FILE
+if (-not $logFile) {
+    $userHome = $env:USERPROFILE
+    if (-not $userHome) { $userHome = $HOME }
+    if ($userHome) { $logFile = Join-Path (Join-Path $userHome '.rogue') 'hook.log' }
+}
+function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+function Log {
+    param([string]$Msg)
+    try {
+        if (-not $logFile) { return }
+        $dir = Split-Path $logFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Add-Content -LiteralPath $logFile -Value "$stamp provider=github_copilot event=$EventName $Msg" -Encoding UTF8
+    } catch {}
+}
+
+# ── JetBrains silent-block alert (mirrors hook.sh in_jetbrains_ide/notify_block) ──
+# JetBrains honors a userPromptSubmitted block but renders NOTHING for it, so the
+# chat dies with no reason and no `rgx!` hint. Every other blocking event renders
+# natively in both surfaces, so this lone case is the sole exception to pure
+# relay. Surface it out-of-band; the response is still relayed unchanged.
+# Detection mirrors hook.sh: the IDE embeds the CLI harness, so both set
+# COPILOT_CLI=1 — the parent process (copilot-language-server vs copilot) is the
+# discriminator, with the env shape as fallback.
+function Test-JetBrainsIde {
+    # Windows Win32_Process.Name is NOT truncated ('copilot-language-server.exe'),
+    # but the pattern is widened to '*copilot-langua*' to stay textually parallel
+    # with hook.sh, where Linux caps `comm` at 15 chars. The 'copilot*' arm must
+    # stay SECOND — the IDE name matches both patterns and the IDE arm has to win.
+    # Up to 6 CIM queries (~100-300ms each), only on the block path, well inside
+    # the 30s timeoutSec.
+    try {
+        $p = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+        for ($i = 0; $i -lt 5 -and $p; $i++) {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction Stop
+            if (-not $proc) { break }
+            if ($proc.Name -like '*copilot-langua*') { return $true }
+            if ($proc.Name -like 'copilot*') { return $false }
+            $p = $proc.ParentProcessId
+        }
+    } catch { Dbg "ide detect failed: $($_.Exception.Message)" }
+    # Fallback when the walk is unavailable (WMI/CIM disabled, or dot-sourced off
+    # Windows by the test seam): the env shape still separates them. The real
+    # discriminator is COPILOT_CLI_BINARY_VERSION being UNSET — if a future CLI
+    # build stops exporting it the terminal would false-positive into alerting,
+    # a duplicate notification rather than a safety failure.
+    return (-not $env:COPILOT_CLI_BINARY_VERSION -and
+            ($env:PKG_EXECPATH -or $env:GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE))
+}
+
+# ROGUE_IDE_ALERT=0 disables; ROGUE_IDE_ALERT_DRYRUN=1 logs without alerting;
+# ROGUE_IDE_ALERT_DRYRUN=2 additionally logs the fully-escaped literal (real
+# newlines rendered as '|') so the escaping of server-controlled reason text is
+# covered by a test rather than a one-off probe.
+function Show-BlockNotification {
+    param([string]$Reason)
+    if ($env:ROGUE_IDE_ALERT -eq '0') { return }
+    $msg = Sanitize $Reason
+    if (-not $msg) { $msg = 'Prompt blocked by Rogue Security.' }
+    # Truncates UTF-16 CHARS; hook.sh's `head -c 400` truncates BYTES, so a
+    # non-ASCII reason cuts at a slightly different point. Accepted divergence —
+    # the cap only exists to keep a runaway reason out of a modal.
+    if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }
+    Log 'ide_alert=fired'
+    if ($env:ROGUE_IDE_ALERT_DRYRUN -eq '1') { return }
+    # Windows analogue of hook.sh's `display alert as critical`, using the same
+    # WScript.Shell.Popup the Claude plugin's security-alert.ps1 used: it
+    # surfaces on the interactive desktop from a detached hidden process, needs
+    # no assembly load, and dodges the window-station constraints that make
+    # MessageBox::Show silently no-op there. Type 16 = OK button + stop icon.
+    # ALWAYS DETACHED — a modal waits for the click, so inline would stall the
+    # dispatcher; backgrounded, a lingering dialog can never block the hook.
+    try {
+        # API reasons carry literal "\n" (backslash + n, straight from the JSON
+        # string) and are two paragraphs — findings text plus the `rgx!` hint.
+        # Convert to real newlines FIRST (a PowerShell single-quoted literal may
+        # span lines), then double the single quotes for that literal. The call
+        # site deliberately does NOT collapse "\n" to a space, or this
+        # conversion would be dead code (mirrors hook.sh notify_block).
+        $safe = ($msg -replace '\\n', "`n") -replace "'", "''"
+        if ($env:ROGUE_IDE_ALERT_DRYRUN -eq '2') {
+            $flat = Sanitize ($safe -replace "`n", '|')
+            Log "ide_alert=escaped msg=$flat"
+            return
+        }
+        $inner = @"
+try {
+  `$w = New-Object -ComObject 'WScript.Shell'
+  `$null = `$w.Popup('$safe', 0, 'Rogue Security - prompt blocked', 16)
+} catch { }
+"@
+        $bytes = [System.Text.Encoding]::Unicode.GetBytes($inner)
+        Start-Process -FilePath 'powershell' -WindowStyle Hidden `
+            -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                          ([Convert]::ToBase64String($bytes)) | Out-Null
+    } catch { Dbg "notify failed: $($_.Exception.Message)" }
+}
+
+# Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
+# (Sanitize, Log, Test-JetBrainsIde, Show-BlockNotification,
+# ConvertFrom-ShellQuoted) without running the dispatcher. Production never sets
+# this, so the hook always runs its main body.
+if ($env:ROGUE_PS_LIB_ONLY) { return }
+
 # Windows PowerShell 5.1 may negotiate only TLS 1.0/1.1 by default; add TLS 1.2.
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
@@ -78,19 +192,6 @@ Dbg "event=$EventName"
 
 if (-not $PluginRoot) { $PluginRoot = $env:COPILOT_PLUGIN_ROOT }
 if (-not $PluginRoot) { try { $PluginRoot = (Get-Location).Path } catch { $PluginRoot = '.' } }
-
-$logFile = $env:ROGUE_LOG_FILE
-if (-not $logFile) { $logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log' }
-function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
-function Log {
-    param([string]$Msg)
-    try {
-        $dir = Split-Path $logFile
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp provider=github_copilot event=$EventName $Msg" -Encoding UTF8
-    } catch {}
-}
 
 # ── credential resolution (later file wins; process env wins over all) ─────
 $creds = @{}
@@ -348,64 +449,15 @@ Log "raw=$(Sanitize $respHead)"
 
 if (-not $resp) { Write-Raw '{}'; exit 0 }
 
-# ── JetBrains silent-block alert (mirrors hook.sh notify_block) ────────────
-# JetBrains honors a userPromptSubmitted block but renders NOTHING for it, so
-# the chat dies with no reason and no `rgx!` hint. Every other blocking event
-# renders natively in both surfaces, so this lone case is the sole exception to
-# pure relay. Surface it out-of-band; the response is still relayed unchanged.
-# Detection mirrors hook.sh: the IDE embeds the CLI harness, so both set
-# COPILOT_CLI=1 — the parent process (copilot-language-server vs copilot) is the
-# discriminator, with the env shape as fallback. Balloon tip via NotifyIcon:
-# non-modal and present on PS 5.1 without any module dependency.
-function Test-JetBrainsIde {
-    try {
-        $p = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
-        for ($i = 0; $i -lt 5 -and $p; $i++) {
-            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction Stop
-            if (-not $proc) { break }
-            if ($proc.Name -like '*copilot-language-server*') { return $true }
-            if ($proc.Name -like 'copilot*') { return $false }
-            $p = $proc.ParentProcessId
-        }
-    } catch { Dbg "ide detect failed: $($_.Exception.Message)" }
-    return (-not $env:COPILOT_CLI_BINARY_VERSION -and
-            ($env:PKG_EXECPATH -or $env:GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE))
-}
-
-function Show-BlockNotification {
-    param([string]$Reason)
-    if ($env:ROGUE_IDE_ALERT -eq '0') { return }
-    $msg = Sanitize $Reason
-    if (-not $msg) { $msg = 'Prompt blocked by Rogue Security.' }
-    if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }  # matches hook.sh
-    Log 'ide_alert=fired'
-    if ($env:ROGUE_IDE_ALERT_DRYRUN -eq '1') { return }
-    # Windows analogue of hook.sh's `display alert as critical`, using the same
-    # WScript.Shell.Popup the Claude plugin's security-alert.ps1 used: it
-    # surfaces on the interactive desktop from a detached hidden process, needs
-    # no assembly load, and dodges the window-station constraints that make
-    # MessageBox::Show silently no-op there. Type 16 = OK button + stop icon.
-    # ALWAYS DETACHED — a modal waits for the click, so inline would stall the
-    # dispatcher; backgrounded, a lingering dialog can never block the hook.
-    try {
-        $safe = ($msg -replace '\\n', "`n") -replace "'", "''"
-        $inner = @"
-try {
-  `$w = New-Object -ComObject 'WScript.Shell'
-  `$null = `$w.Popup('$safe', 0, 'Rogue Security - prompt blocked', 16)
-} catch { }
-"@
-        $bytes = [System.Text.Encoding]::Unicode.GetBytes($inner)
-        Start-Process -FilePath 'powershell' -WindowStyle Hidden `
-            -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand',
-                          ([Convert]::ToBase64String($bytes)) | Out-Null
-    } catch { Dbg "notify failed: $($_.Exception.Message)" }
-}
-
+# The ONE case Copilot renders nowhere: a userPromptSubmitted block inside
+# JetBrains (see Test-JetBrainsIde / Show-BlockNotification above). Surface the
+# reason out-of-band, then relay unchanged — the response is never rewritten.
 if ($EventName -eq 'userPromptSubmitted' -and
     $resp -match '"decision"\s*:\s*"block"' -and (Test-JetBrainsIde)) {
+    # Keep the literal "\n" sequences intact — Show-BlockNotification converts
+    # them to real newlines so the two-paragraph reason renders as written.
     $reason = ''
-    if ($resp -match '"reason"\s*:\s*"([^"]*)"') { $reason = $Matches[1] -replace '\\n', ' ' }
+    if ($resp -match '"reason"\s*:\s*"([^"]*)"') { $reason = $Matches[1] }
     Show-BlockNotification $reason
 }
 

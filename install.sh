@@ -587,6 +587,14 @@ install_copilot() {
   printf '\n%sRogue Security%s — GitHub Copilot CLI\n' "$C_TEAL" "$C_RESET" >&2
   copilot_install_plugin
   note "Copilot skips untrusted hooks — open ${C_DIM}/hooks${C_RESET} in Copilot CLI and trust the Rogue entries once."
+  # Rogue reaches JetBrains only through Copilot's CLI/Agent provider. The IDE's
+  # built-in "Local" agent runs its OWN hook engine, which reads only
+  # <git-root>/.github/hooks/**/*.json and refuses plugin-provided hooks — zero
+  # coverage. No hook ever runs there, so nothing inside the IDE can warn about
+  # it; the installer is the only place we still have a voice.
+  if [ -d "$HOME/Library/Application Support/JetBrains" ] || [ -d "$HOME/.config/JetBrains" ]; then
+    note "In JetBrains, pick Copilot's ${C_DIM}CLI/Agent${C_RESET} provider — the built-in ${C_DIM}Local${C_RESET} agent ignores installed plugins, so Rogue would see nothing."
+  fi
   note "Then restart Copilot CLI and run ${C_DIM}/rogue:status${C_RESET} to verify."
 }
 

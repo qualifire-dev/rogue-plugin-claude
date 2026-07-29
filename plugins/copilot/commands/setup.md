@@ -73,6 +73,12 @@ Until this is done, no events are sent. (Trust is recorded against the hook
 definition; script-only plugin updates keep the same hook definition, so this is
 a one-time step.)
 
+**If the user works in JetBrains**, also tell them to select Copilot's
+**CLI/Agent** provider. The IDE's built-in **Local** agent runs a separate hook
+engine that reads only `<git-root>/.github/hooks/**/*.json` and refuses
+plugin-provided hooks, so with Local selected Rogue sees and blocks **nothing** —
+and cannot warn them from inside the IDE, since no hook ever runs.
+
 ## Step 7: Final instructions
 
 Tell the user:
@@ -80,4 +86,8 @@ Tell the user:
 1. Credentials are stored in `~/.rogue-env` with restricted permissions (mode 600)
 2. **Restart Copilot CLI** so the plugin loads the credentials
 3. After restarting (and trusting via `/hooks`), run `/rogue:status` to verify
-4. The AIDR dashboard is at https://app.rogue.security/aidr
+4. In **JetBrains**, a blocked prompt also raises a desktop alert with the reason,
+   because the IDE renders nothing for it itself. Add `export ROGUE_IDE_ALERT=0`
+   to `~/.rogue-env` to disable the alert — the block is still enforced, it just
+   becomes invisible in the IDE again.
+5. The AIDR dashboard is at https://app.rogue.security/aidr

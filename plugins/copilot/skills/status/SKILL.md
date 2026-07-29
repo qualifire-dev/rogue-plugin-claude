@@ -26,10 +26,15 @@ echo "Credential sources detected:"
 [ -r "$HOME/.rogue-env" ] && echo "  $HOME/.rogue-env  (per-user)"
 [ ! -r /etc/rogue/env ] && [ ! -r "$HOME/.rogue-env" ] && echo "  (none)"
 [ -n "$ROGUE_API_KEY" ] && echo "API key resolved: ...${ROGUE_API_KEY: -4}" || echo "API key: not resolved"
+[ "${ROGUE_IDE_ALERT:-1}" = "0" ] && echo "ROGUE_IDE_ALERT=0  (JetBrains blocked-prompt alert disabled)"
 ```
 
 If no sources are found OR `ROGUE_API_KEY` is empty: individual users run
 `/rogue:setup`; managed users contact their security admin. Stop here in that case.
+
+If `ROGUE_IDE_ALERT=0` is reported, mention it: in JetBrains a blocked prompt
+renders nothing, so with the alert off a block looks like the chat silently dying.
+Remove the line from `~/.rogue-env` to get the reason back.
 
 ## Step 2: Test connection + register heartbeat
 

@@ -4,10 +4,14 @@
 #
 # Reads one Copilot hook event JSON on stdin, POSTs it to the rogue-api
 # /hooks/copilot route, and relays the native Copilot decision verbatim on
-# stdout. PURE RELAY: no block-detection regex, no local modal — Copilot renders
-# the native deny shape ({"permissionDecision":"deny",...}) itself. The only
-# stdin enrichment is agentStop/subagentStop, which append the transcript tail
-# (see augment_with_transcript) so the backend can read the final message.
+# stdout. PURE RELAY: the response body is NEVER rewritten — Copilot renders the
+# native deny shape ({"permissionDecision":"deny",...}) itself. There is one
+# narrow OUT-OF-BAND exception: a userPromptSubmitted block inside JetBrains,
+# which the IDE honors but renders nowhere, so we additionally show a local
+# alert (see in_jetbrains_ide / notify_block) while still relaying the body
+# unchanged. The only stdin enrichment is agentStop/subagentStop, which append
+# the transcript tail (see augment_with_transcript) so the backend can read the
+# final message.
 #
 # Copilot selects the `bash` command on macOS/Linux and the `powershell` command
 # on Windows (see hooks.json), so — unlike the Claude bridge — there is no
@@ -65,18 +69,32 @@ sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 #                  CLI harness), COPILOT_CLI_BINARY_VERSION unset, PKG_EXECPATH
 #                  and GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE set.
 # Walk a few levels because hooks.json invokes us through a shell.
+# NOTE: _p/_n are NOT function-local (POSIX sh has no `local`) and the same names
+# are reused by wait_for_transcript_flush and reattribute_subagent below. That is
+# safe only because this helper runs LAST, after both — do not reorder the call
+# sites without renaming these.
 in_jetbrains_ide() {
   _p=$PPID
   _n=0
   while [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null && [ "$_n" -lt 5 ]; do
+    # Linux caps `comm` at TASK_COMM_LEN-1 = 15 chars, so copilot-language-server
+    # (23 chars) is reported as "copilot-languag" — matching only the full name
+    # can NEVER succeed there. Match the truncated prefix too. macOS BSD
+    # `ps -o comm=` prints the full executable PATH, so the *copilot) arm must
+    # stay SECOND: ".../copilot-language-server" matches both patterns and the
+    # IDE arm has to win. Ordering is load-bearing.
     case "$(ps -o comm= -p "$_p" 2>/dev/null)" in
-      *copilot-language-server*) return 0 ;;
-      *copilot)                  return 1 ;;
+      *copilot-langua*) return 0 ;;
+      *copilot)         return 1 ;;
     esac
     _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
     _n=$((_n + 1))
   done
-  # Fallback when ps is unavailable/restricted: the env shape still separates them.
+  # Fallback when ps is unavailable/restricted (hidepid=2, containers): the env
+  # shape still separates them. The real discriminator is
+  # COPILOT_CLI_BINARY_VERSION being UNSET; if a future CLI build stops exporting
+  # it the terminal would false-positive into alerting — a duplicate
+  # notification, not a safety failure.
   [ -z "${COPILOT_CLI_BINARY_VERSION:-}" ] &&
     [ -n "${PKG_EXECPATH:-}${GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE:-}" ]
 }
@@ -89,18 +107,32 @@ in_jetbrains_ide() {
 # ALWAYS DETACHED: a modal waits for the click, so running it inline would stall
 # the dispatcher until dismissed. Backgrounded, it can never change our exit code
 # or delay the relay — which matters on this fail-open-critical path.
-# ROGUE_IDE_ALERT=0 disables; ROGUE_IDE_ALERT_DRYRUN=1 logs without alerting.
+# ROGUE_IDE_ALERT=0 disables; ROGUE_IDE_ALERT_DRYRUN=1 logs without alerting;
+# ROGUE_IDE_ALERT_DRYRUN=2 additionally logs the fully-escaped literal that would
+# be handed to osascript (real newlines rendered as '|') so the escaping of
+# server-controlled reason text is covered by a test rather than a one-off probe.
 notify_block() {
   [ "${ROGUE_IDE_ALERT:-1}" = "0" ] && return 0
+  # head -c truncates BYTES; hook.ps1's .Substring(0,400) truncates UTF-16 chars,
+  # so a non-ASCII reason cuts at a slightly different point (accepted
+  # divergence). head -c can also split a multi-byte UTF-8 sequence — osascript
+  # and notify-send both tolerate the stray byte.
   _msg=$(sanitize "$1" | head -c 400)
   [ -n "$_msg" ] || _msg="Prompt blocked by Rogue Security."
   log "ide_alert=fired"
   [ "${ROGUE_IDE_ALERT_DRYRUN:-0}" = "1" ] && return 0
   # API reasons carry literal "\n" (backslash + n, straight from the JSON
-  # string). Convert to real newlines FIRST — AppleScript accepts them inside a
-  # double-quoted literal — then escape backslashes and quotes for that literal.
+  # string) and are two paragraphs — the findings text and the `rgx!` override
+  # hint. Convert to real newlines FIRST (AppleScript accepts them inside a
+  # double-quoted literal, verified) then escape backslashes and quotes for that
+  # literal. The call site deliberately does NOT collapse "\n" to a space, or
+  # this conversion would be dead code and the alert would render as one blob.
   _msg=$(printf '%s' "$_msg" | awk '{gsub(/\\n/,"\n")}1')
   _esc=$(printf '%s' "$_msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  if [ "${ROGUE_IDE_ALERT_DRYRUN:-0}" = "2" ]; then
+    log "ide_alert=escaped msg=$(sanitize "$(printf '%s' "$_esc" | tr '\n' '|')")"
+    return 0
+  fi
   if command -v osascript >/dev/null 2>&1; then
     # NEVER wrap this in `tell application "System Events"` (as the deleted
     # Claude security-alert.sh did): a cross-app tell is an Automation request,
@@ -109,11 +141,15 @@ notify_block() {
     # security alert, which many users will simply deny, silently killing the
     # alert forever. A bare `display alert` needs no permission; `activate`
     # targets osascript ITSELF (also permission-free) and brings it to the front.
+    # stdin is redirected too: a leaked fd would hold Copilot's pipe open past
+    # our exit. (nohup only shields the child from SIGHUP, not from a
+    # process-group SIGTERM — a non-issue since we return immediately after
+    # spawning, well inside the 30s timeoutSec.)
     ( nohup osascript -e 'activate' \
         -e "display alert \"Rogue Security\" message \"$_esc\" as critical buttons {\"Dismiss\"} default button \"Dismiss\" giving up after 30" \
-        >/dev/null 2>&1 & ) 2>/dev/null
+        </dev/null >/dev/null 2>&1 & ) 2>/dev/null
   elif command -v notify-send >/dev/null 2>&1; then
-    ( nohup notify-send -u critical "Rogue Security — prompt blocked" "$_msg" >/dev/null 2>&1 & ) 2>/dev/null
+    ( nohup notify-send -u critical "Rogue Security — prompt blocked" "$_msg" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
   fi
   return 0
 }
@@ -317,16 +353,20 @@ fi
 # unchanged — the response itself is never rewritten.
 case "$EVENT" in
   userPromptSubmitted)
-    case "$BODY" in
-      *'"decision"'*'"block"'*)
-        if in_jetbrains_ide; then
-          _reason=$(printf '%s' "$BODY" \
-            | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | sed 's/\\n/ /g')
-          notify_block "$_reason"
-        fi
-        ;;
-    esac
+    # STRICT shape match, mirroring hook.ps1's '"decision"\s*:\s*"block"' regex.
+    # A loose glob (*'"decision"'*'"block"'*) false-positives on an ALLOWED body
+    # that merely carries "block" as some other field's value — e.g.
+    # {"decision":"allow","reason":"no findings","rulesetMode":"block"} — popping
+    # a modal on a prompt that was never blocked. The body is server-controlled,
+    # so the pair, not the substrings, is the gate.
+    if printf '%s' "$BODY" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' &&
+       in_jetbrains_ide; then
+      # Keep the literal "\n" sequences intact — notify_block converts them to
+      # real newlines so the two-paragraph reason renders as written.
+      _reason=$(printf '%s' "$BODY" \
+        | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      notify_block "$_reason"
+    fi
     ;;
 esac
 
