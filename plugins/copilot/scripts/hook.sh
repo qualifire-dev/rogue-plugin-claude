@@ -219,7 +219,7 @@ augment_with_transcript() {
 # `subagent.started` line records this id as its toolCallId/agentId — and the
 # parent session id IS that transcript's directory name. Resolve it and rewrite
 # the outgoing sessionId so the subagent's turns land in the right session,
-# tagged via the x-rogue-subagent-* headers. Fail-open: unresolved → leave the
+# tagged via the x-rogue-agent-* headers. Fail-open: unresolved → leave the
 # body untouched (i.e. today's orphaned behavior — never worse).
 SUBAGENT_ID=""
 SUBAGENT_NAME=""
@@ -315,15 +315,18 @@ esac
 # failure curl exits non-zero and the code is 000. Relay the body ONLY on a clean
 # HTTP 200 so an error page (401/404/500) is never handed to Copilot as a decision.
 # Subagent events carry two extra headers so the backend can tag the
-# (now correctly-attributed) rows; main-agent events send neither.
+# (now correctly-attributed) rows; main-agent events send neither. The HEADERS are
+# x-rogue-agent-* (matching the backend's agentId/agentName fields and
+# aidr_message.agent_id/agent_name); the local SUBAGENT_* variables keep Copilot's
+# own terminology, since Copilot is what calls these subagents.
 if [ -n "$SUBAGENT_ID" ]; then
   RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
     -H "x-rogue-api-key: $ROGUE_API_KEY" \
     -H "x-rogue-event: $EVENT" \
     -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
     -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
-    -H "x-rogue-subagent-id: $SUBAGENT_ID" \
-    -H "x-rogue-subagent-name: $SUBAGENT_NAME" \
+    -H "x-rogue-agent-id: $SUBAGENT_ID" \
+    -H "x-rogue-agent-name: $SUBAGENT_NAME" \
     -H 'Content-Type: application/json' \
     --data-binary @- --max-time 15 -w '\n%{http_code}')
 else

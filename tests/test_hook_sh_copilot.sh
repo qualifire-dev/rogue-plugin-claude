@@ -435,7 +435,7 @@ rm -rf "$TDIR"
 # A subagent's own preToolUse arrives with sessionId = the model tool-call id
 # (toolu_…/call_…). The dispatcher must resolve the parent from the parent
 # transcript's subagent.started line, rewrite the POST body's sessionId to the
-# parent, and tag the POST with x-rogue-subagent-{id,name}.
+# parent, and tag the POST with x-rogue-agent-{id,name}.
 SDIR="$(mktemp -d)"
 PARENT="11111111-2222-3333-4444-555555555555"
 mkdir -p "$SDIR/$PARENT"
@@ -451,8 +451,8 @@ unset ROGUE_COPILOT_STATE_DIR ROGUE_SUBAGENT_RESOLVE_ITERS
 assert_eq "$LAST_RC" "0" "re-attributed subagent event exits 0"
 body_sid=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["body"])["sessionId"])' "$HEADERS_FILE")
 assert_eq "$body_sid" "$PARENT" "subagent event sessionId rewritten to the parent session"
-assert_header "x-rogue-subagent-id"   "toolu_bdrk_TESTSUB" "x-rogue-subagent-id carries the real subagent id"
-assert_header "x-rogue-subagent-name" "Task Agent"         "x-rogue-subagent-name carries the display name"
+assert_header "x-rogue-agent-id"   "toolu_bdrk_TESTSUB" "x-rogue-agent-id carries the real subagent id"
+assert_header "x-rogue-agent-name" "Task Agent"         "x-rogue-agent-name carries the display name"
 rm -rf "$SDIR"
 
 # ── Case 15: unresolvable subagent id → fail-open (orphaned, never worse) ────
@@ -469,7 +469,7 @@ unset ROGUE_COPILOT_STATE_DIR ROGUE_SUBAGENT_RESOLVE_ITERS
 assert_eq "$LAST_RC" "0" "unresolved subagent event exits 0"
 body_sid=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["body"])["sessionId"])' "$HEADERS_FILE")
 assert_eq "$body_sid" "call_UNKNOWNSUB" "unresolved subagent event keeps its original sessionId (fail-open)"
-assert_no_header "x-rogue-subagent-id" "no x-rogue-subagent-id when unresolved"
+assert_no_header "x-rogue-agent-id" "no x-rogue-agent-id when unresolved"
 if [ "$ELAPSED" -le 3 ]; then echo "  ok: bounded resolve wait honored (${ELAPSED}s)"; else echo "FAIL [Case 15]: waited ${ELAPSED}s (unbounded?)" >&2; exit 1; fi
 rm -rf "$SDIR"
 

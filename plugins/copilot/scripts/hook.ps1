@@ -257,7 +257,7 @@ $payload = $payload.TrimStart([char]0xFEFF)
 # they orphan into a separate audit log. The parent link lives only in the
 # parent session's events.jsonl (a subagent.started line naming this id; the
 # parent id IS that transcript's directory name). Resolve it, rewrite the
-# outgoing sessionId, and tag via x-rogue-subagent-* headers. Fail-open:
+# outgoing sessionId, and tag via x-rogue-agent-* headers. Fail-open:
 # unresolved → body untouched (today's orphaned behavior — never worse).
 $subagentId = ''
 $subagentName = ''
@@ -427,10 +427,13 @@ $headers = @{
     'x-rogue-actor-name'  = $actorName
 }
 # Subagent events carry the tag headers so the backend can label the
-# (now correctly-attributed) rows; main-agent events send neither.
+# (now correctly-attributed) rows; main-agent events send neither. The HEADERS are
+# x-rogue-agent-* (matching the backend's agentId/agentName fields and
+# aidr_message.agent_id/agent_name); the local $subagent* variables keep Copilot's
+# own terminology, since Copilot is what calls these subagents.
 if ($subagentId) {
-    $headers['x-rogue-subagent-id'] = $subagentId
-    $headers['x-rogue-subagent-name'] = $subagentName
+    $headers['x-rogue-agent-id'] = $subagentId
+    $headers['x-rogue-agent-name'] = $subagentName
 }
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 $resp = ''
