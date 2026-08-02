@@ -133,6 +133,33 @@ if [ -d "plugins/gemini" ]; then
   rm -rf "$GMSTAGE"
 fi
 
+# ── GitHub Copilot CLI plugin tarball ────────────────────────────────────────
+# Primary Copilot install path is `copilot plugin marketplace add <repo>` (git),
+# but we also ship a versionless tarball so /releases/latest/download URLs are
+# stable (used by compiled-key MDM bundles). Like Claude/Codex — and UNLIKE the
+# Gemini "archive-root-is-the-plugin" layout — the plugin is staged UNDER
+# plugins/copilot/ alongside its marketplace file (.github/plugin/marketplace.json).
+# Cross-platform by content (ships both hook.sh and hook.ps1).
+if [ -d "plugins/copilot" ]; then
+  COPILOT_VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
+    plugins/copilot/plugin.json 2>/dev/null | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && [ -n "$COPILOT_VERSION" ] || {
+    echo "✗ unable to read plugins/copilot/plugin.json" >&2; exit 1
+  }
+  echo "→ copilot plugin version: $COPILOT_VERSION"
+  CPSTAGE=$(mktemp -d)
+  CPTOP="$CPSTAGE/rogue-plugin-copilot"
+  mkdir -p "$CPTOP/plugins" "$CPTOP/.github/plugin"
+  cp .github/plugin/marketplace.json "$CPTOP/.github/plugin/"
+  cp -R plugins/copilot "$CPTOP/plugins/"
+  cp README.md LICENSE "$CPTOP/" 2>/dev/null || true
+  CPOUT="$DIST/rogue-plugin-copilot.tar.gz"
+  tar -czf "$CPOUT" -C "$CPSTAGE" "rogue-plugin-copilot"
+  CPSIZE=$(wc -c < "$CPOUT" | awk '{print $1}')
+  echo "✓ $CPOUT  ($CPSIZE bytes, version $COPILOT_VERSION)"
+  rm -rf "$CPSTAGE"
+fi
+
 echo ""
 echo "dist/:"
 ls -la "$DIST"

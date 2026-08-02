@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# Rogue Security hook bridge for GitHub Copilot CLI — bash implementation.
+# Usage: hook.sh <eventName>   (any of Copilot's 14 hook events)
+#
+# Reads one Copilot hook event JSON on stdin, POSTs it to the rogue-api
+# /hooks/copilot route, and relays the native Copilot decision verbatim on
+# stdout. PURE RELAY: the response body is NEVER rewritten — Copilot renders the
+# native deny shape ({"permissionDecision":"deny",...}) itself. There is one
+# narrow OUT-OF-BAND exception: a userPromptSubmitted block inside JetBrains,
+# which the IDE honors but renders nowhere, so we additionally show a local
+# alert (see in_jetbrains_ide / notify_block) while still relaying the body
+# unchanged. There are exactly TWO stdin enrichments: a re-attributed subagent
+# event gets its sessionId rewritten plus agentId/agentNameB64 added (see
+# reattribute_subagent / augment_with_agent_tag), and agentStop/subagentStop
+# additionally get the transcript tail appended (see augment_with_transcript) so
+# the backend can read the final message.
+#
+# Copilot selects the `bash` command on macOS/Linux and the `powershell` command
+# on Windows (see hooks.json), so — unlike the Claude bridge — there is no
+# exactly-one-runs arbitration and no Git-Bash stand-down: exactly one script
+# runs per platform, chosen by Copilot.
+#
+# FAIL-OPEN IS SAFETY-CRITICAL HERE. Copilot's preToolUse hook is fail-CLOSED: a
+# non-zero exit (or exit 2) DENIES the tool call. So this script MUST always
+# `exit 0` and emit `{}` on any error (missing key, network failure, non-200,
+# empty body). Never `set -e`; never let curl propagate a non-zero exit. A block
+# is carried in the relayed JSON body on stdout, never via the exit code.
+#
+# Credential resolution (later file wins; process env wins over all):
+#   1. ${PLUGIN_ROOT}/env        (baked into a compiled customer plugin)
+#   2. /etc/rogue/env            (MDM-provisioned)
+#   3. $HOME/.rogue-env          (per-user / installer-written)
+
+EVENT="$1"
+
+# Self-locate the plugin root from $0 (the path Copilot invoked us with:
+# <root>/scripts/hook.sh). Fall back to the env token if that ever fails.
+PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
+[ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="${COPILOT_PLUGIN_ROOT:-${PLUGIN_ROOT:-.}}"
+
+# Env precedence (later wins): bundled → MDM → per-user.
+[ -r "${PLUGIN_ROOT}/env" ] && . "${PLUGIN_ROOT}/env"
+[ -r /etc/rogue/env ]       && . /etc/rogue/env
+[ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
+
+ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+log() {
+  mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+  printf '%s provider=github_copilot event=%s %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
+}
+sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+
+# ── JetBrains silent-block alert ───────────────────────────────────────────
+# Copilot's JetBrains harness HONORS a userPromptSubmitted block
+# ({"decision":"block","reason":R}) but renders NOTHING for it — no reason, no
+# row: the chat just goes dead (verified 2026-07-28 on PyCharm 2026.2 /
+# github-copilot-intellij 1.14.1; `reason`, `message`, `systemMessage`,
+# `displayMessage`, `userMessage` and `additionalContext` were all probed and
+# none surfaced). The terminal CLI prints "! <reason>" natively, and every other
+# blocking event (preToolUse deny, postToolUse, agentStop) renders in BOTH
+# surfaces — so this one narrow case is the sole exception to the pure-relay
+# rule, and the alert is gated to it. Without it the user cannot see WHY the
+# turn died, nor learn the `rgx!` escape hatch. Remove once JetBrains renders
+# the reason natively (tracked upstream), exactly as Claude's modal was removed
+# once Claude Desktop rendered blocks itself.
+#
+# Detected surface (measured hook env, both harnesses set COPILOT_CLI=1):
+#   terminal CLI : parent process `copilot`,  COPILOT_CLI_BINARY_VERSION set
+#   JetBrains    : parent process `copilot-language-server` (the IDE embeds the
+#                  CLI harness), COPILOT_CLI_BINARY_VERSION unset, PKG_EXECPATH
+#                  and GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE set.
+# Walk a few levels because hooks.json invokes us through a shell.
+# NOTE: _p/_n are NOT function-local (POSIX sh has no `local`) and the same names
+# are reused by wait_for_transcript_flush and reattribute_subagent below. That is
+# safe only because this helper runs LAST, after both — do not reorder the call
+# sites without renaming these.
+in_jetbrains_ide() {
+  _p=$PPID
+  _n=0
+  while [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null && [ "$_n" -lt 5 ]; do
+    # Linux caps `comm` at TASK_COMM_LEN-1 = 15 chars, so copilot-language-server
+    # (23 chars) is reported as "copilot-languag" — matching only the full name
+    # can NEVER succeed there. Match the truncated prefix too. macOS BSD
+    # `ps -o comm=` prints the full executable PATH, so the *copilot) arm must
+    # stay SECOND: ".../copilot-language-server" matches both patterns and the
+    # IDE arm has to win. Ordering is load-bearing.
+    case "$(ps -o comm= -p "$_p" 2>/dev/null)" in
+      *copilot-langua*) return 0 ;;
+      *copilot)         return 1 ;;
+    esac
+    _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+    _n=$((_n + 1))
+  done
+  # Fallback when ps is unavailable/restricted (hidepid=2, containers): the env
+  # shape still separates them. The real discriminator is
+  # COPILOT_CLI_BINARY_VERSION being UNSET; if a future CLI build stops exporting
+  # it the terminal would false-positive into alerting — a duplicate
+  # notification, not a safety failure.
+  [ -z "${COPILOT_CLI_BINARY_VERSION:-}" ] &&
+    [ -n "${PKG_EXECPATH:-}${GITHUB_COPILOT_RIPGREP_PATH_OVERRIDE:-}" ]
+}
+
+# Fire a modal alert carrying the block reason — the same `display alert as
+# critical` the Claude plugin used before Claude Desktop rendered blocks itself
+# (see git history: plugins/rogue/scripts/security-alert.sh). A banner was tried
+# first and rejected: osascript posts it as *Script Editor*, complete with a
+# "Show" button that opens Script Editor's iCloud folder.
+# ALWAYS DETACHED: a modal waits for the click, so running it inline would stall
+# the dispatcher until dismissed. Backgrounded, it can never change our exit code
+# or delay the relay — which matters on this fail-open-critical path.
+# ROGUE_IDE_ALERT=0 disables; ROGUE_IDE_ALERT_DRYRUN=1 logs without alerting;
+# ROGUE_IDE_ALERT_DRYRUN=2 additionally logs the fully-escaped literal that would
+# be handed to osascript (real newlines rendered as '|') so the escaping of
+# server-controlled reason text is covered by a test rather than a one-off probe.
+notify_block() {
+  [ "${ROGUE_IDE_ALERT:-1}" = "0" ] && return 0
+  # head -c truncates BYTES; hook.ps1's .Substring(0,400) truncates UTF-16 chars,
+  # so a non-ASCII reason cuts at a slightly different point (accepted
+  # divergence). head -c can also split a multi-byte UTF-8 sequence — osascript
+  # and notify-send both tolerate the stray byte.
+  _msg=$(sanitize "$1" | head -c 400)
+  [ -n "$_msg" ] || _msg="Prompt blocked by Rogue Security."
+  log "ide_alert=fired"
+  [ "${ROGUE_IDE_ALERT_DRYRUN:-0}" = "1" ] && return 0
+  # API reasons carry literal "\n" (backslash + n, straight from the JSON
+  # string) and are two paragraphs — the findings text and the `rgx!` override
+  # hint. Convert to real newlines FIRST (AppleScript accepts them inside a
+  # double-quoted literal, verified) then escape backslashes and quotes for that
+  # literal. The call site deliberately does NOT collapse "\n" to a space, or
+  # this conversion would be dead code and the alert would render as one blob.
+  _msg=$(printf '%s' "$_msg" | awk '{gsub(/\\n/,"\n")}1')
+  _esc=$(printf '%s' "$_msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  if [ "${ROGUE_IDE_ALERT_DRYRUN:-0}" = "2" ]; then
+    log "ide_alert=escaped msg=$(sanitize "$(printf '%s' "$_esc" | tr '\n' '|')")"
+    return 0
+  fi
+  if command -v osascript >/dev/null 2>&1; then
+    # NEVER wrap this in `tell application "System Events"` (as the deleted
+    # Claude security-alert.sh did): a cross-app tell is an Automation request,
+    # so macOS attributes it to the HOST app and prompts ""PyCharm" wants access
+    # to control "System Events"" on first block — a consent dialog in front of a
+    # security alert, which many users will simply deny, silently killing the
+    # alert forever. A bare `display alert` needs no permission; `activate`
+    # targets osascript ITSELF (also permission-free) and brings it to the front.
+    # stdin is redirected too: a leaked fd would hold Copilot's pipe open past
+    # our exit. (nohup only shields the child from SIGHUP, not from a
+    # process-group SIGTERM — a non-issue since we return immediately after
+    # spawning, well inside the 30s timeoutSec.)
+    ( nohup osascript -e 'activate' \
+        -e "display alert \"Rogue Security\" message \"$_esc\" as critical buttons {\"Dismiss\"} default button \"Dismiss\" giving up after 30" \
+        </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+  elif command -v notify-send >/dev/null 2>&1; then
+    ( nohup notify-send -u critical "Rogue Security — prompt blocked" "$_msg" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+  fi
+  return 0
+}
+
+# agentStop / subagentStop carry no message content inline — only a
+# transcriptPath pointing at the session's events.jsonl. Append the last ~256KB
+# of that file, base64-encoded, as "transcriptTailB64" so the backend can extract
+# the final assistant reply / subagent message. base64 output has no JSON-special
+# characters, so appending it by re-closing the object is safe. Fail-open: any
+# problem (no path, unreadable, empty) returns the body unchanged.
+# $1 = original JSON body; echoes the (possibly augmented) body.
+# The agentStop/subagentStop hook fires as soon as Copilot decides the turn
+# ended, which can be BEFORE it has flushed the turn's final assistant.message
+# line to events.jsonl (observed ~5-50ms lag). A naive tail then captures a
+# stale transcript missing the very reply we need to evaluate — the reply is
+# silently dropped. File appends are ordered, so once the turn's closing
+# "assistant.turn_end" line is on disk, every earlier line of the turn (incl.
+# the final assistant.message) is too. Poll (bounded) until the last non-hook
+# line is an assistant.turn_end. Our own agentStop hook.start/hook.end lines are
+# excluded so they can't be mistaken for the turn boundary. Fail-open: on
+# timeout we proceed with whatever is on disk.
+# $1 = transcript path.
+wait_for_transcript_flush() {
+  _wtp="$1"
+  _n=0
+  # ~5s cap (50 * 0.1s), well inside the 30s hook budget. This covers the disk
+  # FLUSH lag between Copilot writing the completed assistant.message line and
+  # our read (~5-64ms observed) — NOT streaming time: agentStop fires only after
+  # the turn completes, so the message is already written when we poll. The gap
+  # is generous purely for slow/loaded disks. ROGUE_FLUSH_WAIT_ITERS overrides
+  # the count (tests set it low to exercise the fail-open path).
+  _max=${ROGUE_FLUSH_WAIT_ITERS:-50}
+  while [ "$_n" -lt "$_max" ]; do   # the happy path returns in 0-1 iters
+    _last=$(tail -c 262144 "$_wtp" 2>/dev/null | grep -v '"hook\.' | grep -v '^[[:space:]]*$' | tail -1)
+    case "$_last" in
+      *'"assistant.turn_end"'*) return 0 ;;
+    esac
+    sleep 0.1
+    _n=$((_n + 1))
+  done
+  return 0
+}
+
+augment_with_transcript() {
+  _body="$1"
+  _tp=$(printf '%s' "$_body" | sed -n 's/.*"transcriptPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$_tp" ] || { printf '%s' "$_body"; return; }
+  [ -r "$_tp" ] || { printf '%s' "$_body"; return; }
+  wait_for_transcript_flush "$_tp"
+  _b64=$(tail -c 262144 "$_tp" 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
+  [ -n "$_b64" ] || { printf '%s' "$_body"; return; }
+  # Trim trailing whitespace (a pretty-printed stop payload can end in spaces or
+  # a newline after the closing brace) so the single-'}' strip lands on the real
+  # closing brace. Without it "${_body%\}}" no-ops and we emit invalid JSON
+  # ({...}  ,"transcriptTailB64":...). Mirrors hook.ps1's $payload.TrimEnd().
+  _body="${_body%"${_body##*[![:space:]]}"}"
+  printf '%s,"transcriptTailB64":"%s"}' "${_body%\}}" "$_b64"
+}
+
+# ── Subagent re-attribution ────────────────────────────────────────────────
+# A Copilot subagent's OWN hook events (its preToolUse/postToolUse/
+# userPromptSubmitted/agentStop) arrive with sessionId = the model's tool-call
+# id (`toolu_…` for Claude models, `call_…` for GPT models) and carry NO parent
+# reference. Persisted verbatim they become an ORPHANED audit log named after
+# that id instead of appearing in the conversation that spawned them. The only
+# place the link exists is the PARENT session's events.jsonl, where a
+# `subagent.started` line records this id as its toolCallId/agentId — and the
+# parent session id IS that transcript's directory name. Resolve it and rewrite
+# the outgoing sessionId so the subagent's turns land in the right session,
+# tagged with the agentId/agentNameB64 BODY fields (see augment_with_agent_tag —
+# the tag used to travel as x-rogue-agent-* headers). Fail-open: unresolved →
+# leave the body untouched (i.e. today's orphaned behavior — never worse).
+SUBAGENT_ID=""
+SUBAGENT_NAME=""
+COPILOT_STATE_DIR="${ROGUE_COPILOT_STATE_DIR:-$HOME/.copilot/session-state}"
+
+# $1 = subagent id. Echoes "<parentSessionId>\n<displayName>" on success.
+resolve_subagent_parent() {
+  _sub="$1"
+  [ -d "$COPILOT_STATE_DIR" ] || return 1
+  for _f in "$COPILOT_STATE_DIR"/*/events.jsonl; do
+    [ -r "$_f" ] || continue
+    _line=$(grep '"subagent.started"' "$_f" 2>/dev/null | grep "\"$_sub\"" | head -1)
+    [ -n "$_line" ] || continue
+    _parent=$(basename "$(dirname "$_f")")
+    [ -n "$_parent" ] || continue
+    _name=$(printf '%s' "$_line" | sed -n 's/.*"agentDisplayName":"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_name" ] || _name=$(printf '%s' "$_line" | sed -n 's/.*"agentName":"\([^"]*\)".*/\1/p' | head -1)
+    printf '%s\n%s' "$_parent" "$_name"
+    return 0
+  done
+  return 1
+}
+
+# Rewrite BODY's subagent sessionId to its parent and set SUBAGENT_ID/NAME.
+reattribute_subagent() {
+  _sid=$(printf '%s' "$BODY" | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  case "$_sid" in
+    toolu_*|call_*) : ;;
+    *) return ;;   # a UUID → main-agent session, nothing to re-attribute
+  esac
+
+  # Resolve once per subagent, then cache (a subagent fires many events).
+  _cache_dir="$HOME/.rogue/copilot-submap"
+  _cache_file="$_cache_dir/$_sid"
+  _map=""
+  if [ -r "$_cache_file" ]; then
+    _map=$(cat "$_cache_file" 2>/dev/null)
+  else
+    # Bounded retry for the flush race: the parent's subagent.started line may
+    # not be on disk yet when the subagent's first event fires. No state dir →
+    # don't spin (fail-open immediately).
+    _n=0
+    _max=${ROGUE_SUBAGENT_RESOLVE_ITERS:-20}   # ~2s at 0.1s/iter
+    [ -d "$COPILOT_STATE_DIR" ] || _max=0
+    while [ "$_n" -lt "$_max" ]; do
+      _map=$(resolve_subagent_parent "$_sid") && [ -n "$_map" ] && break
+      _map=""
+      sleep 0.1
+      _n=$((_n + 1))
+    done
+    [ -n "$_map" ] && { mkdir -p "$_cache_dir" 2>/dev/null; printf '%s' "$_map" > "$_cache_file" 2>/dev/null; }
+  fi
+
+  [ -n "$_map" ] || { log "subagent=$_sid outcome=unresolved"; return; }
+
+  _parent=$(printf '%s' "$_map" | sed -n '1p')
+  SUBAGENT_NAME=$(printf '%s' "$_map" | sed -n '2p')
+  [ -n "$_parent" ] || return
+  SUBAGENT_ID="$_sid"
+  # Tolerate whitespace around the key/colon (a pretty-printed payload) and
+  # normalize to compact form; a non-matching rewrite would leave the body
+  # orphaned even though we resolved the parent.
+  BODY=$(printf '%s' "$BODY" | sed "s/\"sessionId\"[[:space:]]*:[[:space:]]*\"$_sid\"/\"sessionId\":\"$_parent\"/")
+  log "subagent=$_sid parent=$_parent name=$(sanitize "$SUBAGENT_NAME")"
+}
+
+# Add the subagent tag to the BODY of a re-attributed event: "agentId" (the bare
+# tool-call id) and "agentNameB64" (base64 of the UTF-8 display name). The name is
+# arbitrary vendor text — one '"' or '\' would corrupt the payload — so it travels
+# base64-encoded, the same trick as transcriptTailB64; base64 has no JSON-special
+# characters, so appending it by re-closing the object is safe. Omitted when the
+# name is unknown. The backend reads both fields off the payload (they used to
+# ride as x-rogue-agent-* headers).
+#
+# TWO mutation paths, and they must agree byte-for-byte on a compact payload
+# (tests/test_hook_sh_copilot.sh asserts exactly that, since only one path runs on
+# any given machine):
+#   1. jq when it is on PATH (macOS 26 ships /usr/bin/jq) — a real JSON edit.
+#      NOTE jq re-serializes, so a pretty-printed vendor payload comes back
+#      compacted; semantically identical, and Copilot sends compact JSON.
+#   2. otherwise the same string concat used for transcriptTailB64 — no parse, so
+#      the vendor's bytes are preserved exactly.
+# Fail-open everywhere: a bad id, a jq failure, or a body that is not an object
+# returns the body unchanged (we lose attribution, never the relay).
+# $1 = body; echoes the (possibly tagged) body.
+augment_with_agent_tag() {
+  _body="$1"
+  # The id is a bare token from Copilot (toolu_… / call_…). Anything outside the
+  # token charset is not one — skip BOTH fields rather than risk a corrupt body.
+  case "$SUBAGENT_ID" in
+    ''|*[!A-Za-z0-9_-]*) printf '%s' "$_body"; return ;;
+  esac
+  _nb64=""
+  if [ -n "$SUBAGENT_NAME" ]; then
+    _nb64=$(printf '%s' "$SUBAGENT_NAME" | base64 2>/dev/null | tr -d '\r\n')
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    if [ -n "$_nb64" ]; then
+      _out=$(printf '%s' "$_body" | jq -c --arg id "$SUBAGENT_ID" --arg nb64 "$_nb64" \
+        '. + {agentId:$id,agentNameB64:$nb64}' 2>/dev/null)
+    else
+      _out=$(printf '%s' "$_body" | jq -c --arg id "$SUBAGENT_ID" \
+        '. + {agentId:$id}' 2>/dev/null)
+    fi
+    # Only trust a complete object back; anything else (invalid JSON in, jq error,
+    # a non-object payload) falls through to the concat path.
+    case "$_out" in
+      '{'*'}') printf '%s' "$_out"; return ;;
+    esac
+  fi
+
+  # Trim trailing whitespace (a pretty-printed payload can end in spaces or a
+  # newline after the closing brace) so the single-'}' strip lands on the real
+  # closing brace — mirrors augment_with_transcript / hook.ps1's $payload.TrimEnd().
+  _body="${_body%"${_body##*[![:space:]]}"}"
+  case "$_body" in
+    *'}') : ;;
+    *) printf '%s' "$1"; return ;;   # not an object → leave it alone
+  esac
+  _pre="${_body%\}}"
+  # An empty object needs no separator ({} → {"agentId":…}); jq produces the same.
+  if [ "$_pre" = "{" ]; then _sep=""; else _sep=","; fi
+  if [ -n "$_nb64" ]; then
+    printf '%s%s"agentId":"%s","agentNameB64":"%s"}' "$_pre" "$_sep" "$SUBAGENT_ID" "$_nb64"
+  else
+    printf '%s%s"agentId":"%s"}' "$_pre" "$_sep" "$SUBAGENT_ID"
+  fi
+}
+
+# Not configured: emit the SessionStart hint (so the user knows to run setup) or a
+# clean allow for every other event. Never POST without a key.
+if [ -z "${ROGUE_API_KEY:-}" ]; then
+  log "outcome=unconfigured"
+  if [ "$EVENT" = "sessionStart" ]; then
+    printf '{"additionalContext":"[Rogue Security] Not configured. Run /rogue:setup to connect your API key."}'
+  else
+    echo '{}'
+  fi
+  exit 0
+fi
+
+[ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
+
+URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/copilot}"
+
+# Buffer stdin so we can enrich it (agentStop/subagentStop) before POSTing.
+BODY="$(cat)"
+# Re-attribute a subagent's event to its parent session BEFORE any tail
+# augmentation (a subagent agentStop has no transcriptPath, so augment no-ops).
+reattribute_subagent
+# Tag the (now correctly-attributed) body so the backend can mark these rows as a
+# subagent's. Before the tail append, so the field order is stable across events.
+if [ -n "$SUBAGENT_ID" ]; then
+  BODY="$(augment_with_agent_tag "$BODY")"
+fi
+case "$EVENT" in
+  agentStop|subagentStop) BODY="$(augment_with_transcript "$BODY")" ;;
+esac
+
+# Capture body + HTTP status. -w appends a final line "<code>"; on any transport
+# failure curl exits non-zero and the code is 000. Relay the body ONLY on a clean
+# HTTP 200 so an error page (401/404/500) is never handed to Copilot as a decision.
+# The subagent tag rides in the BODY (agentId/agentNameB64 — see
+# augment_with_agent_tag), so every event POSTs the same four headers. The local
+# SUBAGENT_* variables keep Copilot's own terminology, since Copilot is what calls
+# these subagents; the wire field names match the backend's agentId/agentName and
+# the aidr_message.agent_id/agent_name columns they land in.
+RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
+  -H "x-rogue-api-key: $ROGUE_API_KEY" \
+  -H "x-rogue-event: $EVENT" \
+  -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
+  -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- --max-time 15 -w '\n%{http_code}')
+RC=$?
+CODE=$(printf '%s' "$RAW" | tail -n1)
+BODY=$(printf '%s' "$RAW" | sed '$d')
+
+log "http=$CODE rc=$RC raw=$(sanitize "$BODY" | head -c 400)"
+
+# Fail-open on transport error or any non-200: emit a clean allow.
+if [ "$RC" -ne 0 ] || [ "$CODE" != "200" ] || [ -z "$BODY" ]; then
+  log "outcome=allow http=$CODE rc=$RC"
+  echo '{}'
+  exit 0
+fi
+
+# The ONE case Copilot renders nowhere: a userPromptSubmitted block inside
+# JetBrains (see in_jetbrains_ide). Surface the reason out-of-band, then relay
+# unchanged — the response itself is never rewritten.
+case "$EVENT" in
+  userPromptSubmitted)
+    # STRICT shape match, mirroring hook.ps1's '"decision"\s*:\s*"block"' regex.
+    # A loose glob (*'"decision"'*'"block"'*) false-positives on an ALLOWED body
+    # that merely carries "block" as some other field's value — e.g.
+    # {"decision":"allow","reason":"no findings","rulesetMode":"block"} — popping
+    # a modal on a prompt that was never blocked. The body is server-controlled,
+    # so the pair, not the substrings, is the gate.
+    if printf '%s' "$BODY" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' &&
+       in_jetbrains_ide; then
+      # Keep the literal "\n" sequences intact — notify_block converts them to
+      # real newlines so the two-paragraph reason renders as written.
+      _reason=$(printf '%s' "$BODY" \
+        | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      notify_block "$_reason"
+    fi
+    ;;
+esac
+
+# rogue-api already returns the correct native Copilot shape (allow "{}" for
+# audit-only events like sessionStart); relay it verbatim.
+printf '%s' "$BODY"
+exit 0

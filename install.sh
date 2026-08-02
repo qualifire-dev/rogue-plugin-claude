@@ -29,6 +29,7 @@
 #   --codex                install only for OpenAI Codex
 #   --cursor               install only for Cursor
 #   --gemini               install only for Gemini CLI
+#   --copilot              install only for GitHub Copilot CLI
 #                          (no agent flag = auto-detect and install for every agent found)
 #   --api-key=KEY          same as ROGUE_API_KEY
 #   --actor-email=EMAIL    same as ROGUE_ACTOR_EMAIL
@@ -109,14 +110,18 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 #   codex     Codex CLI      command:codex         install_codex    ← implemented
 #   cursor    Cursor         command:cursor|~/.cursor  install_cursor ← implemented
 #   gemini    Gemini CLI     command:gemini        install_gemini   ← implemented
+#   copilot   Copilot CLI    command:copilot       install_copilot  ← implemented
 #
-# Claude and Codex install via their native plugin CLIs (which git-clone the
-# marketplace). Cursor has NO plugin CLI — install is a file copy into
+# Claude, Codex, and Copilot install via their native plugin CLIs (which git-clone
+# the marketplace). Cursor has NO plugin CLI — install is a file copy into
 # ~/.cursor/plugins/local/rogue. So install_cursor downloads the release tarball
 # and copies the plugin tree (see cursor_install_plugin). Gemini HAS a native
 # extension CLI but expects the manifest at a source root — so gemini_install_extension
 # downloads the release tarball (whose top dir IS the extension) and runs
-# `gemini extensions install <dir>` (see gemini_install_extension).
+# `gemini extensions install <dir>` (see gemini_install_extension). Copilot reads
+# BOTH .github/plugin/marketplace.json AND .claude-plugin/marketplace.json from the
+# monorepo, so its marketplace uses a DISTINCT name (rogue-copilot) and the install
+# targets rogue@rogue-copilot to avoid resolving to the Claude plugin.
 
 # ── Marketplace + plugin install (Claude) ─────────────────────────────────────
 claude_install_plugin() {
@@ -171,6 +176,38 @@ codex_install_plugin() {
     ok "Plugin installed"
   else
     die "codex plugin add failed. Run 'codex plugin add ${PLUGIN_NAME}@${MARKETPLACE_NAME}' to see the error."
+  fi
+}
+
+# ── Marketplace + plugin install (GitHub Copilot CLI) ─────────────────────────
+# Copilot has a native plugin CLI (`copilot plugin marketplace add` +
+# `copilot plugin install NAME@MARKETPLACE`) that git-clones the marketplace —
+# same model as Claude/Codex. But Copilot reads BOTH .github/plugin/marketplace.json
+# (native) and .claude-plugin/marketplace.json (which points at the Claude plugin),
+# so the Copilot marketplace uses a DISTINCT name (rogue-copilot) and we install
+# rogue@rogue-copilot to disambiguate.
+COPILOT_MARKETPLACE_NAME="rogue-copilot"
+copilot_install_plugin() {
+  note "Adding marketplace ${C_DIM}$ROGUE_PLUGIN_REPO${C_RESET}"
+  local add_err
+  if add_err="$(copilot plugin marketplace add "$ROGUE_PLUGIN_REPO" 2>&1)"; then
+    ok "Marketplace added"
+  else
+    if copilot plugin marketplace update "$COPILOT_MARKETPLACE_NAME" >/dev/null 2>&1; then
+      ok "Marketplace updated"
+    else
+      warn "Could not add or update Copilot marketplace (continuing — it may already be present)"
+      [ -n "$add_err" ] && note "${C_DIM}${add_err}${C_RESET}"
+    fi
+  fi
+
+  note "Installing plugin ${C_DIM}${PLUGIN_NAME}@${COPILOT_MARKETPLACE_NAME}${C_RESET}"
+  if copilot plugin install "${PLUGIN_NAME}@${COPILOT_MARKETPLACE_NAME}" >/dev/null 2>&1; then
+    ok "Plugin installed"
+  elif copilot plugin update "$PLUGIN_NAME" >/dev/null 2>&1; then
+    ok "Plugin updated"
+  else
+    die "copilot plugin install failed. Run 'copilot plugin install ${PLUGIN_NAME}@${COPILOT_MARKETPLACE_NAME}' to see the error."
   fi
 }
 
@@ -275,17 +312,39 @@ gemini_install_extension() {
 # roster row deduped with the later heartbeats.
 STATUS_ORG=""
 STATUS_UPDATE=""
+# /api/v1/hooks/status has side effects (it registers/updates the roster row), so
+# the key-validation POST must register under an agent that is actually being
+# installed — a Copilot-only or Codex-only install must NOT create a bogus Claude
+# roster row. Resolve the family/agent from the selected `agents`: prefer claude
+# when it's a target (its heartbeat backs the row, preserving today's behavior);
+# otherwise use the first selected agent so the row matches a plugin whose
+# heartbeat will run. Values mirror each plugin's heartbeat body.
+status_agent_ctx() { # sets SC_FAMILY / SC_AGENT from $agents
+  local a
+  for a in ${agents:-}; do
+    [ "$a" = claude ] && { SC_FAMILY="claude"; SC_AGENT="Claude Code - CLI"; return; }
+  done
+  set -- ${agents:-claude}
+  case "${1:-claude}" in
+    codex)   SC_FAMILY="openai";  SC_AGENT="codex_cli" ;;
+    cursor)  SC_FAMILY="cursor";  SC_AGENT="cursor" ;;
+    gemini)  SC_FAMILY="gemini";  SC_AGENT="gemini_cli" ;;
+    copilot) SC_FAMILY="copilot"; SC_AGENT="github_copilot" ;;
+    *)       SC_FAMILY="claude";  SC_AGENT="Claude Code - CLI" ;;
+  esac
+}
 status_check() { # status_check <api-key> <actor-email>
   have_cmd curl || { printf ''; return; }
   local resp code body host json
   host="$(hostname 2>/dev/null || echo unknown)"
+  status_agent_ctx
   # POST /api/v1/hooks/status with a JSON body — the GET route was removed
   # (see plugins/rogue/scripts/heartbeat.sh). The former x-rogue-agent-*
   # headers now ride the body; x-rogue-api-key stays a header. esc() so a host
   # or email with a " or \ can't break the JSON.
   esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-  json=$(printf '{"agent_family":"claude","agent":"Claude Code - CLI","host":"%s","actor_email":"%s"}' \
-    "$(esc "$host")" "$(esc "${2:-}")")
+  json=$(printf '{"agent_family":"%s","agent":"%s","host":"%s","actor_email":"%s"}' \
+    "$SC_FAMILY" "$SC_AGENT" "$(esc "$host")" "$(esc "${2:-}")")
   resp=$(curl -s -w $'\n%{http_code}' --max-time 10 -X POST \
     "$ROGUE_BASE_URL/api/v1/hooks/status" \
     -H "x-rogue-api-key: $1" \
@@ -524,6 +583,21 @@ install_gemini() {
   fi
 }
 
+install_copilot() {
+  printf '\n%sRogue Security%s — GitHub Copilot CLI\n' "$C_TEAL" "$C_RESET" >&2
+  copilot_install_plugin
+  note "Copilot skips untrusted hooks — open ${C_DIM}/hooks${C_RESET} in Copilot CLI and trust the Rogue entries once."
+  # Rogue reaches JetBrains only through Copilot's CLI/Agent provider. The IDE's
+  # built-in "Local" agent runs its OWN hook engine, which reads only
+  # <git-root>/.github/hooks/**/*.json and refuses plugin-provided hooks — zero
+  # coverage. No hook ever runs there, so nothing inside the IDE can warn about
+  # it; the installer is the only place we still have a voice.
+  if [ -d "$HOME/Library/Application Support/JetBrains" ] || [ -d "$HOME/.config/JetBrains" ]; then
+    note "In JetBrains, pick Copilot's ${C_DIM}CLI/Agent${C_RESET} provider — the built-in ${C_DIM}Local${C_RESET} agent ignores installed plugins, so Rogue would see nothing."
+  fi
+  note "Then restart Copilot CLI and run ${C_DIM}/rogue:status${C_RESET} to verify."
+}
+
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 # Accepts `--flag=value` and `--flag value`. Sets the same globals the env knobs
 # do, so the rest of the script is flag-agnostic. CLI flags override env vars.
@@ -545,6 +619,7 @@ parse_args() {
       --codex)           WANT="$WANT codex" ;;
       --cursor)          WANT="$WANT cursor" ;;
       --gemini)          WANT="$WANT gemini" ;;
+      --copilot)         WANT="$WANT copilot" ;;
       --non-interactive) NON_INTERACTIVE=1 ;;
       --no-statusline)   ROGUE_NO_STATUSLINE=1 ;;
       -h|--help)         usage; exit 0 ;;
@@ -569,6 +644,7 @@ main() {
         codex)  have_cmd codex  || die "--codex requested but the 'codex' CLI is not on PATH. Install OpenAI Codex first." ;;
         cursor) : ;;
         gemini) have_cmd gemini || die "--gemini requested but the 'gemini' CLI is not on PATH. Install Gemini CLI (https://geminicli.com) first." ;;
+        copilot) have_cmd copilot || die "--copilot requested but the 'copilot' CLI is not on PATH. Install GitHub Copilot CLI (https://github.com/github/copilot-cli) first." ;;
       esac
     done
   else
@@ -579,7 +655,8 @@ main() {
     have_cmd codex  && agents="$agents codex"
     { have_cmd cursor || [ -d "$HOME/.cursor" ]; } && agents="$agents cursor"
     have_cmd gemini && agents="$agents gemini"
-    [ -n "$agents" ] || die "No supported coding agent found (looked for: claude, codex, cursor, gemini). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), or Gemini CLI (https://geminicli.com) first."
+    have_cmd copilot && agents="$agents copilot"
+    [ -n "$agents" ] || die "No supported coding agent found (looked for: claude, codex, cursor, gemini, copilot). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), or GitHub Copilot CLI (https://github.com/github/copilot-cli) first."
   fi
 
   # Credentials once — every plugin reads the shared ~/.rogue-env.
@@ -591,6 +668,7 @@ main() {
       codex)  install_codex ;;
       cursor) install_cursor ;;
       gemini) install_gemini ;;
+      copilot) install_copilot ;;
     esac
   done
 

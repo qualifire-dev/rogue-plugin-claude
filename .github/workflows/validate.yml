@@ -41,6 +41,7 @@ jobs:
           plugins/rogue/.claude-plugin/plugin.json|.claude-plugin/marketplace.json|./plugins/rogue
           plugins/codex/.codex-plugin/plugin.json|.agents/plugins/marketplace.json|./plugins/codex
           plugins/cursor/.cursor-plugin/plugin.json|.cursor-plugin/marketplace.json|./plugins/cursor
+          plugins/copilot/plugin.json|.github/plugin/marketplace.json|./plugins/copilot
           "
           fail=0
           echo "$rows" | while IFS='|' read -r plugin market src; do
@@ -70,3 +71,30 @@ jobs:
             if ! $chk "$f"; then echo "::error file=$f::$chk parse error"; fail=1; fi
           done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh')
           [ "$fail" = 0 ] || exit 1
+
+      - name: PowerShell scripts parse
+        # The .ps1 dispatchers are the Windows half of every plugin and cannot be
+        # run on a dev Mac (no pwsh) — this is the only gate that ever parses
+        # them. It matters more than the sh side: hooks.json loads hook.ps1 via
+        # `try { & ([scriptblock]::Create(...)) } catch { '{}' } ; exit 0`, so a
+        # single syntax error is swallowed into a permanent `{}` and every
+        # Windows user silently loses all enforcement. ubuntu-latest ships pwsh.
+        # Caveat: pwsh 7's parser is not Windows PowerShell 5.1's — this catches
+        # syntax, not 5.1-only API gaps.
+        run: |
+          pwsh -NoProfile -Command '
+            $bad = 0
+            Get-ChildItem -Path . -Recurse -Filter *.ps1 -File | ForEach-Object {
+              $t = $null; $e = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$t, [ref]$e) | Out-Null
+              if ($e.Count) { Write-Host "::error file=$($_.FullName)::$($e[0].Message)"; $bad = 1 }
+            }
+            exit $bad'
+
+      - name: PowerShell unit tests
+        # Both load their dispatcher through the ROGUE_PS_LIB_ONLY seam, so the
+        # functions run on Linux even though the main body stands down there.
+        run: |
+          set -euo pipefail
+          pwsh -NoProfile -File tests/test_hook_ps1.ps1
+          pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1

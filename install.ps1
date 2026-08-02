@@ -38,7 +38,9 @@
 .PARAMETER Cursor
     Install only for Cursor.
 .PARAMETER Gemini
-    Install only for Gemini CLI. With no agent switch, every detected agent is installed.
+    Install only for Gemini CLI.
+.PARAMETER Copilot
+    Install only for GitHub Copilot CLI. With no agent switch, every detected agent is installed.
 #>
 [CmdletBinding()]
 param(
@@ -51,13 +53,15 @@ param(
     [switch]$Claude,
     [switch]$Codex,
     [switch]$Cursor,
-    [switch]$Gemini
+    [switch]$Gemini,
+    [switch]$Copilot
 )
 
 $ErrorActionPreference = 'Stop'
 
 $ROGUE_BASE_URL_DEFAULT = 'https://api.rogue.security'
 $MarketplaceName = 'rogue-marketplace'
+$CopilotMarketplaceName = 'rogue-copilot'
 $PluginName      = 'rogue'
 $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $env:USERPROFILE '.rogue-env' }
 
@@ -86,12 +90,13 @@ Write-Host "Rogue Security (Windows)" -ForegroundColor Cyan
 # every supported agent. claude/codex ship a CLI on PATH; Cursor's `cursor` command is
 # opt-in, so detection also accepts %USERPROFILE%\.cursor. An explicitly selected CLI
 # agent still needs its binary; Cursor is a plain file copy, so it installs regardless.
-$explicit = $Claude -or $Codex -or $Cursor -or $Gemini
+$explicit = $Claude -or $Codex -or $Cursor -or $Gemini -or $Copilot
 if ($explicit) {
-    $hasClaude = [bool]$Claude
-    $hasCodex  = [bool]$Codex
-    $hasCursor = [bool]$Cursor
-    $hasGemini = [bool]$Gemini
+    $hasClaude  = [bool]$Claude
+    $hasCodex   = [bool]$Codex
+    $hasCursor  = [bool]$Cursor
+    $hasGemini  = [bool]$Gemini
+    $hasCopilot = [bool]$Copilot
     if ($hasClaude -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
         Die "-Claude requested but the 'claude' CLI is not on PATH. Install Claude Code (https://claude.com/code) first."
     }
@@ -101,13 +106,17 @@ if ($explicit) {
     if ($hasGemini -and -not (Get-Command gemini -ErrorAction SilentlyContinue)) {
         Die "-Gemini requested but the 'gemini' CLI is not on PATH. Install Gemini CLI (https://geminicli.com) first."
     }
+    if ($hasCopilot -and -not (Get-Command copilot -ErrorAction SilentlyContinue)) {
+        Die "-Copilot requested but the 'copilot' CLI is not on PATH. Install GitHub Copilot CLI (https://github.com/github/copilot-cli) first."
+    }
 } else {
-    $hasClaude = [bool](Get-Command claude -ErrorAction SilentlyContinue)
-    $hasCodex  = [bool](Get-Command codex  -ErrorAction SilentlyContinue)
-    $hasCursor = [bool](Get-Command cursor -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.cursor'))
-    $hasGemini = [bool](Get-Command gemini -ErrorAction SilentlyContinue)
-    if (-not ($hasClaude -or $hasCodex -or $hasCursor -or $hasGemini)) {
-        Die "No supported coding agent found (looked for: claude, codex, cursor, gemini). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), or Gemini CLI (https://geminicli.com) first."
+    $hasClaude  = [bool](Get-Command claude -ErrorAction SilentlyContinue)
+    $hasCodex   = [bool](Get-Command codex  -ErrorAction SilentlyContinue)
+    $hasCursor  = [bool](Get-Command cursor -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.cursor'))
+    $hasGemini  = [bool](Get-Command gemini -ErrorAction SilentlyContinue)
+    $hasCopilot = [bool](Get-Command copilot -ErrorAction SilentlyContinue)
+    if (-not ($hasClaude -or $hasCodex -or $hasCursor -or $hasGemini -or $hasCopilot)) {
+        Die "No supported coding agent found (looked for: claude, codex, cursor, gemini, copilot). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), or GitHub Copilot CLI (https://github.com/github/copilot-cli) first."
     }
 }
 # Claude shells out to git to clone the marketplace; git is required only for it.
@@ -162,7 +171,19 @@ if ($ApiKey) {
     Log 'Validating API key...'
     try {
         $hostName = $env:COMPUTERNAME; if (-not $hostName) { $hostName = 'unknown' }
-        $body = @{ agent_family = 'claude'; agent = 'Claude Code - CLI'; host = $hostName; actor_email = [string]$Email } | ConvertTo-Json -Compress
+        # /api/v1/hooks/status has side effects (it registers/updates the roster
+        # row), so register under an agent actually being installed — a Copilot-
+        # only or Codex-only install must NOT create a bogus Claude roster row.
+        # Prefer claude when it's a target (its heartbeat backs the row,
+        # preserving prior behavior); otherwise use the first selected agent.
+        # Values mirror each heartbeat.
+        $scFamily = 'claude'; $scAgent = 'Claude Code - CLI'
+        if ($hasClaude)      { $scFamily = 'claude';  $scAgent = 'Claude Code - CLI' }
+        elseif ($hasCodex)   { $scFamily = 'openai';  $scAgent = 'codex_cli' }
+        elseif ($hasCursor)  { $scFamily = 'cursor';  $scAgent = 'cursor' }
+        elseif ($hasGemini)  { $scFamily = 'gemini';  $scAgent = 'gemini_cli' }
+        elseif ($hasCopilot) { $scFamily = 'copilot'; $scAgent = 'github_copilot' }
+        $body = @{ agent_family = $scFamily; agent = $scAgent; host = $hostName; actor_email = [string]$Email } | ConvertTo-Json -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
         $resp = Invoke-WebRequest -Uri "$($BaseUrl.TrimEnd('/'))/api/v1/hooks/status" -Method Post `
             -Headers @{ 'x-rogue-api-key' = $ApiKey } -ContentType 'application/json' `
@@ -329,6 +350,41 @@ if ($hasGemini) {
         Warn2 "Gemini extension not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
     } finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Copilot has a native plugin CLI (marketplace add + install NAME@MARKETPLACE),
+# same model as Claude/Codex. But Copilot reads BOTH .github/plugin/marketplace.json
+# and .claude-plugin/marketplace.json from the monorepo, so its marketplace uses a
+# DISTINCT name (rogue-copilot) and we install rogue@rogue-copilot to disambiguate.
+# `copilot` is a native command — a non-zero exit does NOT throw, so gate on $LASTEXITCODE.
+if ($hasCopilot) {
+    Write-Host ""
+    Write-Host "Rogue Security - GitHub Copilot CLI" -ForegroundColor Cyan
+    Log "Adding marketplace $PluginRepo"
+    $mktOk = $false
+    try { & copilot plugin marketplace add $PluginRepo 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $mktOk = $true } } catch {}
+    if ($mktOk) { Ok 'Marketplace added' }
+    else {
+        try { & copilot plugin marketplace update $CopilotMarketplaceName 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $mktOk = $true } } catch {}
+        if ($mktOk) { Ok 'Marketplace updated' }
+        else { Warn2 'Could not add or update Copilot marketplace (continuing - it may already be present).' }
+    }
+    Log "Installing plugin $PluginName@$CopilotMarketplaceName"
+    $installed = $false
+    try { & copilot plugin install "$PluginName@$CopilotMarketplaceName" 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $installed = $true } } catch {}
+    if (-not $installed) {
+        try { & copilot plugin update $PluginName 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $installed = $true } } catch {}
+    }
+    if (-not $installed) { Die "copilot plugin install failed. Run 'copilot plugin install $PluginName@$CopilotMarketplaceName' to see the error." }
+    Ok 'Plugin installed'
+    Warn2 'Copilot skips untrusted hooks - open /hooks in Copilot CLI and trust the Rogue entries once.'
+    # Mirrors install.sh: Rogue reaches JetBrains only through Copilot's
+    # CLI/Agent provider. The IDE's built-in "Local" agent runs its own hook
+    # engine that refuses plugin-provided hooks (zero coverage), and no hook ever
+    # runs there to warn from - the installer is the only place we can say it.
+    if ($env:APPDATA -and (Test-Path -LiteralPath (Join-Path $env:APPDATA 'JetBrains'))) {
+        Warn2 "In JetBrains, pick Copilot's CLI/Agent provider - the built-in Local agent ignores installed plugins, so Rogue would see nothing."
     }
 }
 
