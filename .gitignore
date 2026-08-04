@@ -8,3 +8,4 @@ dist/
 # Compiled customer plugins bake a customer ROGUE_API_KEY into env. NEVER commit
 # them — zip artifacts and the unpacked staging dir alike.
 rogue-aidr-compiled-*
+plugins/rogue-staging/env
