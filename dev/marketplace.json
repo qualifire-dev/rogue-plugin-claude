@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "rogue-staging-marketplace",
+  "version": "0.1.0",
+  "description": "Internal dev marketplace: Rogue AIDR staging shadow plugin. Add from a local checkout; never published.",
+  "owner": {
+    "name": "Qualifire (Rogue Security)",
+    "email": "support@rogue.security"
+  },
+  "plugins": [
+    {
+      "name": "rogue-staging",
+      "version": "1.0.23",
+      "description": "Rogue Security AIDR (STAGING shadow) - mirrors every Claude Code event to the staging backend; monitor-only unless ROGUE_STAGING_ENFORCE=1",
+      "category": "security",
+      "source": "../plugins/rogue-staging"
+    }
+  ]
+}

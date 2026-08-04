@@ -1,0 +1,10 @@
+{
+  "name": "rogue-staging",
+  "version": "1.0.23",
+  "description": "Rogue Security AIDR (STAGING shadow) - mirrors every Claude Code event to the staging backend; monitor-only unless ROGUE_STAGING_ENFORCE=1",
+  "author": {
+    "name": "Rogue Security",
+    "url": "https://www.rogue.security"
+  },
+  "homepage": "https://docs.rogue.security/integrations/claude-code"
+}
