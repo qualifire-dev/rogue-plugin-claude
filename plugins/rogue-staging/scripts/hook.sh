@@ -66,13 +66,7 @@ log "raw=$(sanitize "$RESP" | head -c 400)"
 #   "decision":"block"           PostToolUse (inside hookSpecificOutput)
 #   "behavior":"deny"            PermissionRequest (inside hookSpecificOutput.decision)
 BLOCK=0
-if # Shadow mode: never influence the session unless enforcement is opted into.
-if [ "${ROGUE_STAGING_ENFORCE:-0}" = "1" ]; then
-  printf '%s' "$RESP"
-else
-  [ "$BLOCK" = "1" ] && log "shadow=1 suppressed_block_relay"
-  echo '{}'
-fi | grep -qiE '"decision"[[:space:]]*:[[:space:]]*"block"|"continue"[[:space:]]*:[[:space:]]*false|"permissionDecision"[[:space:]]*:[[:space:]]*"deny"|"behavior"[[:space:]]*:[[:space:]]*"deny"'; then
+if printf '%s' "$RESP" | grep -qiE '"decision"[[:space:]]*:[[:space:]]*"block"|"continue"[[:space:]]*:[[:space:]]*false|"permissionDecision"[[:space:]]*:[[:space:]]*"deny"|"behavior"[[:space:]]*:[[:space:]]*"deny"'; then
   BLOCK=1
 fi
 
@@ -81,34 +75,10 @@ if [ "$BLOCK" = "1" ]; then
   # uses (permissionDecisionReason for PreToolUse, reason for everything else,
   # stopReason for continue:false). Limitation: doesn't handle JSON-escaped
   # quotes inside reason text — Rogue's reasons don't contain them.
-  REASON=$(# Shadow mode: never influence the session unless enforcement is opted into.
-if [ "${ROGUE_STAGING_ENFORCE:-0}" = "1" ]; then
-  printf '%s' "$RESP"
-else
-  [ "$BLOCK" = "1" ] && log "shadow=1 suppressed_block_relay"
-  echo '{}'
-fi | sed -E -n 's/.*"permissionDecisionReason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
-  [ -z "$REASON" ] && REASON=$(# Shadow mode: never influence the session unless enforcement is opted into.
-if [ "${ROGUE_STAGING_ENFORCE:-0}" = "1" ]; then
-  printf '%s' "$RESP"
-else
-  [ "$BLOCK" = "1" ] && log "shadow=1 suppressed_block_relay"
-  echo '{}'
-fi | sed -E -n 's/.*"reason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
-  [ -z "$REASON" ] && REASON=$(# Shadow mode: never influence the session unless enforcement is opted into.
-if [ "${ROGUE_STAGING_ENFORCE:-0}" = "1" ]; then
-  printf '%s' "$RESP"
-else
-  [ "$BLOCK" = "1" ] && log "shadow=1 suppressed_block_relay"
-  echo '{}'
-fi | sed -E -n 's/.*"stopReason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
-  [ -z "$REASON" ] && REASON=$(# Shadow mode: never influence the session unless enforcement is opted into.
-if [ "${ROGUE_STAGING_ENFORCE:-0}" = "1" ]; then
-  printf '%s' "$RESP"
-else
-  [ "$BLOCK" = "1" ] && log "shadow=1 suppressed_block_relay"
-  echo '{}'
-fi | sed -E -n 's/.*"message"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
+  REASON=$(printf '%s' "$RESP" | sed -E -n 's/.*"permissionDecisionReason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
+  [ -z "$REASON" ] && REASON=$(printf '%s' "$RESP" | sed -E -n 's/.*"reason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
+  [ -z "$REASON" ] && REASON=$(printf '%s' "$RESP" | sed -E -n 's/.*"stopReason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
+  [ -z "$REASON" ] && REASON=$(printf '%s' "$RESP" | sed -E -n 's/.*"message"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
   [ -z "$REASON" ] && REASON="prompt blocked"
 
   # No local alert: Claude (CLI and Desktop/Cowork) shows the block reason
