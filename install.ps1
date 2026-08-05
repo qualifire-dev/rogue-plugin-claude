@@ -380,13 +380,20 @@ if ($hasAntigravity) {
         Ok "Plugin installed -> $ideDir"
 
         # CLI: native install if `agy` is present, else manual copy if the CLI dir exists.
+        #
+        # A failure here is not fatal: the global copy above is the shared plugins dir
+        # all three surfaces read, so the CLI keeps loading the plugin from there. What
+        # it must not print is a dead recovery command — $srcDir lives under $tmp, which
+        # the finally block deletes on the way out. Mirrors install.sh.
         if (Get-Command agy -ErrorAction SilentlyContinue) {
             try { & agy plugin uninstall rogue 2>&1 | Out-Null } catch {}
-            & agy plugin install $srcDir 2>&1 | Out-Null
+            $agyErr = (& agy plugin install $srcDir 2>&1 | Out-String).Trim()
             if ($LASTEXITCODE -eq 0) {
                 Ok "Plugin installed via agy plugin install"
             } else {
-                Warn2 "agy plugin install failed. Run 'agy plugin install $srcDir' to see the error."
+                Warn2 "agy plugin install failed - the CLI still loads the plugin from $ideDir."
+                if ($agyErr) { Log $agyErr }
+                Log "To retry the native registration: agy plugin install '$ideDir'"
             }
         } else {
             $cliPlugins = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\plugins'

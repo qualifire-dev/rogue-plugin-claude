@@ -374,7 +374,7 @@ returns an empty table on exactly the turns that matter. One honest caveat: a WA
 reader takes a read lock, which writes read-mark slots into the `-shm` sidecar.
 The main `.db` is never written, never checkpointed, never opened read-write.
 
-Payload contract, both escaping-free so they can be appended by re-closing the
+Payload contract, all escaping-free so they can be appended by re-closing the
 JSON object (the `transcriptTailB64` technique): `rogueDbPromptB64` (base64 of a
 `{v:1, idx, stepType, status, stepFormat, source, userVersion, text, readMs,
 walBytes, runtime}` envelope) and `rogueDbPromptCapable: true`, which is sent even
@@ -385,6 +385,33 @@ base64-or-nothing, the shell validates that charset, and only the shell writes
 JSON — so a crash in the reader can never become a hook decision. Kill switches:
 `ROGUE_ANTIGRAVITY_DB_PROMPT=0` (never read) and `=log` (read and log, never
 attach), both from `~/.rogue-env` or `/etc/rogue/env`, no reinstall needed.
+
+### A failed read is not an empty turn (`rogueDb*Missed`)
+
+`rogueDbPromptCapable` describes the **machine**, and the backend reads it on
+`Stop` as "this turn already arrived, don't re-emit the tail". Empty reader output
+alone cannot justify that: a turn's second and later `PreInvocation` genuinely has
+no new prompt (18 of 22 misses on a real machine were exactly that), while a locked
+DB, schema drift, a blown deadline or the `=log` mode means the content exists and
+we never delivered it. Reporting the second case as delivered lost the whole turn
+silently, with the transcript tail in hand.
+
+So health rides the reader's **exit status**, keeping the stdout invariant intact:
+
+| Exit | Meaning | Dispatcher does |
+|---|---|---|
+| 0 | store was read (emitted, or genuinely nothing new) | nothing extra |
+| 3 | could not read it (missing/locked DB, drift, deadline, unparseable input) | writes a per-conversation marker |
+
+`Stop` consumes any marker it finds and reports `rogueDbPromptMissed` /
+`rogueDbStepsMissed`, and the backend rebuilds **only** those halves from the tail
+(`antigravity-hook-parser.ts`, the `Stop` branch) — so a partial failure never
+duplicates the half that did arrive. Markers live next to the high-water cache
+(`ROGUE_ANTIGRAVITY_DBPROMPT_DIR`, default `~/.rogue/antigravity-dbprompt`) as
+`<conversationId>.missed-{prompt,steps}`. Absent markers mean "delivered", so an
+older backend that ignores these fields behaves exactly as before. A crash before
+`Stop` leaves a marker behind, which costs the next turn a duplicated message
+rather than a lost one — the safe direction.
 
 **The store is undocumented** — one CLI changelog line (v1.0.4, 2026-06-06) is its
 only public acknowledgement, and the language server ships roughly monthly. So

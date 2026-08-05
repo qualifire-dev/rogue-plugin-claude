@@ -643,6 +643,80 @@ print(env["kind"], " ".join(parts))')
   # every user message is stored twice — observed live before this assertion existed.
   assert_eq "$(field_present rogueDbPromptCapable)" "True" "IDE Stop declares the capability"
   assert_eq "$(field_present rogueDbPromptB64)" "False" "…without re-sending the prompt itself"
+  assert_eq "$(field_present rogueDbPromptMissed)" "False" "…and reports nothing missed on a clean turn"
+  assert_eq "$(field_present rogueDbStepsMissed)" "False" "…for either half"
+
+  # ── A FAILED read must not be reported as a delivered turn ────────────────
+  # The capability flag describes the machine, and the backend reads it on Stop as
+  # "this turn already arrived". A read that could not reach the content (here: no
+  # store file for the conversation at all — same class as a locked DB, drift, or a
+  # blown deadline) therefore has to be recorded, or Stop suppresses its transcript
+  # fallback and the whole turn is invisible with the tail in hand.
+  MISSING_BODY=$(printf '{"conversationId":"NOSTORE","transcriptPath":"%s","initialNumSteps":1,"invocationNum":0}' "$IDE_TP")
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; run_dispatcher PreInvocation "$MISSING_BODY"; LAST_RC=$?; set -e
+  assert_eq "$LAST_RC" "0" "an unreadable store still exits 0"
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "an unreadable store attaches nothing"
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$MISSING_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptMissed)" "True" "Stop reports the prompt the store never delivered"
+  assert_eq "$(field_present rogueDbStepsMissed)" "False" "…and only that half"
+  assert_eq "$(field_present rogueDbPromptCapable)" "True" "…while still declaring the capability"
+
+  # Consumed at Stop: a lingering marker would make the NEXT turn re-emit its tail.
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$MISSING_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptMissed)" "False" "the marker is consumed, not sticky"
+
+  # A steps read that fails is reported as the steps half, not the prompt.
+  restart_mock '{}'
+  set +e; run_dispatcher PostInvocation "$MISSING_BODY"; LAST_RC=$?; set -e
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$MISSING_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbStepsMissed)" "True" "Stop reports the steps the store never delivered"
+  assert_eq "$(field_present rogueDbPromptMissed)" "False" "…without claiming the prompt was lost too"
+
+  # "Nothing new" is NOT a failure: a turn's later invocations legitimately have no
+  # new prompt (18 of 22 misses on a real machine were exactly this), and treating
+  # them as failures would re-emit every turn's tail and duplicate messages.
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptB64)" "True" "first read of the turn attaches the prompt"
+  restart_mock '{}'
+  set +e; run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "the repeat read sends nothing"
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptMissed)" "False" "…and is not reported as a miss"
+
+  # log mode reads without attaching, so the turn was NOT delivered — the mode has
+  # to stay observational rather than blind the IDE.
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; ROGUE_ANTIGRAVITY_DB_PROMPT=log run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptMissed)" "True" "DB_PROMPT=log leaves Stop carrying the turn"
+
+  # The reader's exit status is the signal the dispatcher branches on, so pin it.
+  rm -rf "$DBT/cache"
+  set +e
+  printf '%s' "$IDE_BODY" | ELECTRON_RUN_AS_NODE=1 "$RUNTIME" --no-warnings --experimental-sqlite \
+    "$REPO/plugins/antigravity/scripts/db-prompt.mjs" prompt >/dev/null 2>&1
+  READER_RC=$?
+  printf '%s' "$IDE_BODY" | ELECTRON_RUN_AS_NODE=1 "$RUNTIME" --no-warnings --experimental-sqlite \
+    "$REPO/plugins/antigravity/scripts/db-prompt.mjs" prompt >/dev/null 2>&1
+  REPEAT_RC=$?
+  printf '%s' "$MISSING_BODY" | ELECTRON_RUN_AS_NODE=1 "$RUNTIME" --no-warnings --experimental-sqlite \
+    "$REPO/plugins/antigravity/scripts/db-prompt.mjs" prompt >/dev/null 2>&1
+  UNREAD_RC=$?
+  set -e
+  assert_eq "$READER_RC" "0" "the reader exits 0 when it emits"
+  assert_eq "$REPEAT_RC" "0" "the reader exits 0 when there is genuinely nothing new"
+  assert_eq "$UNREAD_RC" "3" "the reader exits 3 when it could not read the store"
+
   unset ROGUE_ANTIGRAVITY_NODE ROGUE_ANTIGRAVITY_DBPROMPT_DIR
 else
   echo "  skip: no node:sqlite-capable runtime found; DB-prompt positive cases skipped"

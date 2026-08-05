@@ -26,6 +26,15 @@
 // never a hook decision, never JSON on stdout. hook.sh owns the decision shape,
 // so a crash here can only ever degrade to "nothing recovered".
 //
+// HEALTH RIDES THE EXIT CODE, not stdout, so that invariant stands. Empty output
+// is ambiguous on its own: a turn's second and later `PreInvocation` genuinely has
+// no new prompt (18 of 22 local misses were exactly that), while a locked DB,
+// schema drift or a blown deadline means the content exists and we failed to
+// deliver it. The caller has to tell those apart, because it is what decides
+// whether `Stop` still carries the turn from the transcript — treating a failed
+// read as "already delivered" makes the whole turn invisible. So: exit 0 = the
+// store was read (emitted or genuinely nothing new), exit 3 = not read.
+//
 // Read-only, with one honest caveat: a WAL reader takes a read lock, which writes
 // read-mark slots into the `-shm` sidecar. The main `.db` is never written, never
 // checkpointed, never opened read-write.
@@ -252,6 +261,12 @@ function walBytes(dbPath) {
   }
 }
 
+// Exit codes. READ means the store was consulted successfully — emitting nothing
+// under READ is the ordinary "no new rows" case. UNREAD means we never got the
+// content, so the caller must not report this turn as delivered.
+const EXIT_READ = 0;
+const EXIT_UNREAD = 3;
+
 function main() {
   const started = performance.now();
   const mode = process.argv[2] === "steps" ? "steps" : "prompt";
@@ -259,22 +274,28 @@ function main() {
   try {
     body = JSON.parse(readFileSync(0, "utf8"));
   } catch {
-    return;
+    return EXIT_UNREAD;
   }
-  if (!body || typeof body !== "object") return;
+  if (!body || typeof body !== "object") return EXIT_UNREAD;
 
   const transcriptPath = typeof body.transcriptPath === "string" ? body.transcriptPath : "";
   const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
   const initialNumSteps = body.initialNumSteps;
   // IDE only: the other surfaces already carry this content in the transcript
   // tail at these same events, so reading their store is risk for no gain.
-  if (!transcriptPath.includes(IDE_SEGMENT)) return;
-  if (!conversationId || !Number.isInteger(initialNumSteps) || initialNumSteps < 0) return;
+  // Not a failure: there is nothing here we were meant to deliver.
+  if (!transcriptPath.includes(IDE_SEGMENT)) return EXIT_READ;
+  // The fields the read needs. Their absence is drift, not an empty turn.
+  if (!conversationId || !Number.isInteger(initialNumSteps) || initialNumSteps < 0) {
+    return EXIT_UNREAD;
+  }
 
   const stateDir = transcriptPath.split("/brain/")[0];
-  if (!stateDir) return;
+  if (!stateDir) return EXIT_UNREAD;
   const dbPath = join(stateDir, "conversations", `${conversationId}.db`);
-  if (!existsSync(dbPath)) return;
+  // A conversation whose store file is not there yet (a brand-new session) has
+  // content we cannot see, not an empty turn.
+  if (!existsSync(dbPath)) return EXIT_UNREAD;
 
   const already = highWater(conversationId);
   let db;
@@ -302,7 +323,9 @@ function main() {
     const uv = db.prepare("pragma user_version").get();
     if (uv && Number.isFinite(Number(uv.user_version))) userVersion = Number(uv.user_version);
   } catch {
-    return;
+    // Locked, mid-checkpoint, or a schema we cannot query: the content is there
+    // and we did not get it.
+    return EXIT_UNREAD;
   } finally {
     try {
       db?.close();
@@ -318,10 +341,16 @@ function main() {
     steps.push(step);
     if (mode === "prompt") break; // newest prompt only
   }
-  if (steps.length === 0) return;
-  if (performance.now() - started > DEADLINE_MS) return; // too late to act on
+  if (steps.length === 0) {
+    // No rows at all is the ordinary case (a turn's later invocations have no new
+    // prompt). Rows that all failed to decode is drift: content we cannot read.
+    return rows.length === 0 ? EXIT_READ : EXIT_UNREAD;
+  }
+  // Past the deadline, or unable to record the high-water mark: we have the
+  // content but are not delivering it, so the turn is NOT accounted for.
+  if (performance.now() - started > DEADLINE_MS) return EXIT_UNREAD;
   const maxIdx = Math.max(...steps.map((s) => s.idx));
-  if (!setHighWater(conversationId, maxIdx)) return;
+  if (!setHighWater(conversationId, maxIdx)) return EXIT_UNREAD;
 
   const common = {
     v: 1,
@@ -338,11 +367,13 @@ function main() {
   // Base64 has no JSON-special characters, so hook.sh can append it by
   // re-closing the object — the same technique it uses for transcriptTailB64.
   process.stdout.write(Buffer.from(JSON.stringify(envelope), "utf8").toString("base64"));
+  return EXIT_READ;
 }
 
 try {
-  main();
+  process.exitCode = main() ?? EXIT_READ;
 } catch {
   // Unreachable by design; a reader must never fail loudly on a user's keystroke.
+  // Reported as unread so the caller keeps the transcript fallback for this turn.
+  process.exitCode = EXIT_UNREAD;
 }
-process.exitCode = 0;

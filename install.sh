@@ -315,12 +315,22 @@ antigravity_install_plugin() {
   ok "Plugin installed → ${C_DIM}$ide_dir${C_RESET}"
 
   # CLI: native install if `agy` is present, else manual copy if the CLI dir exists.
+  #
+  # A failure here is NOT fatal and must not be reported as one: the global copy
+  # above is the shared plugins dir all three surfaces read (`agy plugin list`
+  # reports it as source "antigravity"), so the CLI keeps loading the plugin from
+  # there. What it must not do is print a dead recovery command — `$src` lives in
+  # `$tmp`, which the RETURN trap deletes on the way out of this function, so the
+  # durable path ($ide_dir) is the only one worth suggesting.
   if have_cmd agy; then
     agy plugin uninstall "$PLUGIN_NAME" >/dev/null 2>&1 || true
-    if agy plugin install "$src" >/dev/null 2>&1; then
+    local agy_err
+    if agy_err="$(agy plugin install "$src" 2>&1)"; then
       ok "Plugin installed via ${C_DIM}agy plugin install${C_RESET}"
     else
-      warn "agy plugin install failed. Run 'agy plugin install $src' to see the error."
+      warn "agy plugin install failed — the CLI still loads the plugin from $ide_dir."
+      [ -n "$agy_err" ] && note "${C_DIM}${agy_err}${C_RESET}"
+      note "To retry the native registration: ${C_DIM}agy plugin install '$ide_dir'${C_RESET}"
     fi
   elif [ -d "$HOME/.gemini/antigravity-cli/plugins" ]; then
     cli_dir="$HOME/.gemini/antigravity-cli/plugins/${PLUGIN_NAME}"

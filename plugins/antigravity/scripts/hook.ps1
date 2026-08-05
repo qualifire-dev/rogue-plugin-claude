@@ -441,6 +441,34 @@ function Get-JsRuntime {
 # `prompt` at PreInvocation is the pending prompt; `steps` at PostInvocation is what
 # the finished invocation produced — its tool results are what the NEXT model call
 # would read, and PostInvocation is the only event that owns terminationBehavior.
+# Per-conversation record of what the store failed to DELIVER this turn, consumed
+# at Stop (mirrors hook.sh's miss_marker / mark_store_miss). rogueDbPromptCapable
+# describes the machine, and the backend reads it on Stop as "the turn already
+# arrived" — so a read that could not reach the content (reader exit 3, or a kill,
+# or output we refuse to trust) has to be recorded, or the turn is lost outright
+# with the transcript tail sitting right there.
+function Get-MissMarker {
+    param([string]$Kind)
+    $dir = if ($env:ROGUE_ANTIGRAVITY_DBPROMPT_DIR) { $env:ROGUE_ANTIGRAVITY_DBPROMPT_DIR }
+           else { Join-Path (Join-Path $env:USERPROFILE '.rogue') 'antigravity-dbprompt' }
+    $cid = [regex]::Match($payload, '"conversationId"\s*:\s*"([^"]*)"').Groups[1].Value
+    # This becomes a path component, so anything but an id character is dropped.
+    $cid = ($cid -replace '[^0-9A-Za-z_-]', '')
+    if (-not $cid) { return '' }
+    if ($cid.Length -gt 64) { $cid = $cid.Substring(0, 64) }
+    return (Join-Path $dir "$cid.missed-$Kind")
+}
+
+function Mark-StoreMiss {
+    param([string]$Kind)
+    try {
+        $f = Get-MissMarker $Kind
+        if (-not $f) { return }
+        New-Item -ItemType Directory -Path (Split-Path $f) -Force | Out-Null
+        Set-Content -LiteralPath $f -Value '' -Encoding UTF8
+    } catch { Dbg "miss marker failed ($Kind): $($_.Exception.Message)" }
+}
+
 function Add-StoreRead {
     param([string]$Mode, [string]$Field)
     if ($payload -notmatch '/antigravity-ide/') { return }
@@ -461,22 +489,35 @@ function Add-StoreRead {
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.Write($payload); $proc.StandardInput.Close()
         $b64 = ''
-        if ($proc.WaitForExit(1000)) { $b64 = $proc.StandardOutput.ReadToEnd().Trim() }
-        else { try { $proc.Kill() } catch {} }
+        # The exit status is what separates "read it, nothing new" (0) from "could
+        # not read it"; a timeout is the latter.
+        $readOk = $false
+        if ($proc.WaitForExit(1000)) {
+            $b64 = $proc.StandardOutput.ReadToEnd().Trim()
+            $readOk = ($proc.ExitCode -eq 0)
+        } else { try { $proc.Kill() } catch {} }
 
         # The reader's whole stdout vocabulary is base64-or-nothing, so anything
         # else is discarded unread and can never become a hook decision.
         if ($b64 -and $b64 -match '^[A-Za-z0-9+/=]+$') {
             if ($env:ROGUE_ANTIGRAVITY_DB_PROMPT -eq 'log') {
                 Log "dbstore=hit mode=$Mode len=$($b64.Length) (not attached)"
+                # Read but deliberately not attached, so nothing was delivered:
+                # recording the miss keeps this mode observational.
+                Mark-StoreMiss $Mode
                 $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
             } else {
                 Log "dbstore=hit mode=$Mode len=$($b64.Length)"
                 $script:payload = $payload.TrimEnd().TrimEnd('}') +
                     ',"' + $Field + '":"' + $b64 + '","rogueDbPromptCapable":true}'
             }
+        } elseif ($readOk -and -not $b64) {
+            # Nothing new to send: the ordinary case on a turn's later invocations.
+            Log "dbstore=miss mode=$Mode reason=nothing-new capable=1"
+            $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
         } else {
-            Log "dbstore=miss mode=$Mode capable=1"
+            Log "dbstore=fail mode=$Mode capable=1"
+            Mark-StoreMiss $Mode
             $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
         }
     } catch { Dbg "store read failed ($Mode): $($_.Exception.Message)" }
@@ -539,14 +580,26 @@ if ($tailEvents -contains $EventName) {
 
 # Stop must also declare the capability: it re-reads the whole turn from the
 # transcript, and without this the backend cannot know the prompt was already
-# recorded at PreInvocation, so every user message lands twice. Mirrors hook.sh's
-# mark_db_prompt_capable.
+# recorded at PreInvocation, so every user message lands twice. It also reports
+# whichever halves of the turn the store failed to deliver, so the backend rebuilds
+# exactly those from the tail. Mirrors hook.sh's mark_db_prompt_capable.
 if ($EventName -eq 'Stop' -and $payload -match '/antigravity-ide/' `
     -and $env:ROGUE_ANTIGRAVITY_DB_PROMPT -ne '0') {
     try {
+        # Consume the markers whether or not a runtime still resolves, so a stale one
+        # cannot leak into a later turn.
+        $missed = ''
+        foreach ($kind in @('prompt', 'steps')) {
+            $f = Get-MissMarker $kind
+            if (-not $f -or -not (Test-Path -LiteralPath $f)) { continue }
+            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+            $field = if ($kind -eq 'prompt') { 'rogueDbPromptMissed' } else { 'rogueDbStepsMissed' }
+            $missed += ',"' + $field + '":true'
+        }
         $stopTp = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value.Replace('\/', '/').Replace('\\', '\')
         if (Get-JsRuntime (($stopTp -split '/brain/')[0])) {
-            $payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+            if ($missed) { Log "dbstore=stop missed=$($missed.TrimStart(','))" }
+            $payload = $payload.TrimEnd().TrimEnd('}') + $missed + ',"rogueDbPromptCapable":true}'
         }
     } catch { Dbg "capability flag failed: $($_.Exception.Message)" }
 }

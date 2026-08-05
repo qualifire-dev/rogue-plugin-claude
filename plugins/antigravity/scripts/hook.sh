@@ -203,18 +203,66 @@ resolve_js_runtime() {
   sh "${PLUGIN_ROOT}/scripts/resolve-runtime.sh" "$1" 2>/dev/null
 }
 
-# Mark that this machine CAN recover a prompt pre-send. It describes the MACHINE,
-# not the turn, so it must ride `Stop` as well as `PreInvocation`: `Stop` re-reads
-# the whole turn from the transcript, and without this flag the backend cannot know
-# the prompt was already recorded at `PreInvocation` — it re-emits it and every
-# user message lands twice (observed on a live IDE session before this existed).
+# ── What the store actually delivered this turn ─────────────────────────────
+# `rogueDbPromptCapable` describes the MACHINE, not the turn, and the backend reads
+# it on `Stop` as "this turn already arrived, don't re-emit the tail". That is right
+# for a successful read and wrong for a failed one: a locked DB, schema drift or a
+# blown deadline would cost the whole turn silently, with the tail in hand.
+#
+# So a read that could NOT reach the content (db-prompt.mjs exit 3, as opposed to
+# exit 0 = "read, nothing new") leaves a marker here, and `Stop` turns whatever it
+# finds into `rogueDbPromptMissed` / `rogueDbStepsMissed` so the backend rebuilds
+# exactly the missing halves from the transcript. No marker means delivered, which
+# keeps the behaviour identical for an older backend that ignores these fields.
+#
+# Markers are per conversation and consumed at `Stop`. A crash before `Stop` leaves
+# one behind and costs the NEXT turn a duplicated message rather than a lost one —
+# the safe direction.
+MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"
+
+# Conversation ids are UUIDs; anything else is filtered out rather than trusted,
+# because this value becomes a path component.
+miss_marker() {
+  _mkid=$(printf '%s' "$1" | tr -dc '0-9a-zA-Z_-' | cut -c1-64)
+  [ -n "$_mkid" ] || return 1
+  printf '%s/%s.missed-%s' "$MISS_DIR" "$_mkid" "$2"
+}
+
+# $1 = kind (prompt|steps), $2 = body.
+mark_store_miss() {
+  _msf=$(miss_marker "$(json_field conversationId "$2")" "$1") || return 0
+  mkdir -p "$MISS_DIR" 2>/dev/null || return 0
+  : > "$_msf" 2>/dev/null || true
+}
+
+# Mark that this machine CAN recover a prompt pre-send, and report whatever the
+# store failed to deliver this turn. Rides `Stop`: it re-reads the whole turn from
+# the transcript, and without the capability flag the backend cannot know the prompt
+# was already recorded at `PreInvocation` — it re-emits it and every user message
+# lands twice (observed on a live IDE session before this existed).
 mark_db_prompt_capable() {
   _mbody="$1"
   [ "$DB_PROMPT_MODE" = "0" ] && { printf '%s' "$_mbody"; return; }
   _mtp=$(json_field transcriptPath "$_mbody")
   case "$_mtp" in */antigravity-ide/*) ;; *) printf '%s' "$_mbody"; return ;; esac
+
+  # Consume the turn's markers even if no runtime resolves any more, so a stale one
+  # cannot leak into a later turn.
+  _mmissed=""
+  _mcid=$(json_field conversationId "$_mbody")
+  for _mkind in prompt steps; do
+    _mmf=$(miss_marker "$_mcid" "$_mkind") || continue
+    [ -f "$_mmf" ] || continue
+    rm -f "$_mmf" 2>/dev/null || true
+    case "$_mkind" in
+      prompt) _mmissed="${_mmissed},\"rogueDbPromptMissed\":true" ;;
+      steps)  _mmissed="${_mmissed},\"rogueDbStepsMissed\":true" ;;
+    esac
+  done
+
   [ -n "$(resolve_js_runtime "$_mtp")" ] || { printf '%s' "$_mbody"; return; }
-  printf '%s,"rogueDbPromptCapable":true}' "${_mbody%\}}"
+  [ -n "$_mmissed" ] && log "dbstore=stop missed=${_mmissed#,}"
+  printf '%s%s,"rogueDbPromptCapable":true}' "${_mbody%\}}" "$_mmissed"
 }
 
 # Read from the store and append the result, plus `rogueDbPromptCapable` (whether
@@ -239,26 +287,47 @@ augment_from_store() {
   fi
 
   # Hard wall independent of the reader's own deadline: these events gate the
-  # developer's turn, so a hung runtime must never hold one open.
+  # developer's turn, so a hung runtime must never hold one open. The reader's
+  # exit status is what separates "read it, nothing new" (0) from "could not read
+  # it" (non-zero, including 137 from the kill below), so it is carried out of the
+  # subshell explicitly — otherwise `$?` would be the watchdog's `kill`.
   _out=$(printf '%s' "$_body" | ELECTRON_RUN_AS_NODE=1 "$_rt" --no-warnings \
     --experimental-sqlite "${PLUGIN_ROOT}/scripts/db-prompt.mjs" "$_mode" 2>/dev/null &
     _pid=$!
     ( sleep 1; kill -9 "$_pid" 2>/dev/null ) 2>/dev/null &
     _watch=$!
     wait "$_pid" 2>/dev/null
-    kill "$_watch" 2>/dev/null)
+    _rc=$?
+    kill "$_watch" 2>/dev/null
+    exit "$_rc")
+  _read_rc=$?
 
   # The reader's whole stdout vocabulary is base64-or-nothing. Anything else is
   # discarded unread, so its output can never become a hook decision.
   case "$_out" in
-    "" ) log "dbstore=miss mode=$_mode capable=1"
+    "" ) if [ "$_read_rc" -eq 0 ]; then
+           # Read fine, nothing to send: the ordinary case on a turn's later
+           # invocations, which have no new prompt. The turn is accounted for.
+           log "dbstore=miss mode=$_mode reason=nothing-new capable=1"
+         else
+           # The content is there and we did not get it, so `Stop` must still
+           # carry this turn from the transcript.
+           log "dbstore=fail mode=$_mode rc=$_read_rc capable=1"
+           mark_store_miss "$_mode" "$_body"
+         fi
          printf '%s,"rogueDbPromptCapable":true}' "${_body%\}}"; return ;;
     *[!A-Za-z0-9+/=]* ) log "dbstore=none mode=$_mode reason=bad-output"
+         # Nothing is attached and no capability is claimed here, but `Stop` claims
+         # it from the runtime alone — so record the miss or the turn is lost.
+         mark_store_miss "$_mode" "$_body"
          printf '%s' "$_body"; return ;;
   esac
 
   if [ "$DB_PROMPT_MODE" = "log" ]; then
     log "dbstore=hit mode=$_mode len=${#_out} (not attached)"
+    # Diagnostic mode reads without attaching, so nothing was delivered: recording
+    # the miss is what keeps it observational instead of blinding the IDE.
+    mark_store_miss "$_mode" "$_body"
     printf '%s,"rogueDbPromptCapable":true}' "${_body%\}}"
     return
   fi
