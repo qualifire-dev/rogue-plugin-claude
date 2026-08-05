@@ -1,31 +1,30 @@
-# Rogue Security hook dispatcher for Claude Code - PowerShell implementation.
+# Rogue Security hook dispatcher for Claude Code — PowerShell implementation.
 #
 # Cross-platform sibling of hook.sh. hooks.json fires BOTH an `sh` entry and a
 # PowerShell entry for every event; exactly one does real work per machine:
 #
-#   * macOS / Linux / WSL         -> hook.sh runs (curl POST); `powershell` is
+#   • macOS / Linux / WSL         → hook.sh runs (curl POST); `powershell` is
 #                                   absent so this entry fails to spawn.
-#   * native Windows + Git Bash   -> hook.sh STANDS DOWN (uname is MINGW/MSYS/
+#   • native Windows + Git Bash   → hook.sh STANDS DOWN (uname is MINGW/MSYS/
 #                                   CYGWIN) so this script owns Windows.
-#   * native Windows, no Git Bash -> `sh` is not found (clean fail-open); this
+#   • native Windows, no Git Bash → `sh` is not found (clean fail-open); this
 #                                   script runs.
 #
 # hooks.json loads this WITHOUT -File so the PowerShell ExecutionPolicy never
 # applies (running a scriptblock built from a string is not subject to policy,
-# unlike invoking a .ps1 on disk - this also survives a GPO-enforced policy,
+# unlike invoking a .ps1 on disk — this also survives a GPO-enforced policy,
 # which -ExecutionPolicy Bypass does not):
 #
 #   powershell -NoProfile -NonInteractive -Command \
-#     "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path (Get-Item Env:CLAUDE_PLUGIN_ROOT).Value 'scripts/hook.ps1')))) <Event>" ; exit 0
+#     "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts/hook.ps1')))) <Event>"
 #
-# CLAUDE_PLUGIN_ROOT is a process ENVIRONMENT VARIABLE, read dollar-free as
-# (Get-Item Env:CLAUDE_PLUGIN_ROOT).Value - on Windows-with-Git-Bash the whole
-# command string is parsed by bash first, which would expand and mangle a
-# double-quoted $env:CLAUDE_PLUGIN_ROOT.
+# CLAUDE_PLUGIN_ROOT is a process ENVIRONMENT VARIABLE, so PowerShell resolves
+# $env:CLAUDE_PLUGIN_ROOT at runtime via Join-Path — it must NOT be
+# single-quoted (single quotes are literal in PowerShell and would never expand).
 #
 # This script mirrors hook.sh stage-for-stage: collect creds, resolve actor,
-# POST stdin to /api/v1/hooks/claude, detect + log a block decision, and relay
-# the server response verbatim (Claude shows the block reason natively).
+# POST stdin to /api/v1/hooks/claude, detect a block decision, fire a native
+# modal (security-alert.ps1) on block, and relay the server response verbatim.
 #
 # Fail-open everywhere: missing API key, network error, non-200, empty body all
 # yield `{}` on stdout, exit 0. Claude Code must never block because Rogue
@@ -101,11 +100,11 @@ function ConvertFrom-ShellQuoted {
 
 function Repair-DoubleEncodedUtf8 {
     # Claude Code on non-UTF-8 Windows locales can double-encode assistant text
-    # (UTF-8 -> CP1252 -> UTF-8): e.g. "-" arrives as """ and "'" as "".
+    # (UTF-8 -> CP1252 -> UTF-8): e.g. "—" arrives as "â€"" and "'" as "â€™".
     # Re-encode as CP1252 and decode as UTF-8, with BOTH steps STRICT (throw on any
     # unmappable char / invalid byte). Genuine mojibake round-trips to valid UTF-8
-    # and is repaired; already-correct text (cafe, an emoji, plain ASCII) fails the strict
-    # round-trip and is returned unchanged - a safe no-op for well-behaved clients.
+    # and is repaired; already-correct text (café, 😀, plain ASCII) fails the strict
+    # round-trip and is returned unchanged — a safe no-op for well-behaved clients.
     param([string]$Text)
     if (-not $Text) { return $Text }
     try {
@@ -132,7 +131,7 @@ try {
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch {}
 
-# -- stand down on non-Windows (pwsh on macOS/Linux) ------------------------
+# ── stand down on non-Windows (pwsh on macOS/Linux) ────────────────────────
 # $IsWindows exists only in PowerShell 6+. In 5.1 (Windows-only) it is $null, so
 # guard on the version to avoid a false stand-down there.
 if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { Write-Raw '{}'; exit 0 }
@@ -144,14 +143,13 @@ if (-not $env:CLAUDE_CODE_ENTRYPOINT) { Write-Raw '{}'; exit 0 }
 if (-not $EventName) { Dbg "no event name -> {}"; Write-Raw '{}'; exit 0 }
 Dbg "event=$EventName"
 
-# -- plugin root + logging --------------------------------------------------
+# ── plugin root + logging ──────────────────────────────────────────────────
 $pluginRoot = $env:CLAUDE_PLUGIN_ROOT
 if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
 Dbg "pluginRoot=$pluginRoot"
 
-# Staging shadow always logs to its own file so prod and shadow diagnostics
-# never interleave.
-$logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook-staging.log'
+$logFile = $env:ROGUE_LOG_FILE
+if (-not $logFile) { $logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log' }
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
 function Log {
     param([string]$Msg)
@@ -163,7 +161,7 @@ function Log {
     } catch {}
 }
 
-# -- credential resolution (later file wins; process env wins over all) -----
+# ── credential resolution (later file wins; process env wins over all) ─────
 $creds = @{}
 $credFiles = @(
     (Join-Path $pluginRoot 'env'),
@@ -182,23 +180,18 @@ foreach ($f in $credFiles) {
         }
     }
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_STAGING_API_KEY','ROGUE_STAGING_ENFORCE') {
+foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL') {
     $val = [Environment]::GetEnvironmentVariable($k)
     if ($val) { $creds[$k] = $val }
 }
-
-# -- Staging shadow overrides (mirrors hook.sh) -----------------------------
-# Always target staging with the staging key; prod creds never leak here.
-$creds['ROGUE_BASE_URL'] = 'https://api.staging.on.rogue.security'
-$creds['ROGUE_API_KEY'] = $creds['ROGUE_STAGING_API_KEY']
 
 $apiKey = $creds['ROGUE_API_KEY']
 if (-not $apiKey) {
     Dbg "no API key after cred resolution -> fail-open"
     Log "outcome=unconfigured"
     if ($EventName -eq 'SessionStart') {
-        # Mirrors warn.sh's nudge (there is no warn.ps1 - this covers its job).
-        Write-Raw '{"systemMessage": "[Rogue Staging shadow] Not configured. Set ROGUE_STAGING_API_KEY in ~/.rogue-env."}'
+        # Mirrors warn.sh's nudge (there is no warn.ps1 — this covers its job).
+        Write-Raw '{"systemMessage": "[Rogue Security] Not configured. Run /rogue:setup to connect your API key."}'
     } else {
         Write-Raw '{}'
     }
@@ -211,8 +204,8 @@ $baseUrl = $creds['ROGUE_BASE_URL']
 if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
 $baseUrl = $baseUrl.TrimEnd('/')
 
-# -- actor resolution: explicit creds -> git config -> CLAUDE_CODE_USER_EMAIL ->
-#    username/hostname (mirrors actor.sh) -------------------------------------
+# ── actor resolution: explicit creds → git config → CLAUDE_CODE_USER_EMAIL →
+#    username/hostname (mirrors actor.sh) ─────────────────────────────────────
 $actorName = $creds['ROGUE_ACTOR_NAME']
 if (-not $actorName) { try { $actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
 if (-not $actorName -and $env:CLAUDE_CODE_USER_EMAIL) { $actorName = ($env:CLAUDE_CODE_USER_EMAIL -split '@')[0] }
@@ -227,7 +220,7 @@ if (-not $actorEmail) {
     else { $actorEmail = $env:COMPUTERNAME }
 }
 
-# -- payload from stdin -----------------------------------------------------
+# ── payload from stdin ─────────────────────────────────────────────────────
 $payload = [Console]::In.ReadToEnd()
 if (-not $payload) { $payload = '{}' }
 # Claude Code sends a UTF-8 payload, but the console often reads stdin under a
@@ -242,7 +235,7 @@ try {
 $payload = $payload.TrimStart([char]0xFEFF)
 $payload = Repair-DoubleEncodedUtf8 $payload
 
-# -- POST (fail-open) -------------------------------------------------------
+# ── POST (fail-open) ───────────────────────────────────────────────────────
 $headers = @{
     'x-rogue-api-key'     = $apiKey
     'x-rogue-event'       = $EventName
@@ -259,7 +252,7 @@ $resp = ''
 try {
     $r = Invoke-WebRequest -Uri $url -Method Post `
         -Headers $headers -ContentType 'application/json' -Body $bodyBytes `
-        -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
     Dbg "HTTP $($r.StatusCode), body length $($r.Content.Length)"
     if ($r.StatusCode -eq 200) {
         # Decode explicitly as UTF-8. Invoke-WebRequest's .Content mis-decodes as
@@ -277,13 +270,14 @@ try {
 $respHead = if ($resp.Length -gt 400) { $resp.Substring(0, 400) } else { $resp }
 Log "raw=$(Sanitize $respHead)"
 
-# -- block detection (mirrors hook.sh's pure-text scan) ---------------------
+# ── block detection (mirrors hook.sh's pure-text scan) ─────────────────────
 # Covers every block-decision shape Claude Code's hook protocol emits:
 #   "decision":"block"           UserPromptSubmit, Stop (top-level)
 #   "continue":false             legacy block signal
 #   "permissionDecision":"deny"  PreToolUse (inside hookSpecificOutput)
 #   "behavior":"deny"            PermissionRequest (inside hookSpecificOutput.decision)
 $blockRe = '"decision"\s*:\s*"block"|"continue"\s*:\s*false|"permissionDecision"\s*:\s*"deny"|"behavior"\s*:\s*"deny"'
+$fireAlert = $false
 if ($resp -imatch $blockRe) {
     # Extract reason (first match across the field names the formatter uses).
     $reason = $null
@@ -292,18 +286,52 @@ if ($resp -imatch $blockRe) {
     }
     if (-not $reason) { $reason = 'prompt blocked' }
 
-    # No local alert: Claude (CLI and Desktop/Cowork) shows the block reason
-    # natively now, so the response relay below is the whole user-facing story.
     Log "outcome=block reason=`"$(Sanitize $reason)`""
+    if ($env:CLAUDE_CODE_ENTRYPOINT -ne 'cli') {
+        switch ($EventName) {
+            'UserPromptSubmit'              { $noun = 'prompt' }
+            { $_ -in 'PreToolUse','PermissionRequest' } { $noun = 'tool call' }
+            default                         { $noun = 'action' }
+        }
+        $alertTitle = "⛔ Rogue blocked this $noun"
+        $alertMsg = "Why:`n$reason"
+        if ($reason -notlike '*rgx!*') {
+            $alertMsg += "`n`nTo allow it: prepend `"rgx!`" to your prompt and resend (marks it a false positive)."
+        }
+        $fireAlert = $true
+    } else {
+        Log "alert_skipped=cli"
+    }
 } else {
     Log "outcome=allow"
 }
 
-# Enforcing by default; ROGUE_STAGING_ENFORCE=0 opts into monitor-only shadow.
-if ($creds['ROGUE_STAGING_ENFORCE'] -ne '0') {
-    Emit-Json $resp
-} else {
-    if ($resp -imatch $blockRe) { Log "shadow=1 suppressed_block_relay" }
-    Emit-Json '{}'
+# Relay the decision to Claude FIRST and flush it, BEFORE launching the modal, so
+# the block is delivered even if the modal lingers on screen. The modal runs in a
+# separate, non-blocking Start-Process (its own fds), so it can never hold Claude's
+# stdout open or delay the decision — the sibling hook.sh fix detaches the
+# backgrounded alert's fds for the same reason.
+Emit-Json $resp
+
+if ($fireAlert) {
+    # Launch the modal detached (separate process, own handles). Pass title/msg via
+    # env vars so quoting/newlines can't break a -Command string. Load
+    # security-alert.ps1 via a scriptblock (no -File) so ExecutionPolicy/GPO never
+    # blocks it.
+    try {
+        $alert = Join-Path $pluginRoot 'scripts\security-alert.ps1'
+        if (Test-Path -LiteralPath $alert) {
+            $env:ROGUE_ALERT_TITLE = $alertTitle
+            $env:ROGUE_ALERT_MSG = $alertMsg
+            $env:ROGUE_ALERT_SEVERITY = 'critical'
+            $alertEsc = $alert.Replace("'", "''")
+            $boot = "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$alertEsc')))"
+            Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile', '-NonInteractive', '-Command', $boot) | Out-Null
+            Log "alert_launched=1 entrypoint=$($env:CLAUDE_CODE_ENTRYPOINT)"
+        } else {
+            Log "alert_skipped=missing_script"
+        }
+    } catch { Log "alert_error=$(Sanitize $_.Exception.Message)" }
 }
 exit 0

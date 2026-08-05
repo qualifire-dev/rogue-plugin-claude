@@ -16,17 +16,6 @@ esac
 [ -r /etc/rogue/env ]               && . /etc/rogue/env
 [ -r "$HOME/.rogue-env" ]           && . "$HOME/.rogue-env"
 
-# ── Staging shadow overrides ────────────────────────────────────────────────
-# This variant ALWAYS talks to the staging backend with its own key, so the
-# prod plugin's creds (which the cascade above just loaded) can never leak
-# into staging traffic, and vice versa. ENFORCING by default: the staging
-# dashboard's per-category Off/Log/Block rulesets are the control plane.
-# Set ROGUE_STAGING_ENFORCE=0 (env or plugin-root env file) for
-# monitor-only shadow mode that never influences the session.
-ROGUE_BASE_URL="https://api.staging.on.rogue.security"
-ROGUE_API_KEY="${ROGUE_STAGING_API_KEY:-}"
-ROGUE_LOG_FILE="$HOME/.rogue/hook-staging.log"
-
 [ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ] && echo '{}' && exit 0
 
 ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
@@ -50,7 +39,7 @@ RESP=$(curl -sS -X POST "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/ho
   -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
   -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
   -H 'Content-Type: application/json' \
-  --data-binary @- --max-time 15 || echo '{}')
+  --data-binary @- --max-time 10 || echo '{}')
 
 # Always log raw response so block-detection bugs are diagnosable from
 # ~/.rogue/hook.log alone, without re-instrumenting the script.
@@ -83,17 +72,45 @@ if [ "$BLOCK" = "1" ]; then
   [ -z "$REASON" ] && REASON=$(printf '%s' "$RESP" | sed -E -n 's/.*"message"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
   [ -z "$REASON" ] && REASON="prompt blocked"
 
-  # No local alert: Claude (CLI and Desktop/Cowork) shows the block reason
-  # natively now, so the response relay below is the whole user-facing story.
   log "outcome=block reason=\"$(sanitize "$REASON")\""
+  if [ "${CLAUDE_CODE_ENTRYPOINT:-}" != "cli" ]; then
+    # Build a clear, self-explanatory alert: an outcome+what title, then the
+    # server reason under a "Why:" label, then the override instruction. Naming
+    # the blocked thing (prompt / tool call) and the fix makes the modal
+    # actionable instead of dumping a raw detection code.
+    case "$EVENT" in
+      UserPromptSubmit)            NOUN="prompt" ;;
+      PreToolUse|PermissionRequest) NOUN="tool call" ;;
+      *)                           NOUN="action" ;;
+    esac
+    ALERT_TITLE="⛔ Rogue blocked this $NOUN"
+    ALERT_MSG="Why:
+$REASON"
+    # Only add the override line if the reason doesn't already explain rgx!,
+    # so we don't print the instruction twice.
+    case "$REASON" in
+      *rgx!*) : ;;
+      *) ALERT_MSG="$ALERT_MSG
+
+To allow it: prepend \"rgx!\" to your prompt and resend (marks it a false positive)." ;;
+    esac
+    # Background the alert so hook.sh returns immediately. Capture exit code
+    # afterward so TCC denials / osascript failures become visible in the log.
+    #
+    # The trailing `>/dev/null 2>&1 </dev/null` redirects the SUBSHELL's own fds —
+    # not just security-alert.sh's. Without it the subshell inherits hook.sh's
+    # stdout/stderr (the pipe Claude reads) and, because it waits for the modal to
+    # capture alert_rc, holds that pipe OPEN until the dialog is dismissed. Claude
+    # waits for stdout EOF up to the hook `timeout`, so a dismissal slower than the
+    # timeout makes Claude time the hook out and fail-open — silently letting a
+    # blocked prompt through. Detaching the subshell's fds lets hook.sh reach EOF
+    # the instant it exits, so the block applies regardless of when the modal closes.
+    ( bash "${CLAUDE_PLUGIN_ROOT}/scripts/security-alert.sh" "$ALERT_TITLE" "$ALERT_MSG" critical >/dev/null 2>&1; log "alert_rc=$? entrypoint=${CLAUDE_CODE_ENTRYPOINT:-unset}" ) >/dev/null 2>&1 </dev/null &
+  else
+    log "alert_skipped=cli"
+  fi
 else
   log "outcome=allow"
 fi
 
-# Enforcing by default; ROGUE_STAGING_ENFORCE=0 opts into monitor-only shadow.
-if [ "${ROGUE_STAGING_ENFORCE:-1}" = "1" ]; then
-  printf '%s' "$RESP"
-else
-  [ "$BLOCK" = "1" ] && log "shadow=1 suppressed_block_relay"
-  echo '{}'
-fi
+printf '%s' "$RESP"

@@ -1,0 +1,10 @@
+# Compiled by compile-local-dev.sh on 2026-06-08T16:32:29Z
+# Source: local working tree (git f250a73)
+export ROGUE_API_KEY=rsk_kkdlsbtDYXMGbKcdlzbNTbCINDEWNYyzxcIoVuBroOTHOmzrVpXEYyiJUixoBcCO
+export ROGUE_PRETOOLUSE_ON_BLOCK=ask
+export ROGUE_AUTO_UPDATE=0
+
+# Best-effort actor identity from git config on the end-user's machine.
+: "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email 2>/dev/null)}"
+: "${ROGUE_ACTOR_NAME:=$(git config --global user.name 2>/dev/null)}"
+export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
