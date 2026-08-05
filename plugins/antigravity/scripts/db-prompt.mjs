@@ -185,20 +185,37 @@ function harvestTypePayload(payload) {
   return out;
 }
 
-/** A step row → the canonical message it should become, or undefined to skip. */
+// Why a row produced no message. `SKIP` is expected and says nothing about the
+// store's health: plenty of rows legitimately carry no message. `UNDECODABLE` is
+// the drift signal — a row we should have been able to read and could not — and it
+// is the only kind that makes a turn "not delivered" (see main).
+const SKIP = "skip";
+const UNDECODABLE = "undecodable";
+
+/**
+ * A step row → the canonical message it should become, or `SKIP` / `UNDECODABLE`.
+ *
+ * The distinction is load-bearing: an empty result is reported to the dispatcher as
+ * a failed read, which makes `Stop` rebuild that half of the turn from the
+ * transcript. Calling an ordinary no-message row a failure therefore DUPLICATES
+ * messages that were delivered fine — a tool-call-only planner response is the
+ * common case, one per tool the model picks.
+ */
 function decodeStep(row) {
   const payload = row.step_payload;
-  if (!(payload instanceof Uint8Array)) return undefined;
+  // The blob is missing or not a blob at all: this row should have been readable.
+  if (!(payload instanceof Uint8Array)) return UNDECODABLE;
   const stepType = Number(row.step_type);
-  if (BOOKKEEPING_STEPS.has(stepType)) return undefined;
+  if (BOOKKEEPING_STEPS.has(stepType)) return SKIP;
   const envelope = message(payload, 5);
   const source = envelope ? varint(envelope, 3) : undefined;
-  if (source === SOURCE_ROGUE_INJECTION) return undefined; // never read our own writes
+  if (source === SOURCE_ROGUE_INJECTION) return SKIP; // never read our own writes
 
   let role;
   let body;
   if (stepType === STEP.USER_INPUT) {
-    if (source !== SOURCE_USER_EXPLICIT) return undefined;
+    // Not the developer's own prompt, so there is nothing here to gate.
+    if (source !== SOURCE_USER_EXPLICIT) return SKIP;
     role = "user";
     body = text(payload, 19, 2); // the prompt, stored bare
   } else if (stepType === STEP.PLANNER_RESPONSE) {
@@ -208,10 +225,13 @@ function decodeStep(row) {
     body = text(payload, 20, 1);
   } else {
     role = "tool";
+    // Generic harvest, so a tool we have never seen still yields its output. An
+    // empty harvest means the row carries no text at ALL, which is a state-only
+    // step type rather than a decode failure.
     const parts = harvestTypePayload(payload);
     body = parts.length > 0 ? parts.join("\n") : undefined;
   }
-  if (!body) return undefined;
+  if (!body) return SKIP;
   const truncated = body.length > MAX_TEXT;
   return {
     idx: Number(row.idx),
@@ -333,18 +353,32 @@ function main() {
   }
 
   const steps = [];
+  // Rows that should have carried a message and did not. This, and NOT "no steps
+  // came out", is what makes a read unhealthy — see the empty case below.
+  let undecodable = 0;
   for (const row of rows) {
-    if (Number(row.step_format) !== SUPPORTED_STEP_FORMAT) continue; // layout changed
+    if (Number(row.step_format) !== SUPPORTED_STEP_FORMAT) {
+      undecodable++; // the layout changed under us: the clearest drift signal there is
+      continue;
+    }
     const step = decodeStep(row);
-    if (!step) continue;
+    if (step === UNDECODABLE) {
+      undecodable++;
+      continue;
+    }
+    if (step === SKIP) continue;
     if (step.text.startsWith(OWN_INJECTION_PREFIX)) continue;
     steps.push(step);
     if (mode === "prompt") break; // newest prompt only
   }
   if (steps.length === 0) {
-    // No rows at all is the ordinary case (a turn's later invocations have no new
-    // prompt). Rows that all failed to decode is drift: content we cannot read.
-    return rows.length === 0 ? EXIT_READ : EXIT_UNREAD;
+    // Emitting nothing is USUALLY correct and healthy: no new rows since the last
+    // read, a tool-call-only planner response (one per tool the model picks), a
+    // state-only step type, our own injected message. Reporting those as failures
+    // would have the backend rebuild the turn from the transcript at `Stop` and
+    // duplicate messages that were delivered fine. Only a row we could not decode
+    // means content is being missed.
+    return undecodable === 0 ? EXIT_READ : EXIT_UNREAD;
   }
   // Past the deadline, or unable to record the high-water mark: we have the
   // content but are not delivering it, so the turn is NOT accounted for.

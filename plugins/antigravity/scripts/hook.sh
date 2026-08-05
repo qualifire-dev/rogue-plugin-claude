@@ -235,6 +235,18 @@ mark_store_miss() {
   : > "$_msf" 2>/dev/null || true
 }
 
+# A later read of the same half succeeded, so the content IS delivered and the
+# earlier failure is void. Without this a transient lock or deadline on the first
+# invocation of a turn would still make `Stop` replay that half from the transcript,
+# duplicating what a subsequent invocation delivered. Cleared only on a real attach:
+# "nothing new" says nothing about what an earlier failure missed.
+# $1 = kind (prompt|steps), $2 = body.
+clear_store_miss() {
+  _csf=$(miss_marker "$(json_field conversationId "$2")" "$1") || return 0
+  [ -f "$_csf" ] || return 0
+  rm -f "$_csf" 2>/dev/null || true
+}
+
 # Mark that this machine CAN recover a prompt pre-send, and report whatever the
 # store failed to deliver this turn. Rides `Stop`: it re-reads the whole turn from
 # the transcript, and without the capability flag the backend cannot know the prompt
@@ -332,6 +344,8 @@ augment_from_store() {
     return
   fi
   log "dbstore=hit mode=$_mode len=${#_out} runtime=$(basename "$_rt")"
+  # This half is delivered, so any earlier failure for it no longer costs anything.
+  clear_store_miss "$_mode" "$_body"
   printf '%s,"%s":"%s","rogueDbPromptCapable":true}' "${_body%\}}" "$_field" "$_out"
 }
 

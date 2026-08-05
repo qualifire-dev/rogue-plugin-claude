@@ -469,6 +469,20 @@ function Mark-StoreMiss {
     } catch { Dbg "miss marker failed ($Kind): $($_.Exception.Message)" }
 }
 
+# A later read of the same half succeeded, so the earlier failure is void. Without
+# this a transient lock on the first invocation of a turn would still make Stop
+# replay that half from the transcript, duplicating what a later invocation
+# delivered. Cleared only on a real attach. Mirrors hook.sh's clear_store_miss.
+function Clear-StoreMiss {
+    param([string]$Kind)
+    try {
+        $f = Get-MissMarker $Kind
+        if ($f -and (Test-Path -LiteralPath $f)) {
+            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+        }
+    } catch { Dbg "miss marker clear failed ($Kind): $($_.Exception.Message)" }
+}
+
 function Add-StoreRead {
     param([string]$Mode, [string]$Field)
     if ($payload -notmatch '/antigravity-ide/') { return }
@@ -508,6 +522,8 @@ function Add-StoreRead {
                 $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
             } else {
                 Log "dbstore=hit mode=$Mode len=$($b64.Length)"
+                # This half is delivered, so an earlier failure for it costs nothing.
+                Clear-StoreMiss $Mode
                 $script:payload = $payload.TrimEnd().TrimEnd('}') +
                     ',"' + $Field + '":"' + $b64 + '","rogueDbPromptCapable":true}'
             }

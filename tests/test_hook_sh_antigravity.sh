@@ -717,6 +717,74 @@ print(env["kind"], " ".join(parts))')
   assert_eq "$REPEAT_RC" "0" "the reader exits 0 when there is genuinely nothing new"
   assert_eq "$UNREAD_RC" "3" "the reader exits 3 when it could not read the store"
 
+  # ── A row with no message is not a failed read ────────────────────────────
+  # Every tool the model picks produces a PLANNER_RESPONSE row with tool_calls and
+  # NO prose. Reporting that as unread had Stop rebuild the turn from the transcript
+  # and duplicate what later invocations delivered — the common case poisoning the
+  # turn. Only a row that should have decoded and did not is a failure, so the
+  # step_format guard below must still report one.
+  python3 - "$IDE_STATE/conversations/TOOLONLY.db" "$IDE_STATE/conversations/DRIFT.db" <<'PY'
+import sqlite3, sys
+def varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n: return bytes(out)
+def tag(num, wire): return varint((num << 3) | wire)
+def msg(num, body): return tag(num, 2) + varint(len(body)) + body
+def make(path, step_format, blob):
+    con = sqlite3.connect(path)
+    con.execute("create table steps (idx integer primary key, step_type integer not null default 0, "
+                "status integer not null default 0, step_format integer not null default 0, step_payload blob)")
+    con.execute("insert into steps (idx, step_type, status, step_format, step_payload) values (5,15,3,?,?)",
+                (step_format, blob))
+    con.commit(); con.close()
+# step_type 15 with an envelope but no prose at 20.1: "the model chose a tool".
+make(sys.argv[1], 0, tag(1, 0) + varint(15) + msg(5, tag(3, 0) + varint(2)))
+# Same row under a step_format we cannot read: real drift.
+make(sys.argv[2], 1, tag(1, 0) + varint(15) + msg(5, tag(3, 0) + varint(2)))
+PY
+  toolonly_body() {
+    printf '{"conversationId":"%s","transcriptPath":"%s","initialNumSteps":5,"invocationNum":1}' "$1" "$IDE_TP"
+  }
+  rm -rf "$DBT/cache"
+  set +e
+  printf '%s' "$(toolonly_body TOOLONLY)" | ELECTRON_RUN_AS_NODE=1 "$RUNTIME" --no-warnings \
+    --experimental-sqlite "$REPO/plugins/antigravity/scripts/db-prompt.mjs" steps >/dev/null 2>&1
+  TOOLONLY_RC=$?
+  printf '%s' "$(toolonly_body DRIFT)" | ELECTRON_RUN_AS_NODE=1 "$RUNTIME" --no-warnings \
+    --experimental-sqlite "$REPO/plugins/antigravity/scripts/db-prompt.mjs" steps >/dev/null 2>&1
+  DRIFT_RC=$?
+  set -e
+  assert_eq "$TOOLONLY_RC" "0" "a tool-call-only planner row reads clean (nothing to deliver)"
+  assert_eq "$DRIFT_RC" "3" "an unreadable step_format is still reported as drift"
+
+  # …and end to end: such an invocation must leave Stop with nothing to rebuild.
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; run_dispatcher PostInvocation "$(toolonly_body TOOLONLY)"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbStepsB64)" "False" "a tool-call-only invocation attaches no steps"
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$(toolonly_body TOOLONLY)"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbStepsMissed)" "False" "…and is not reported as missed at Stop"
+
+  # ── A transient failure is void once the content arrives ──────────────────
+  # First read fails (no store file yet), a later one delivers the same half. Leaving
+  # the marker in place would make Stop replay a half that was already sent.
+  FLAKY_BODY=$(printf '{"conversationId":"FLAKY","transcriptPath":"%s","initialNumSteps":1,"invocationNum":0}' "$IDE_TP")
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; run_dispatcher PreInvocation "$FLAKY_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "the flaky first read attaches nothing"
+  cp "$IDE_STATE/conversations/CONV.db" "$IDE_STATE/conversations/FLAKY.db"
+  restart_mock '{}'
+  set +e; run_dispatcher PreInvocation "$FLAKY_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptB64)" "True" "the retry delivers the prompt"
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$FLAKY_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptMissed)" "False" "a delivered half clears the earlier failure"
+
   unset ROGUE_ANTIGRAVITY_NODE ROGUE_ANTIGRAVITY_DBPROMPT_DIR
 else
   echo "  skip: no node:sqlite-capable runtime found; DB-prompt positive cases skipped"
