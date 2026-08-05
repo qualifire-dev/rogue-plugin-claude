@@ -15,8 +15,10 @@ plugins. It POSTs every lifecycle event to
 `https://api.rogue.security/api/v1/hooks/antigravity` and relays the API's
 native Antigravity decision shape verbatim.
 
-- **Family** `antigravity`; **surfaces** `antigravity_ide` / `antigravity_cli`
-  (the API infers the surface from `transcriptPath` — see below).
+- **Family** `antigravity`; **surfaces** `antigravity` (the 2.0 app),
+  `antigravity_ide` (the IDE), `antigravity_cli` (the `agy` CLI). The API
+  infers the surface from `transcriptPath`; the dispatchers derive the same value
+  for the heartbeat, which has no payload of its own (see below).
 - **Dual sh + PowerShell dispatcher**, NOT the Gemini single-Node model.
   Antigravity does not guarantee Node on PATH, so `hook.sh` (POSIX sh + curl)
   and `hook.ps1` (PowerShell 5.1-compatible) ship side by side and must be kept
@@ -304,16 +306,91 @@ Before tailing, `wait_for_transcript_flush` / `Wait-TranscriptFlush` polls for
 marker-based on purpose: Antigravity has no documented "turn end" marker line to
 poll for the way Copilot's `events.jsonl` has `assistant.turn_end`.
 
-**Real transcript location and schema** (CLI, verified — the docs describe
-neither):
+**Real transcript location and schema** (verified on all three surfaces — the
+docs describe neither):
 
 ```
-~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl   # agy CLI
+~/.gemini/antigravity-ide/brain/<conversationId>/.system_generated/logs/…                  # IDE
+~/.gemini/antigravity/brain/<conversationId>/.system_generated/logs/…                       # 2.0 app
                                                                      …/transcript_full.jsonl
 ```
 
-**`transcriptPath` names `transcript_full.jsonl`** (confirmed from a live
-payload; both files existed with identical content in the sessions captured).
+**Which file `transcriptPath` names differs per surface**: the CLI and the 2.0
+app name `transcript_full.jsonl`, the IDE names `transcript.jsonl`. Both
+exist side by side with the same row schema (contents differ slightly — the IDE's
+`transcript.jsonl` double-quotes some tool args), so `augment_with_transcript`
+falls back to whichever sibling it can read.
+
+**When the transcript is written differs per surface, and it decides which event
+can see anything.** The CLI and the 2.0 app write it **live**, so each
+invocation's rows are on disk by the time its `Pre/PostInvocation` fires. The
+IDE writes it **only when the turn ends** — verified on IDE 2.1.1: the
+file is created at `Stop`, and the same turn's `PreInvocation` and
+`PostInvocation` both logged `tail=none reason=unreadable`. That is why every IDE
+session showed up empty in the UI. Two consequences:
+
+- The dispatchers wait (~2s cap) for the file to appear, so a first-`PreInvocation`
+  race on the live-writing surfaces no longer drops the opening prompt.
+- The IDE's *transcript* content genuinely only exists at `Stop`, so the tail is
+  attached on `Stop` only for that surface. Attaching it on `Pre/PostInvocation`
+  could never carry more than the previous turn, and waiting for the current one
+  is impossible — measured: the file appears ~4s later, at `Stop`.
+
+### The IDE prompt gate: `db-prompt.mjs`
+
+The pending prompt is not in the transcript at `PreInvocation`, but it IS already
+committed to Antigravity's own conversation store, so on **`antigravity_ide` only**
+the dispatcher reads it there and appends it for the backend to evaluate:
+
+```
+<stateDir>/conversations/<conversationId>.db     SQLite, WAL mode, same schema on all 3 products
+steps(idx PRIMARY KEY, step_type, status, step_format, step_payload BLOB, …)
+  step_type 14 = USER_INPUT;  idx == the transcript's step_index
+  step_payload is protobuf: [5.3] = source (4 USER_EXPLICIT, 6 = OUR OWN injection)
+                            [19.2] = the prompt text, BARE (no <USER_REQUEST> wrapper)
+```
+
+Selection rule: the highest `step_type = 14`, `source = 4` row with
+`idx < initialNumSteps`. Deliberately not `idx == initialNumSteps - 1` — on a
+tool-loop continuation that index is a tool result, and bookkeeping rows can land
+below the boundary too. Re-reads within a turn are suppressed by an idx cache
+(`~/.rogue/antigravity-dbprompt/<conversationId>`), which is also what stops us
+reading back our own injected block message.
+
+**Runtime: nothing is installed.** The reader needs `node:sqlite` (Node ≥ 22.13).
+`resolve-runtime.sh` probes candidates *by executing them* — never by version
+string — and caches the answer: `$ROGUE_ANTIGRAVITY_NODE`, then the cache, then
+**the IDE's own Electron** (discovered from `<stateDir>/bin/agentapi`, which execs
+the language server inside the app bundle), then Antigravity 2.0's `agy-node`,
+then system `node`. Measured on macOS: the IDE ships Electron 39 / Node 22.21.1
+with `node:sqlite`, while the developer's own Node 20 does **not** — which is why
+the bundled runtime ranks above PATH. Nothing found ⇒ a `none` sentinel is cached,
+the gate is inactive, and everything else is unaffected.
+
+Open with `?mode=ro`, **never `immutable=1`** — immutable ignores the WAL and the
+pending prompt is WAL-only at `PreInvocation` (measured), so an immutable read
+returns an empty table on exactly the turns that matter. One honest caveat: a WAL
+reader takes a read lock, which writes read-mark slots into the `-shm` sidecar.
+The main `.db` is never written, never checkpointed, never opened read-write.
+
+Payload contract, both escaping-free so they can be appended by re-closing the
+JSON object (the `transcriptTailB64` technique): `rogueDbPromptB64` (base64 of a
+`{v:1, idx, stepType, status, stepFormat, source, userVersion, text, readMs,
+walBytes, runtime}` envelope) and `rogueDbPromptCapable: true`, which is sent even
+on a miss so the backend knows whether `Stop` still needs to carry the prompt.
+
+`db-prompt.mjs` is a **pure reader**: its entire stdout vocabulary is
+base64-or-nothing, the shell validates that charset, and only the shell writes
+JSON — so a crash in the reader can never become a hook decision. Kill switches:
+`ROGUE_ANTIGRAVITY_DB_PROMPT=0` (never read) and `=log` (read and log, never
+attach), both from `~/.rogue-env` or `/etc/rogue/env`, no reinstall needed.
+
+**The store is undocumented** — one CLI changelog line (v1.0.4, 2026-06-06) is its
+only public acknowledgement, and the language server ships roughly monthly. So
+`stepFormat`/`userVersion` travel with every hit as drift markers, every failure
+path fails open, and the hook logs `dbprompt=hit|miss|none` with lengths and
+timings but **never the prompt text**.
 
 One JSON object per line, with these keys:
 
@@ -344,9 +421,11 @@ therefore never found a single assistant reply — FIRE-1828 follow-up):
   `PLANNER_RESPONSE` that requested it (step 2). Anything reasoning about "the
   last row" must sort by `step_index` first.
 
-The IDE surface presumably mirrors this under `~/.gemini/antigravity/brain/…`
-(no `-cli`), which is what makes the API's surface inference work, but no IDE
-transcript has been captured yet — **unverified**.
+All three surfaces write the same row schema (verified against live
+`antigravity`, `antigravity-ide` and `antigravity-cli` transcripts), so the
+parser is surface-agnostic. Two payload differences worth knowing: the IDE
+sends **no `modelName`** at all, and it fires `PostToolUse` for internal steps
+that never had a `PreToolUse`.
 
 ## Subagents
 
@@ -392,14 +471,27 @@ rewrite the body — the **second of the plugin's two stdin mutations**:
 2. Look it up in `~/.rogue/antigravity-submap/<id>` (override:
    `ROGUE_ANTIGRAVITY_SUBMAP_DIR`).
 3. On a cache miss, scan `brain/*/.system_generated/logs/transcript_full.jsonl`
-   (override: `ROGUE_ANTIGRAVITY_BRAIN_DIR`) for an `INVOKE_SUBAGENT` row naming
-   this id; **the parent conversation id IS that transcript's directory name**.
-4. On a hit: rewrite the body's `conversationId` to the parent and add
-   `x-rogue-subagent-id` / `x-rogue-subagent-name`. The backend's
-   (provider-agnostic) `enrichFromHeaders` turns those into the
-   `aidr_message.subagent_id` / `subagent_name` columns, so the rows are
-   distinguishable inside the parent's transcript. Headers are **omitted
-   entirely** — never sent empty — on main-agent events.
+   for an `INVOKE_SUBAGENT` row naming this id; **the parent conversation id IS
+   that transcript's directory name**. The brain dir is taken from this event's
+   own `transcriptPath` (a subagent runs on the surface that spawned it), so the
+   scan follows the surface instead of assuming the CLI's dir; override with
+   `ROGUE_ANTIGRAVITY_BRAIN_DIR`.
+4. On a hit: rewrite the body's `conversationId` to the parent and send the agent
+   tag as **headers** — `x-rogue-agent-id` and `x-rogue-agent-name-b64` (base64,
+   so an arbitrary `Role` with accents or emoji cannot produce an invalid header
+   value). Both are **omitted entirely** — never sent empty — on main-agent events.
+   The backend reads them in `handleAntigravity` and stamps every canonical
+   message, which is what lands in the `aidr_message.agent_id` / `agent_name`
+   columns.
+
+   **Headers, not body fields, on purpose.** The POSTed event must stay
+   byte-identical to what Antigravity handed us, so the stored `rawPayload` is the
+   vendor's own event and nothing we synthesised — the backend strips the two
+   store blobs and the capability flag for the same reason. Copilot puts its tag
+   in the body (`agentId` / `agentNameB64`); that divergence is known and
+   accepted here, so do not "align" the two without being asked. Note the one
+   remaining body mutation: `conversationId` is rewritten so a subagent's events
+   nest under the parent session, which is the whole point of re-attribution.
 
 Load-bearing details:
 
@@ -433,7 +525,7 @@ Display name, in priority order:
 
 Positional naming misaligns if one conversation makes **two** `invoke_subagent`
 calls, because the two lists are read in file order and file order is not step
-order. That degrades only the display name — `x-rogue-subagent-id` is always
+order. That degrades only the display name — `agentId` is always
 exact.
 
 ## Heartbeat
@@ -446,9 +538,15 @@ verified to reset to 0 on each new prompt in the same conversation, so a
 upsert keyed host+actor+family+agent) but chattier than intended; gating on
 `invocationNum == 0 && initialNumSteps <= 1` would make it truly per-session. `heartbeat.sh` POSTs `/api/v1/hooks/status` with
 `agent_family:"antigravity"`, `version` from `VERSION`, host, and actor fields.
-Surface is inferred from the environment rather than a transcript path: default
-`antigravity_ide`, flipped to `antigravity_cli` when `agy` is on PATH or
-`~/.gemini/antigravity-cli` exists. There is **no auto-update script** —
+Surface is **passed in by the dispatcher** (`heartbeat.sh <surface>` /
+`heartbeat.ps1 -Agent <surface>`), read off the triggering event's
+`transcriptPath` — the only reliable source, since one install at
+`~/.gemini/config/plugins/rogue` serves all three products. The old
+environment-sniffing inference survives only as a fallback for a manual run
+(default `antigravity`, flipped to `antigravity_cli` when `agy` is on PATH or
+`~/.gemini/antigravity-cli` exists); it cannot tell co-installed surfaces apart,
+which collapsed every surface into one `antigravity_cli` roster row.
+There is **no auto-update script** —
 Antigravity upgrades by re-running the one-line installer.
 
 ## Exactly-one-runs
@@ -542,23 +640,26 @@ content-less events and *not* on `PreToolUse`, and that the base64 round-trips.
   blocked *before* it enters context, instead of relying on loop termination
   after the read. Only viable for read-type tools — `run_command` output can't
   be known in advance.
-- **Subagent re-attribution depends on the `aidr_message.subagent_id` /
-  `subagent_name` columns**, which arrive with the Copilot work (qualifire
-  #1814 — migration `20260722_aidr_message_subagent.sql`, plus
-  `CanonicalMessage.subagentId`/`subagentName` and the header handling in
-  `enrichFromHeaders`). That plumbing is provider-agnostic, so the Antigravity
-  side needs **no backend code** — until #1814 merges, the two
-  `x-rogue-subagent-*` headers are simply ignored and only the session nesting
-  takes effect.
+- **Subagent re-attribution depends on the `aidr_message.agent_id` /
+  `agent_name` columns**, which landed with the Copilot work (qualifire #1814,
+  migration `20260803103612_aidr_message_occurred_at_agent.sql`, plus
+  `CanonicalMessage.agentId`/`agentName` and the promotion in
+  `aidr-transcript-dao.ts`). Those columns are vendor-agnostic, but the WIRE is
+  not: Copilot's parser reads body fields, so Antigravity's headers are read in
+  `handleAntigravity` instead. Nothing displays the columns yet — no tRPC router
+  or component selects them — so attribution is stored and queryable, not visible.
 - The subagent's *delivered result* in the parent (the `SYSTEM_MESSAGE` row) is
   currently tagged with the sender id via `tool_call_id`. Once the columns exist
   it should carry `subagentId`/`subagentName` too, so the parent's copy of a
   reply is attributed the same way as the subagent's own rows.
 - `~/.rogue/antigravity-submap/` grows one small file per conversation and is
   never pruned (same as Copilot's `copilot-submap`).
-- Antigravity IDE surface entirely untested; CLI only so far. In particular the
-  IDE's transcript path (assumed `~/.gemini/antigravity/brain/…`, which is what
-  the surface inference keys off) is unverified.
+- `~/.rogue/antigravity-submap/` is keyed by conversation id only, so the three
+  surfaces share one namespace. Harmless today (ids are UUIDs), but a collision
+  across surfaces would resolve to the wrong parent.
+- A subagent is looked for only in the brain dir of the surface that fired the
+  event. Correct for every case seen, but a cross-surface spawn (if Antigravity
+  ever adds one) would not resolve.
 - MCP tool naming under Antigravity's `mcp(server/tool)` permission namespace is
   matched heuristically server-side; no real MCP call has been observed.
 - Heartbeat fires per user turn rather than per session (see above).

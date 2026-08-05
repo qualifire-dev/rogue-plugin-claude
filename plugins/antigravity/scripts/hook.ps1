@@ -167,6 +167,21 @@ try {
 } catch {}
 $payload = $payload.TrimStart([char]0xFEFF)
 
+# Which Antigravity product fired this event, from the state dir its transcript
+# lives in. Slash-anchored and ordered specific → general because the bare
+# segment is a prefix of the other two: the `-ide` dir is the Antigravity IDE and
+# the bare one is Antigravity 2.0 (both current products). Mirrors
+# hook.sh's surface_from_transcript and the backend's surfaceFromTranscript.
+# Unattributable → empty, so the caller keeps its own fallback.
+function Get-AntigravitySurface {
+    param([string]$TranscriptPath)
+    $p = ($TranscriptPath -replace '\\', '/')
+    if ($p -like '*/antigravity-cli/*') { return 'antigravity_cli' }
+    if ($p -like '*/antigravity-ide/*') { return 'antigravity_ide' }
+    if ($p -like '*/antigravity/*')     { return 'antigravity' }
+    return ''
+}
+
 # Heartbeat on the first invocation of a session (invocationNum == 0). Fire
 # detached (Start-Process -WindowStyle Hidden) so the hook itself returns
 # immediately regardless of heartbeat.ps1's own latency — mirrors hook.sh's
@@ -174,8 +189,15 @@ $payload = $payload.TrimStart([char]0xFEFF)
 if ($EventName -eq 'PreInvocation' -and ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) {
     try {
         $hbPath = Join-Path $PluginRoot 'scripts/heartbeat.ps1'
+        # Pass the surface along: only the hook can know it (three products share
+        # one install, and the event's transcriptPath names which state dir it
+        # lives in). Mirrors hook.sh's `heartbeat.sh "$_hb_agent"`.
+        $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath)
+        $hbTp = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value
+        $hbAgent = Get-AntigravitySurface $hbTp
+        if ($hbAgent) { $hbArgs += @('-Agent', $hbAgent) }
         Start-Process -FilePath 'powershell' `
-            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath `
+            -ArgumentList $hbArgs `
             -WindowStyle Hidden -ErrorAction Stop
     } catch { Dbg "heartbeat launch failed: $($_.Exception.Message)" }
 }
@@ -209,6 +231,40 @@ function Wait-TranscriptFlush {
     }
 }
 
+# The surfaces disagree on which file transcriptPath names: the IDE points at
+# `transcript.jsonl`, the 2.0 app and the `agy` CLI at `transcript_full.jsonl`.
+# Both are written to the same logs dir with the same row schema, so the sibling
+# is a valid substitute when the named file can't be read. Mirrors hook.sh's
+# transcript_sibling.
+function Get-TranscriptSibling {
+    param([string]$Path)
+    if ($Path -like '*transcript_full.jsonl') {
+        return ($Path.Substring(0, $Path.Length - 'transcript_full.jsonl'.Length) + 'transcript.jsonl')
+    }
+    if ($Path -like '*transcript.jsonl') {
+        return ($Path.Substring(0, $Path.Length - 'transcript.jsonl'.Length) + 'transcript_full.jsonl')
+    }
+    return ''
+}
+
+# Return a readable transcript path (the named one, else its sibling), waiting
+# briefly for one to appear: a brand-new conversation creates its transcript
+# ~1s AFTER the first PreInvocation fires, so giving up immediately drops the
+# FIRST prompt of every session. Mirrors hook.sh's resolve_transcript_path.
+function Resolve-TranscriptPath {
+    param([string]$Path)
+    $alt = Get-TranscriptSibling $Path
+    $max = 20
+    if ($env:ROGUE_TRANSCRIPT_WAIT_ITERS) { try { $max = [int]$env:ROGUE_TRANSCRIPT_WAIT_ITERS } catch {} }
+    for ($i = 0; ; $i++) {
+        if (Test-Path -LiteralPath $Path) { return $Path }
+        if ($alt -and (Test-Path -LiteralPath $alt)) { return $alt }
+        if ($i -ge $max) { return '' }
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+
 # ── Subagent re-attribution (mirrors hook.sh's reattribute_subagent) ───────
 # An Antigravity subagent runs as its own conversation and its events carry no
 # parent reference, so persisted verbatim they orphan into a separate audit
@@ -221,7 +277,19 @@ function Wait-TranscriptFlush {
 # Fail-open: unresolved → payload untouched.
 $subagentId = ''
 $subagentName = ''
+# Prefer the brain dir holding THIS event's transcript — which is also where its
+# parent conversation lives, since a subagent runs on the surface that spawned
+# it. Each product has its own brain dir, so the CLI-only default below left
+# subagents in the IDE / 2.0 app unresolved, orphaning them into their own
+# session. transcriptPath is `<brain>/<conversationId>/.system_generated/logs/…`.
+# Mirrors hook.sh's brain_dir_from_transcript. An explicit override still wins.
 $brainDir = $env:ROGUE_ANTIGRAVITY_BRAIN_DIR
+if (-not $brainDir) {
+    $tpForBrain = ([regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value `
+        -replace '\\\\', '\' -replace '\\/', '/' -replace '\\', '/')
+    $m2 = [regex]::Match($tpForBrain, '^(?<root>.*)/brain/[^/]+/\.system_generated/logs/')
+    if ($m2.Success) { $brainDir = Join-Path $m2.Groups['root'].Value 'brain' }
+}
 if (-not $brainDir) { $brainDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\brain' }
 $submapDir = $env:ROGUE_ANTIGRAVITY_SUBMAP_DIR
 if (-not $submapDir) { $submapDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'antigravity-submap' }
@@ -320,12 +388,119 @@ try {
     }
 } catch { Dbg "subagent re-attribution failed: $($_.Exception.Message)" }
 
-if ($EventName -eq 'PreInvocation' -or $EventName -eq 'PostInvocation' -or $EventName -eq 'Stop') {
+# ── IDE prompt recovery (mirrors hook.sh's augment_with_db_prompt) ──────────
+# The IDE writes transcript.jsonl only at invocation boundaries and Stop, so the
+# pending prompt is not on disk at PreInvocation; it IS in Antigravity's own
+# conversation store. db-prompt.mjs reads it there with node:sqlite, using the
+# runtime the IDE itself ships (Electron run as Node) — nothing is installed.
+#
+# UNVERIFIED ON WINDOWS: the macOS path is measured end to end, but no Windows
+# install was available. Every failure here is a no-op, so the worst case is the
+# behaviour that shipped before this file gained the feature.
+function Get-JsRuntime {
+    param([string]$StateDir)
+    if ($env:ROGUE_ANTIGRAVITY_NODE) { return $env:ROGUE_ANTIGRAVITY_NODE }
+    $cache = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'antigravity-runtime'
+    if (Test-Path -LiteralPath $cache) {
+        $line = (Get-Content -LiteralPath $cache -TotalCount 1) -split "`t"
+        if ($line[0] -eq 'none') { return '' }
+        if ($line.Count -gt 1 -and (Test-Path -LiteralPath $line[1])) { return $line[1] }
+    }
+    $candidates = @()
+    # Discover the IDE from state the IDE itself writes, not a hardcoded path:
+    # <stateDir>\bin\agentapi execs the language server inside the install root.
+    $shim = Join-Path (Join-Path $StateDir 'bin') 'agentapi'
+    foreach ($p in @($shim, "$shim.cmd", "$shim.bat")) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $raw = Get-Content -Raw -LiteralPath $p
+        $lm = [regex]::Match($raw, '"?([A-Za-z]:\\[^"]*?)\\resources\\app\\')
+        if ($lm.Success) { $candidates += (Join-Path $lm.Groups[1].Value 'Antigravity IDE.exe') }
+        break
+    }
+    $candidates += (Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+    foreach ($c in $candidates) {
+        if (-not $c -or -not (Test-Path -LiteralPath $c)) { continue }
+        try {
+            $env:ELECTRON_RUN_AS_NODE = '1'
+            $out = & $c --no-warnings --experimental-sqlite -e 'require("node:sqlite").DatabaseSync;process.stdout.write("OK")' 2>$null
+            if ("$out".Trim() -eq 'OK') {
+                New-Item -ItemType Directory -Path (Split-Path $cache) -Force | Out-Null
+                Set-Content -LiteralPath $cache -Value "runtime`t$c" -Encoding UTF8
+                return $c
+            }
+        } catch {}
+    }
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $cache) -Force | Out-Null
+        Set-Content -LiteralPath $cache -Value "none`t" -Encoding UTF8
+    } catch {}
+    return ''
+}
+
+# Read from the store and attach the result (mirrors hook.sh's augment_from_store).
+# `prompt` at PreInvocation is the pending prompt; `steps` at PostInvocation is what
+# the finished invocation produced — its tool results are what the NEXT model call
+# would read, and PostInvocation is the only event that owns terminationBehavior.
+function Add-StoreRead {
+    param([string]$Mode, [string]$Field)
+    if ($payload -notmatch '/antigravity-ide/') { return }
+    if ($env:ROGUE_ANTIGRAVITY_DB_PROMPT -eq '0') { return }
+    try {
+        $tpm = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"')
+        $dbTp = $tpm.Groups[1].Value.Replace('\/', '/').Replace('\\', '\')
+        $runtime = Get-JsRuntime (($dbTp -split '/brain/')[0])
+        if (-not $runtime) { Log "dbstore=none mode=$Mode reason=no-runtime"; return }
+
+        $reader = Join-Path (Join-Path $PluginRoot 'scripts') 'db-prompt.mjs'
+        $env:ELECTRON_RUN_AS_NODE = '1'
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $runtime
+        foreach ($a in @('--no-warnings', '--experimental-sqlite', $reader, $Mode)) { [void]$psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.StandardInput.Write($payload); $proc.StandardInput.Close()
+        $b64 = ''
+        if ($proc.WaitForExit(1000)) { $b64 = $proc.StandardOutput.ReadToEnd().Trim() }
+        else { try { $proc.Kill() } catch {} }
+
+        # The reader's whole stdout vocabulary is base64-or-nothing, so anything
+        # else is discarded unread and can never become a hook decision.
+        if ($b64 -and $b64 -match '^[A-Za-z0-9+/=]+$') {
+            if ($env:ROGUE_ANTIGRAVITY_DB_PROMPT -eq 'log') {
+                Log "dbstore=hit mode=$Mode len=$($b64.Length) (not attached)"
+                $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+            } else {
+                Log "dbstore=hit mode=$Mode len=$($b64.Length)"
+                $script:payload = $payload.TrimEnd().TrimEnd('}') +
+                    ',"' + $Field + '":"' + $b64 + '","rogueDbPromptCapable":true}'
+            }
+        } else {
+            Log "dbstore=miss mode=$Mode capable=1"
+            $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+        }
+    } catch { Dbg "store read failed ($Mode): $($_.Exception.Message)" }
+}
+
+if ($EventName -eq 'PreInvocation')  { Add-StoreRead 'prompt' 'rogueDbPromptB64' }
+if ($EventName -eq 'PostInvocation') { Add-StoreRead 'steps'  'rogueDbStepsB64' }
+
+# Transcript enrichment is per surface: the 2.0 app and the CLI write the file
+# live so all three events can tail it, but on the IDE only Stop can — at
+# Pre/PostInvocation the file holds at most the PREVIOUS turn, and waiting for the
+# current one cannot work (it appears ~4s later, at Stop). Mirrors hook.sh.
+$tailEvents = if ($payload -match '/antigravity-ide/') { @('Stop') }
+              else { @('PreInvocation', 'PostInvocation', 'Stop') }
+if ($tailEvents -contains $EventName) {
     try {
         $m = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"')
         if ($m.Success) {
-            $tp = $m.Groups[1].Value
-            if ($tp -and (Test-Path -LiteralPath $tp)) {
+            # Undo JSON's optional `\/` escape (and `\\` on Windows paths) — an
+            # escaped value fails every file test, silently skipping enrichment.
+            $tp = $m.Groups[1].Value.Replace('\/', '/').Replace('\\', '\')
+            $tp = Resolve-TranscriptPath $tp
+            if (-not $tp) { Log "tail=none reason=unreadable path=$($m.Groups[1].Value)" }
+            if ($tp) {
                 Wait-TranscriptFlush $tp
                 $fs = [System.IO.File]::Open($tp, 'Open', 'Read', 'ReadWrite')
                 try {
@@ -350,13 +525,30 @@ if ($EventName -eq 'PreInvocation' -or $EventName -eq 'PostInvocation' -or $Even
                             # trailing braces and corrupt a body ending in "}}".
                             $p = $payload.TrimEnd()
                             if ($p.EndsWith('}')) { $p = $p.Substring(0, $p.Length - 1) }
-                            if ($b64) { $payload = $p + ',"transcriptTailB64":"' + $b64 + '"}' }
+                            if ($b64) {
+                                $payload = $p + ',"transcriptTailB64":"' + $b64 + '"}'
+                                Log "tail=$($b64.Length) path=$tp"
+                            }
                         }
                     }
                 } finally { $fs.Close() }
             }
         }
     } catch { Dbg "transcript augment failed: $($_.Exception.Message)" }
+}
+
+# Stop must also declare the capability: it re-reads the whole turn from the
+# transcript, and without this the backend cannot know the prompt was already
+# recorded at PreInvocation, so every user message lands twice. Mirrors hook.sh's
+# mark_db_prompt_capable.
+if ($EventName -eq 'Stop' -and $payload -match '/antigravity-ide/' `
+    -and $env:ROGUE_ANTIGRAVITY_DB_PROMPT -ne '0') {
+    try {
+        $stopTp = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value.Replace('\/', '/').Replace('\\', '\')
+        if (Get-JsRuntime (($stopTp -split '/brain/')[0])) {
+            $payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+        }
+    } catch { Dbg "capability flag failed: $($_.Exception.Message)" }
 }
 
 # ── POST (fail-open) → relay verbatim ──────────────────────────────────────
@@ -366,13 +558,17 @@ $headers = @{
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
 }
-# Subagent headers ride ONLY re-attributed events: enrichFromHeaders tags every
-# canonical message with subagent_id/subagent_name (aidr_message columns) so the
-# rows are distinguishable inside the parent's transcript. Omitted entirely — not
-# sent empty — on main-agent events. Mirrors hook.sh.
+# The agent tag rides in HEADERS, never in the body: the POSTed event must stay
+# byte-identical to what Antigravity handed us, so the stored raw payload is the
+# vendor's own event and nothing we synthesised. The name is base64 so an arbitrary
+# subagent Role (accents, emoji) cannot produce an invalid header value. Both are
+# omitted entirely — never sent empty — on main-agent events. Mirrors hook.sh.
 if ($subagentId) {
-    $headers['x-rogue-subagent-id'] = $subagentId
-    $headers['x-rogue-subagent-name'] = $subagentName
+    $headers['x-rogue-agent-id'] = $subagentId
+    if ($subagentName) {
+        $headers['x-rogue-agent-name-b64'] =
+            [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($subagentName))
+    }
 }
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 $resp = ''

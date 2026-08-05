@@ -46,6 +46,9 @@ run_dispatcher() {
     ROGUE_FORCE_UNAME="${ROGUE_FORCE_UNAME:-}" \
     ROGUE_ANTIGRAVITY_BRAIN_DIR="${ROGUE_ANTIGRAVITY_BRAIN_DIR:-}" \
     ROGUE_ANTIGRAVITY_SUBMAP_DIR="${ROGUE_ANTIGRAVITY_SUBMAP_DIR:-}" \
+    ROGUE_ANTIGRAVITY_NODE="${ROGUE_ANTIGRAVITY_NODE:-}" \
+    ROGUE_ANTIGRAVITY_DB_PROMPT="${ROGUE_ANTIGRAVITY_DB_PROMPT:-}" \
+    ROGUE_ANTIGRAVITY_DBPROMPT_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-}" \
     "$SH" "$HOOK" "$1" <<< "$2" > "$OUT_FILE"
   rc=$?
   set -e
@@ -79,6 +82,23 @@ stop_mock() {
 assert_eq() {
   if [ "$1" != "$2" ]; then echo "FAIL [$3]: expected <$2> but got <$1>" >&2; exit 1; fi
   echo "  ok: $3"
+}
+
+# The agent tag rides in HEADERS (`x-rogue-agent-id` + `x-rogue-agent-name-b64`),
+# never in the body — the POSTed event must stay byte-identical to Antigravity's,
+# so the stored raw payload is the vendor's event and nothing we synthesised.
+agent_tag() {   # -> "<agentId> <decoded name>" or "-" when untagged
+  python3 -c '
+import base64, json, sys
+d = json.load(open(sys.argv[1]))
+h = d["headers"]
+if "x-rogue-agent-id" not in h: print("-"); raise SystemExit
+nb64 = h.get("x-rogue-agent-name-b64", "")
+name = base64.b64decode(nb64).decode("utf-8") if nb64 else ""
+print(h["x-rogue-agent-id"], name)
+# The body must carry no tag of ours.
+body = json.loads(d["body"])
+assert "agentId" not in body and "agentNameB64" not in body, "agent tag leaked into the body"' "$HEADERS_FILE"
 }
 
 assert_header() {
@@ -166,22 +186,32 @@ mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
 MARKER="$STAGE/heartbeat-fired"
+# The stub records its first argument: the heartbeat is told which surface fired
+# it, because three products share one install and only the hook can tell them
+# apart (from the event's transcriptPath).
 cat > "$STAGE/scripts/heartbeat.sh" <<EOF
 #!/bin/sh
-touch "$MARKER"
+printf '%s' "\$1" > "$MARKER"
 EOF
 chmod +x "$STAGE/scripts/hook.sh" "$STAGE/scripts/heartbeat.sh"
 
-tmp_home="$(mktemp -d)"
-cp "$ENV_FILE" "$tmp_home/.rogue-env"
-set +e
-HOME="$tmp_home" \
-  ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
-  ROGUE_LOG_FILE="$tmp_home/hook.log" \
-  "$SH" "$STAGE/scripts/hook.sh" PreInvocation <<< '{"invocationNum":0}' > "$OUT_FILE"
-rc=$?
-set -e
-rm -rf "$tmp_home"
+# Run the staged hook.sh (PLUGIN_ROOT resolves to $STAGE) and echo its exit code.
+run_staged() {
+  local tmp_home rc
+  tmp_home="$(mktemp -d)"
+  cp "$ENV_FILE" "$tmp_home/.rogue-env"
+  set +e
+  HOME="$tmp_home" \
+    ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
+    ROGUE_LOG_FILE="$tmp_home/hook.log" \
+    "$SH" "$STAGE/scripts/hook.sh" "$1" <<< "$2" > "$OUT_FILE"
+  rc=$?
+  set -e
+  rm -rf "$tmp_home"
+  return $rc
+}
+
+set +e; run_staged PreInvocation '{"invocationNum":0}'; rc=$?; set -e
 assert_eq "$rc" "0" "PreInvocation invocationNum:0 exits 0"
 # heartbeat.sh is launched via a backgrounded `nohup ... &`; give it a moment
 # to actually run before asserting the marker.
@@ -195,6 +225,25 @@ else
   echo "FAIL [heartbeat launch]: marker file $MARKER was never created" >&2
   exit 1
 fi
+assert_eq "$(cat "$MARKER")" "" "no transcriptPath → no surface passed (heartbeat falls back)"
+
+# The surface rides the transcriptPath: without it every surface on a machine
+# with the CLI installed collapses into one antigravity_cli roster row.
+for surface in antigravity_cli antigravity_ide antigravity; do
+  rm -f "$MARKER"
+  case "$surface" in
+    antigravity_cli) dir=antigravity-cli ;;
+    antigravity_ide) dir=antigravity-ide ;;
+    *)               dir=antigravity ;;
+  esac
+  restart_mock '{}'
+  set +e
+  run_staged PreInvocation "$(printf '{"invocationNum":0,"transcriptPath":"/h/.gemini/%s/brain/c/x/transcript_full.jsonl"}' "$dir")"
+  rc=$?; set -e
+  assert_eq "$rc" "0" "$surface heartbeat exits 0"
+  for _ in $(seq 1 30); do [ -s "$MARKER" ] && break; sleep 0.1; done
+  assert_eq "$(cat "$MARKER" 2>/dev/null)" "$surface" "heartbeat is told the $surface surface"
+done
 rm -rf "$STAGE"
 
 # ── Case 8: PreInvocation with invocationNum != 0 → heartbeat NOT invoked ──
@@ -282,7 +331,7 @@ rm -rf "$TDIR"
 # reference, so persisted verbatim they orphan into a separate audit session.
 # The dispatcher resolves the parent from the INVOKE_SUBAGENT row in some
 # parent transcript (the parent id IS that transcript's directory name),
-# rewrites conversationId, and tags the event with the x-rogue-subagent-*
+# rewrites conversationId, and tags the event with the agentId/agentNameB64 body
 # headers the backend's enrichFromHeaders turns into subagent_id/subagent_name.
 PARENT="11111111-1111-1111-1111-111111111111"
 CHILD="22222222-2222-2222-2222-222222222222"
@@ -314,8 +363,7 @@ set -e
 assert_eq "$LAST_RC" "0" "subagent re-attribution exits 0"
 got=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["body"])["conversationId"])' "$HEADERS_FILE")
 assert_eq "$got" "$PARENT" "subagent conversationId is rewritten to the parent"
-assert_header "x-rogue-subagent-id"   "$CHILD"                  "x-rogue-subagent-id names the subagent"
-assert_header "x-rogue-subagent-name" "Poet for AAPL"           "x-rogue-subagent-name is the spawn-time Role (available on early events)"
+assert_eq "$(agent_tag)" "$CHILD Poet for AAPL" "headers carry the agent id + base64 name, body untouched"
 assert_eq "$(sed -n '1p' "$TSM/$CHILD")" "$PARENT" "parent is cached for the subagent"
 
 # ── Case 13: a main-agent conversation is untouched and sends no headers ────
@@ -330,8 +378,7 @@ set -e
 assert_eq "$LAST_RC" "0" "main-agent event exits 0"
 got=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["body"])["conversationId"])' "$HEADERS_FILE")
 assert_eq "$got" "$PARENT" "main-agent conversationId is left alone"
-assert_no_header "x-rogue-subagent-id"   "no x-rogue-subagent-id on a main-agent event"
-assert_no_header "x-rogue-subagent-name" "no x-rogue-subagent-name on a main-agent event"
+assert_eq "$(agent_tag)" "-" "a main-agent event carries no agent headers at all"
 assert_eq "$(cat "$TSM/$PARENT")" "main" "main-agent verdict is cached"
 
 # ── Case 14: a CONVERSATION_HISTORY mention is not a parent link ────────────
@@ -345,7 +392,7 @@ ROGUE_ANTIGRAVITY_BRAIN_DIR="$TB" ROGUE_ANTIGRAVITY_SUBMAP_DIR="$TSM2" \
   run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?
 set -e
 assert_eq "$(cat "$TSM2/$OTHER")" "main" "a CONVERSATION_HISTORY mention is not treated as a spawn"
-assert_no_header "x-rogue-subagent-id" "no subagent header from a history mention"
+assert_eq "$(agent_tag)" "-" "no agent tag from a history mention"
 
 # ── Case 15: re-attribution survives alongside transcript enrichment ────────
 # Both stdin mutations apply to the same event; the rewrite must happen BEFORE
@@ -367,7 +414,271 @@ b=json.loads(json.load(open(sys.argv[1]))["body"])
 print(b["conversationId"], "transcriptTailB64" in b, "AAPL" in base64.b64decode(b.get("transcriptTailB64","")).decode("utf-8","replace"))
 ' "$HEADERS_FILE")
 assert_eq "$both" "$PARENT True True" "body has the parent id AND a decodable tail"
+
+# ── Case 15b: the brain dir is derived from the event, not assumed to be the CLI's
+# Each product keeps its own brain dir. With ROGUE_ANTIGRAVITY_BRAIN_DIR unset the
+# dispatcher must read it off the event's own transcriptPath, or a subagent
+# spawned in the IDE / 2.0 app resolves no parent and orphans into its own
+# session — the CLI-only default never sees it.
+BB="$(mktemp -d)"
+mkdir -p "$BB/antigravity-ide/brain/$PARENT/.system_generated/logs" \
+         "$BB/antigravity-ide/brain/$CHILD/.system_generated/logs"
+cp "$TB/$PARENT/.system_generated/logs/transcript_full.jsonl" \
+   "$BB/antigravity-ide/brain/$PARENT/.system_generated/logs/transcript_full.jsonl"
+printf '%s\n' '{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"child"}' \
+  > "$BB/antigravity-ide/brain/$CHILD/.system_generated/logs/transcript_full.jsonl"
+TSM3="$(mktemp -d)"
+restart_mock '{}'
+PAYLOAD=$(printf '{"conversationId":"%s","invocationNum":1,"initialNumSteps":1,"transcriptPath":"%s"}' \
+  "$CHILD" "$BB/antigravity-ide/brain/$CHILD/.system_generated/logs/transcript_full.jsonl")
+set +e
+ROGUE_ANTIGRAVITY_SUBMAP_DIR="$TSM3" run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?
+set -e
+assert_eq "$LAST_RC" "0" "brain dir from transcriptPath exits 0"
+cid=$(python3 -c '
+import json,sys
+print(json.loads(json.load(open(sys.argv[1]))["body"])["conversationId"])' "$HEADERS_FILE")
+assert_eq "$cid" "$PARENT" "a non-CLI surface subagent resolves its parent"
+assert_eq "$(agent_tag)" "$CHILD Poet for AAPL" "and the tag names the subagent and its spawn-time Role"
+rm -rf "$BB" "$TSM3"
 rm -rf "$TB" "$TSM" "$TSM2"
+
+# ── Case 16: enrichment survives every payload shape a serializer may emit ──
+# The IDE surface posted 100% of its Pre/PostInvocation events with NO
+# transcript while the 2.0 app and the CLI worked, so extraction is now held to
+# the shapes that used to fail SILENTLY: pretty-printed (key and value on
+# separate lines, which a per-line sed misses entirely) and a `\/`-escaped path
+# (which fails every file test).
+TDIR="$(mktemp -d)"
+ROW='{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"SHAPE final"}'
+printf '%s\n' "$ROW" > "$TDIR/transcript_full.jsonl"
+
+tail_decodes() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE" | python3 -c '
+import base64,json,sys
+b=json.load(sys.stdin)
+print("SHAPE final" in base64.b64decode(b.get("transcriptTailB64","")).decode("utf-8","replace"))
+'
+}
+
+restart_mock '{}'
+PAYLOAD=$(printf '{\n  "invocationNum": 1,\n  "transcriptPath":\n    "%s"\n}' "$TDIR/transcript_full.jsonl")
+set +e; run_dispatcher PostInvocation "$PAYLOAD"; LAST_RC=$?; set -e
+assert_eq "$LAST_RC" "0" "pretty-printed payload exits 0"
+assert_eq "$(tail_decodes)" "True" "pretty-printed payload still gets the transcript tail"
+
+restart_mock '{}'
+PAYLOAD=$(printf '{"invocationNum":1,"transcriptPath":"%s"}' \
+  "$(printf '%s' "$TDIR/transcript_full.jsonl" | sed 's|/|\\/|g')")
+set +e; run_dispatcher PostInvocation "$PAYLOAD"; LAST_RC=$?; set -e
+assert_eq "$LAST_RC" "0" "escaped-slash path exits 0"
+assert_eq "$(tail_decodes)" "True" "an escaped transcriptPath still resolves"
+
+# The IDE names transcript.jsonl, the CLI and 2.0 app name transcript_full.jsonl.
+# A surface naming the one we cannot read falls back to its sibling.
+restart_mock '{}'
+PAYLOAD=$(printf '{"invocationNum":1,"transcriptPath":"%s"}' "$TDIR/transcript.jsonl")
+set +e; ROGUE_TRANSCRIPT_WAIT_ITERS=1 run_dispatcher PostInvocation "$PAYLOAD"; LAST_RC=$?; set -e
+assert_eq "$LAST_RC" "0" "sibling fallback exits 0"
+assert_eq "$(tail_decodes)" "True" "an unreadable transcriptPath falls back to its sibling"
+
+# ── Case 17: a transcript written AFTER the hook fires is still captured ────
+# A brand-new conversation creates its transcript ~1s after its first
+# PreInvocation fires, so without the appearance wait the FIRST prompt of every
+# session — the one that opens the audit trail — is dropped.
+LATE="$(mktemp -d)"
+restart_mock '{}'
+( sleep 0.5; printf '%s\n' "$ROW" > "$LATE/transcript.jsonl" ) &
+WRITER_PID=$!
+PAYLOAD=$(printf '{"invocationNum":1,"transcriptPath":"%s"}' "$LATE/transcript.jsonl")
+set +e; run_dispatcher PreInvocation "$PAYLOAD"; LAST_RC=$?; set -e
+wait "$WRITER_PID" 2>/dev/null || true
+assert_eq "$LAST_RC" "0" "late-appearing transcript exits 0"
+assert_eq "$(tail_decodes)" "True" "a transcript written after the hook fires is still tailed"
+
+# A path that never appears fails open, bounded by the wait cap.
+restart_mock '{}'
+PAYLOAD=$(printf '{"invocationNum":1,"transcriptPath":"%s/nope.jsonl"}' "$LATE")
+set +e; ROGUE_TRANSCRIPT_WAIT_ITERS=2 run_dispatcher PostInvocation "$PAYLOAD"; LAST_RC=$?; set -e
+assert_eq "$LAST_RC" "0" "missing transcript exits 0"
+body=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE")
+case "$body" in
+  *transcriptTailB64*) echo "FAIL [missing transcript]: body was enriched; <$body>" >&2; exit 1 ;;
+  *) echo "  ok: a transcript that never appears fails open, unenriched" ;;
+esac
+rm -rf "$TDIR" "$LATE"
+
+# ── Case 18: IDE prompt recovery from the conversation store ────────────────
+# The IDE writes transcript.jsonl only at invocation boundaries and Stop, so its
+# PreInvocation cannot read the pending prompt from the tail. db-prompt.mjs reads
+# it from Antigravity's own store instead. Everything here is IDE-gated: the 2.0
+# app and the CLI must come out byte-identical to before.
+DBT="$(mktemp -d)"
+IDE_STATE="$DBT/antigravity-ide"
+IDE_TP="$IDE_STATE/brain/CONV/.system_generated/logs/transcript.jsonl"
+mkdir -p "$(dirname "$IDE_TP")" "$IDE_STATE/conversations"
+printf '%s\n' '{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nfixture\n</USER_REQUEST>"}' > "$IDE_TP"
+# Fixture store: the real schema, one developer prompt (source=4) and one row of
+# our own injected text (source=6) that the reader must never pick up.
+python3 - "$IDE_STATE/conversations/CONV.db" <<'PY'
+import sqlite3, sys
+def varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F; n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n: return bytes(out)
+def tag(num, wire): return varint((num << 3) | wire)
+def msg(num, body): return tag(num, 2) + varint(len(body)) + body
+def payload(text, source):
+    return tag(1, 0) + varint(14) + msg(5, tag(3, 0) + varint(source)) + msg(19, msg(2, text.encode()))
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table steps (idx integer primary key, step_type integer not null default 0, "
+            "status integer not null default 0, step_format integer not null default 0, step_payload blob)")
+def planner(text, source):   # step_type 15: the model's prose lives at 20.1
+    return tag(1, 0) + varint(15) + msg(5, tag(3, 0) + varint(source)) + msg(20, msg(1, text.encode()))
+def view_file(body, source): # step_type 8: view_file keeps its result under field 14
+    return tag(1, 0) + varint(8) + msg(5, tag(3, 0) + varint(source)) + \
+        msg(14, msg(1, b"file:///tmp/fixture.txt") + msg(4, body.encode()))
+for idx, st, blob in [
+    (0, 14, payload("fixture prompt from the store", 4)),
+    (1, 15, b"\x08\x0f"),
+    (2, 14, payload("[Rogue Security AIDR] This request was BLOCKED ...", 6)),
+    (3, 8, view_file("untrusted file body", 2)),
+    (4, 15, planner("here is what the file says", 2)),
+]:
+    con.execute("insert into steps (idx, step_type, status, step_format, step_payload) values (?,?,3,0,?)",
+                (idx, st, blob))
+con.commit(); con.close()
+PY
+IDE_BODY=$(printf '{"conversationId":"CONV","transcriptPath":"%s","initialNumSteps":1,"invocationNum":0}' "$IDE_TP")
+
+posted() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE"; }
+field_present() { posted | python3 -c "import json,sys; print('$1' in json.load(sys.stdin))"; }
+
+# A runtime with node:sqlite is required for the positive cases. Absent (CI, or a
+# machine with no Antigravity), the negative cases still run.
+RUNTIME=$(sh "$REPO/plugins/antigravity/scripts/resolve-runtime.sh" "$IDE_STATE" 2>/dev/null || true)
+if [ -z "$RUNTIME" ] && [ -d "$HOME/.gemini/antigravity-ide" ]; then
+  RUNTIME=$(sh "$REPO/plugins/antigravity/scripts/resolve-runtime.sh" "$HOME/.gemini/antigravity-ide" 2>/dev/null || true)
+fi
+
+if [ -n "$RUNTIME" ]; then
+  export ROGUE_ANTIGRAVITY_NODE="$RUNTIME"
+  export ROGUE_ANTIGRAVITY_DBPROMPT_DIR="$DBT/cache"
+
+  restart_mock '{}'
+  set +e; run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$LAST_RC" "0" "IDE PreInvocation with a store exits 0"
+  assert_eq "$(field_present rogueDbPromptB64)" "True" "IDE PreInvocation attaches rogueDbPromptB64"
+  assert_eq "$(field_present rogueDbPromptCapable)" "True" "…and rogueDbPromptCapable"
+  decoded=$(posted | python3 -c '
+import base64, json, sys
+env = json.loads(base64.b64decode(json.loads(sys.stdin.read())["rogueDbPromptB64"]))
+print(env["v"], env["idx"], env["source"], env["stepFormat"], len(env["text"]))')
+  assert_eq "$decoded" "1 0 4 0 29" "envelope carries v/idx/source/stepFormat and the prompt length"
+
+  # Same (conversation, idx) again: a tool-loop turn re-reads the same row and
+  # must not re-send it, which is also what stops us reading our own injection.
+  restart_mock '{}'
+  set +e; run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$LAST_RC" "0" "repeat PreInvocation exits 0"
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "a repeated read is suppressed by the idx cache"
+  assert_eq "$(field_present rogueDbPromptCapable)" "True" "but the machine still reports capable"
+
+  # source=6 is our own injected block message; boundary 3 exposes it.
+  rm -rf "$DBT/cache"
+  restart_mock '{}'
+  set +e; run_dispatcher PreInvocation "$(printf '{"conversationId":"CONV","transcriptPath":"%s","initialNumSteps":3,"invocationNum":0}' "$IDE_TP")"; LAST_RC=$?; set -e
+  ownskip=$(posted | python3 -c '
+import base64, json, sys
+b = json.loads(sys.stdin.read())
+env = json.loads(base64.b64decode(b["rogueDbPromptB64"])) if "rogueDbPromptB64" in b else {}
+print(env.get("idx"), env.get("source"))')
+  assert_eq "$ownskip" "0 4" "our own injected row (source=6) is never returned"
+
+  # log mode reads but must not attach.
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; ROGUE_ANTIGRAVITY_DB_PROMPT=log run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "DB_PROMPT=log reads without attaching"
+
+  # kill switch
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; ROGUE_ANTIGRAVITY_DB_PROMPT=0 run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "DB_PROMPT=0 disables the read entirely"
+  assert_eq "$(field_present rogueDbPromptCapable)" "False" "…and claims no capability"
+
+  # IDE Pre/PostInvocation must NOT tail the transcript (it can only hold the
+  # previous turn there); Stop still must.
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; run_dispatcher PostInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present transcriptTailB64)" "False" "IDE PostInvocation no longer tails the transcript"
+
+  # PostInvocation is the tool-output gate: it fires after the tool ran but before
+  # the model call that reads the result, and it owns terminationBehavior. The
+  # transcript has nothing at that moment, so the store supplies it.
+  restart_mock '{}'
+  rm -rf "$DBT/cache"
+  set +e; run_dispatcher PostInvocation "$(printf '{"conversationId":"CONV","transcriptPath":"%s","initialNumSteps":3,"invocationNum":1}' "$IDE_TP")"; LAST_RC=$?; set -e
+  assert_eq "$LAST_RC" "0" "IDE PostInvocation with produced steps exits 0"
+  assert_eq "$(field_present rogueDbStepsB64)" "True" "IDE PostInvocation attaches rogueDbStepsB64"
+  steps=$(posted | python3 -c '
+import base64, json, sys
+env = json.loads(base64.b64decode(json.loads(sys.stdin.read())["rogueDbStepsB64"]))
+parts = [str(s["idx"]) + ":" + s["role"] for s in env["steps"]]
+print(env["kind"], " ".join(parts))')
+  assert_eq "$steps" "steps 3:tool 4:assistant" "the tool result and the prose arrive as separate steps, in order"
+  # The idx high-water mark stops a tool-loop turn re-sending what it already sent.
+  restart_mock '{}'
+  set +e; run_dispatcher PostInvocation "$(printf '{"conversationId":"CONV","transcriptPath":"%s","initialNumSteps":3,"invocationNum":2}' "$IDE_TP")"; LAST_RC=$?; set -e
+  assert_eq "$(field_present rogueDbStepsB64)" "False" "already-sent steps are not re-sent"
+  restart_mock '{}'
+  set +e; run_dispatcher Stop "$IDE_BODY"; LAST_RC=$?; set -e
+  assert_eq "$(field_present transcriptTailB64)" "True" "IDE Stop still tails the transcript"
+  # Regression: the flag describes the MACHINE, not the turn, so Stop must carry it
+  # too. Without it the backend re-emits the prompt Stop's window contains and
+  # every user message is stored twice — observed live before this assertion existed.
+  assert_eq "$(field_present rogueDbPromptCapable)" "True" "IDE Stop declares the capability"
+  assert_eq "$(field_present rogueDbPromptB64)" "False" "…without re-sending the prompt itself"
+  unset ROGUE_ANTIGRAVITY_NODE ROGUE_ANTIGRAVITY_DBPROMPT_DIR
+else
+  echo "  skip: no node:sqlite-capable runtime found; DB-prompt positive cases skipped"
+fi
+
+# A runtime that exists but cannot do the job must fail open, not hang or error.
+restart_mock '{}'
+set +e; ROGUE_ANTIGRAVITY_NODE=/bin/sh run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+assert_eq "$LAST_RC" "0" "an unusable runtime still exits 0"
+assert_eq "$(field_present rogueDbPromptB64)" "False" "an unusable runtime attaches nothing"
+restart_mock '{}'
+set +e; ROGUE_ANTIGRAVITY_NODE=/nonexistent/node run_dispatcher PreInvocation "$IDE_BODY"; LAST_RC=$?; set -e
+assert_eq "$LAST_RC" "0" "a missing runtime still exits 0"
+assert_eq "$(field_present rogueDbPromptB64)" "False" "a missing runtime attaches nothing"
+
+# ── Case 19: the other two surfaces are untouched ───────────────────────────
+# This is the regression guard for "IDE only". Their bodies must carry the
+# transcript tail exactly as before and none of the new fields.
+CLI_DIR="$(mktemp -d)"
+printf '%s\n' '{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"unchanged"}' \
+  > "$CLI_DIR/transcript_full.jsonl"
+for surface in antigravity-cli antigravity; do
+  SDIR="$CLI_DIR/$surface/brain/C/.system_generated/logs"
+  mkdir -p "$SDIR"
+  cp "$CLI_DIR/transcript_full.jsonl" "$SDIR/transcript_full.jsonl"
+  BODY_S=$(printf '{"conversationId":"C","transcriptPath":"%s/transcript_full.jsonl","initialNumSteps":1,"invocationNum":1}' "$SDIR")
+  for ev in PreInvocation PostInvocation Stop; do
+    restart_mock '{}'
+    set +e; run_dispatcher "$ev" "$BODY_S"; LAST_RC=$?; set -e
+    assert_eq "$LAST_RC" "0" "$surface $ev exits 0"
+    assert_eq "$(field_present transcriptTailB64)" "True" "$surface $ev still tails the transcript"
+    assert_eq "$(field_present rogueDbPromptB64)" "False" "$surface $ev sends no rogueDbPromptB64"
+    assert_eq "$(field_present rogueDbPromptCapable)" "False" "$surface $ev sends no capability flag"
+  done
+done
+rm -rf "$DBT" "$CLI_DIR"
 
 echo
 echo "All antigravity hook.sh tests passed (SH=$SH)."

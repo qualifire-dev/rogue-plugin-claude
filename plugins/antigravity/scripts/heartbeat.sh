@@ -27,13 +27,25 @@ VER="unknown"
 v="$(head -n1 "${PLUGIN_ROOT}/VERSION" 2>/dev/null | tr -d ' \r\n')"
 [ -n "$v" ] && VER="$v"
 
-# Surface inference: heartbeat has no transcriptPath to key off, so infer from
-# the environment. Default to the IDE surface; flip to the CLI surface if the
-# `agy` binary is on PATH or the CLI's config dir exists.
-AGENT="antigravity_ide"
-if command -v agy >/dev/null 2>&1 || [ -d "$HOME/.gemini/antigravity-cli" ]; then
-  AGENT="antigravity_cli"
-fi
+# Surface: $1 when the caller knows it. hook.sh reads it off the event's
+# transcriptPath, which is the only reliable source — three products (the 2.0
+# app, the IDE, the `agy` CLI) share one install, so the filesystem
+# fallback below cannot tell which one is running and picks the CLI whenever it
+# is installed alongside another. Validated, not trusted verbatim: the value ends
+# up in a roster row.
+AGENT="${1:-}"
+case "$AGENT" in
+  antigravity|antigravity_ide|antigravity_cli) ;;
+  *)
+    # No surface passed (a manual run, or an older hook.sh): fall back to the
+    # environment. Default to the 2.0 app — the current flagship; flip to the CLI
+    # surface if the `agy` binary is on PATH or the CLI's config dir exists.
+    AGENT="antigravity"
+    if command -v agy >/dev/null 2>&1 || [ -d "$HOME/.gemini/antigravity-cli" ]; then
+      AGENT="antigravity_cli"
+    fi
+    ;;
+esac
 
 # Family is the fixed enum "antigravity"; surface rides the agent field.
 HOST=$(hostname 2>/dev/null || echo unknown)

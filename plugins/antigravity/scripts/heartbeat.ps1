@@ -4,6 +4,10 @@
 # from the first PreInvocation. POSTs /api/v1/hooks/status so this install shows
 # up in the Coding Agents roster and the org learns which plugin version runs.
 # Fire-and-forget: never blocks Antigravity, always exits 0.
+#
+# Takes the surface positionally so hook.ps1 can pass what it read off the
+# event's transcriptPath (see the surface block below).
+param([string]$Agent = '')
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
@@ -93,13 +97,20 @@ if (Test-Path -LiteralPath $versionFile) {
     } catch {}
 }
 
-# ── surface inference: heartbeat has no transcriptPath to key off, so infer
-#    from the environment. Default to the IDE surface; flip to the CLI
-#    surface if the `agy` binary is on PATH or the CLI's config dir exists. ──
-$agent = 'antigravity_ide'
-$agyCmd = Get-Command agy -ErrorAction SilentlyContinue
-$agyCliDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
-if ($agyCmd -or (Test-Path -LiteralPath $agyCliDir)) { $agent = 'antigravity_cli' }
+# ── surface: -Agent when the caller knows it. hook.ps1 reads it off the event's
+#    transcriptPath, the only reliable source — three products (the 2.0 app, the
+#    IDE, the `agy` CLI) share one install, so the fallback below cannot
+#    tell which is running and picks the CLI whenever it sits alongside another.
+#    Validated, not trusted verbatim: the value ends up in a roster row. ──
+$agent = $Agent
+if (@('antigravity', 'antigravity_ide', 'antigravity_cli') -notcontains $agent) {
+    # Default to the 2.0 app — the current flagship; flip to the CLI surface if
+    # the `agy` binary is on PATH or the CLI's config dir exists.
+    $agent = 'antigravity'
+    $agyCmd = Get-Command agy -ErrorAction SilentlyContinue
+    $agyCliDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
+    if ($agyCmd -or (Test-Path -LiteralPath $agyCliDir)) { $agent = 'antigravity_cli' }
+}
 
 $host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 

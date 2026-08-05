@@ -104,15 +104,166 @@ wait_for_transcript_flush() {
   return 0
 }
 
+# Read a top-level JSON string field out of the raw hook body.
+#
+# NOT line-based, on purpose: the body is squashed to one line first because a
+# pretty-printed payload puts the key and its value on separate lines, and a
+# per-line sed then matches nothing. JSON's optional `\/` escape is undone for
+# the same reason — a serializer that emits it yields a path that fails every
+# file test. Both modes failed silently, which is how the IDE surface came to
+# post 100% of its Pre/PostInvocation events with no transcript at all.
+#
+# On a compact body this is exactly the previous behaviour (one line, greedy
+# `.*` → last occurrence of the key).
+# $1 = field name, $2 = body.
+json_field() {
+  printf '%s' "$2" \
+    | tr '\n\r\t' '   ' \
+    | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+    | sed 's|\\/|/|g'
+}
+
+# Which Antigravity product fired this event, from the state dir its transcript
+# lives in: the `-ide` dir is the Antigravity IDE, the bare one is Antigravity 2.0
+# (both current products, independently versioned). Slash-anchored and ordered
+# specific → general because the bare segment is a prefix of the other two.
+# Mirrors the backend's surfaceFromTranscript (antigravity-hook-parser.ts); an
+# unattributable payload yields empty so the caller keeps its own fallback.
+surface_from_transcript() {
+  case "$1" in
+    */antigravity-cli/*) printf 'antigravity_cli' ;;
+    */antigravity-ide/*) printf 'antigravity_ide' ;;
+    */antigravity/*)     printf 'antigravity' ;;
+  esac
+}
+
+# The surfaces disagree on which file transcriptPath names: the IDE points at
+# `transcript.jsonl`, the 2.0 app and the `agy` CLI at `transcript_full.jsonl`.
+# Both are written to the same logs dir with the same row schema, so the sibling
+# is a valid substitute when the named file can't be read.
+transcript_sibling() {
+  case "$1" in
+    */transcript.jsonl)      printf '%stranscript_full.jsonl' "${1%transcript.jsonl}" ;;
+    */transcript_full.jsonl) printf '%stranscript.jsonl' "${1%transcript_full.jsonl}" ;;
+  esac
+}
+
+# Echo a readable transcript path (the named one, else its sibling), waiting
+# briefly for one to appear. The wait is not paranoia: a brand-new conversation
+# creates its transcript ~1s AFTER the first PreInvocation fires (verified on
+# the IDE surface), so returning empty immediately drops the FIRST prompt of
+# every session — the one that opens the audit trail. ~2s cap, well inside the
+# 30s hook budget; ROGUE_TRANSCRIPT_WAIT_ITERS overrides it for tests.
+resolve_transcript_path() {
+  _rtp="$1"
+  _rta=$(transcript_sibling "$_rtp")
+  _rtn=0
+  _rtmax=${ROGUE_TRANSCRIPT_WAIT_ITERS:-20}
+  while :; do
+    [ -r "$_rtp" ] && { printf '%s' "$_rtp"; return 0; }
+    [ -n "$_rta" ] && [ -r "$_rta" ] && { printf '%s' "$_rta"; return 0; }
+    [ "$_rtn" -ge "$_rtmax" ] && return 1
+    sleep 0.1
+    _rtn=$((_rtn + 1))
+  done
+}
+
 augment_with_transcript() {
   _body="$1"
-  _tp=$(printf '%s' "$_body" | sed -n 's/.*"transcriptPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  [ -n "$_tp" ] || { printf '%s' "$_body"; return; }
-  [ -r "$_tp" ] || { printf '%s' "$_body"; return; }
-  wait_for_transcript_flush "$_tp"
-  _b64=$(tail -c 262144 "$_tp" 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
-  [ -n "$_b64" ] || { printf '%s' "$_body"; return; }
+  _tp=$(json_field transcriptPath "$_body")
+  [ -n "$_tp" ] || { log "tail=none reason=no-path"; printf '%s' "$_body"; return; }
+  _rp=$(resolve_transcript_path "$_tp") || {
+    log "tail=none reason=unreadable path=$_tp"
+    printf '%s' "$_body"; return
+  }
+  wait_for_transcript_flush "$_rp"
+  _b64=$(tail -c 262144 "$_rp" 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
+  [ -n "$_b64" ] || { log "tail=none reason=empty path=$_rp"; printf '%s' "$_body"; return; }
+  log "tail=${#_b64} path=$_rp"
   printf '%s,"transcriptTailB64":"%s"}' "${_body%\}}" "$_b64"
+}
+
+# ── IDE prompt recovery ────────────────────────────────────────────────────
+# The IDE writes transcript.jsonl only at invocation boundaries and Stop, so at
+# PreInvocation the pending prompt is NOT on disk (verified: six 10s hook windows
+# held while rows sat pending in memory, zero change). It IS already committed to
+# Antigravity's own conversation store, so db-prompt.mjs reads it there and we
+# append it for the backend to evaluate. IDE only — the 2.0 app and the CLI write
+# the transcript live, so their existing tail already carries the prompt.
+#
+# Off by default for anything but the IDE, and killable without a reinstall:
+#   ROGUE_ANTIGRAVITY_DB_PROMPT=0    never read
+#   ROGUE_ANTIGRAVITY_DB_PROMPT=log  read and log, never attach
+DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
+
+# Absolute path of a runtime that can load node:sqlite, or empty. The resolver
+# caches its answer (including "none"), so the steady-state cost is one file read.
+resolve_js_runtime() {
+  [ -r "${PLUGIN_ROOT}/scripts/resolve-runtime.sh" ] || return 0
+  sh "${PLUGIN_ROOT}/scripts/resolve-runtime.sh" "$1" 2>/dev/null
+}
+
+# Mark that this machine CAN recover a prompt pre-send. It describes the MACHINE,
+# not the turn, so it must ride `Stop` as well as `PreInvocation`: `Stop` re-reads
+# the whole turn from the transcript, and without this flag the backend cannot know
+# the prompt was already recorded at `PreInvocation` — it re-emits it and every
+# user message lands twice (observed on a live IDE session before this existed).
+mark_db_prompt_capable() {
+  _mbody="$1"
+  [ "$DB_PROMPT_MODE" = "0" ] && { printf '%s' "$_mbody"; return; }
+  _mtp=$(json_field transcriptPath "$_mbody")
+  case "$_mtp" in */antigravity-ide/*) ;; *) printf '%s' "$_mbody"; return ;; esac
+  [ -n "$(resolve_js_runtime "$_mtp")" ] || { printf '%s' "$_mbody"; return; }
+  printf '%s,"rogueDbPromptCapable":true}' "${_mbody%\}}"
+}
+
+# Read from the store and append the result, plus `rogueDbPromptCapable` (whether
+# this machine can read it at all — the backend needs that to know whether `Stop`
+# should still carry the turn). Fail-open at every step: any problem leaves the
+# body exactly as it was.
+#
+# $1 = reader mode: `prompt` (PreInvocation — the pending prompt) or `steps`
+#      (PostInvocation — what the finished invocation produced, i.e. the tool
+#      results the NEXT model call would read).
+# $2 = payload field to attach it as. $3 = body.
+augment_from_store() {
+  _mode="$1"; _field="$2"; _body="$3"
+  _dbtp=$(json_field transcriptPath "$_body")
+  case "$_dbtp" in */antigravity-ide/*) ;; *) printf '%s' "$_body"; return ;; esac
+  [ "$DB_PROMPT_MODE" = "0" ] || [ -z "$_dbtp" ] && { printf '%s' "$_body"; return; }
+
+  _rt=$(resolve_js_runtime "$_dbtp")
+  if [ -z "$_rt" ]; then
+    log "dbstore=none mode=$_mode reason=no-runtime"
+    printf '%s' "$_body"; return
+  fi
+
+  # Hard wall independent of the reader's own deadline: these events gate the
+  # developer's turn, so a hung runtime must never hold one open.
+  _out=$(printf '%s' "$_body" | ELECTRON_RUN_AS_NODE=1 "$_rt" --no-warnings \
+    --experimental-sqlite "${PLUGIN_ROOT}/scripts/db-prompt.mjs" "$_mode" 2>/dev/null &
+    _pid=$!
+    ( sleep 1; kill -9 "$_pid" 2>/dev/null ) 2>/dev/null &
+    _watch=$!
+    wait "$_pid" 2>/dev/null
+    kill "$_watch" 2>/dev/null)
+
+  # The reader's whole stdout vocabulary is base64-or-nothing. Anything else is
+  # discarded unread, so its output can never become a hook decision.
+  case "$_out" in
+    "" ) log "dbstore=miss mode=$_mode capable=1"
+         printf '%s,"rogueDbPromptCapable":true}' "${_body%\}}"; return ;;
+    *[!A-Za-z0-9+/=]* ) log "dbstore=none mode=$_mode reason=bad-output"
+         printf '%s' "$_body"; return ;;
+  esac
+
+  if [ "$DB_PROMPT_MODE" = "log" ]; then
+    log "dbstore=hit mode=$_mode len=${#_out} (not attached)"
+    printf '%s,"rogueDbPromptCapable":true}' "${_body%\}}"
+    return
+  fi
+  log "dbstore=hit mode=$_mode len=${#_out} runtime=$(basename "$_rt")"
+  printf '%s,"%s":"%s","rogueDbPromptCapable":true}' "${_body%\}}" "$_field" "$_out"
 }
 
 # ── Subagent re-attribution ────────────────────────────────────────────────
@@ -142,6 +293,18 @@ SUBAGENT_ID=""
 SUBAGENT_NAME=""
 BRAIN_DIR="${ROGUE_ANTIGRAVITY_BRAIN_DIR:-$HOME/.gemini/antigravity-cli/brain}"
 SUBMAP_DIR="${ROGUE_ANTIGRAVITY_SUBMAP_DIR:-$HOME/.rogue/antigravity-submap}"
+
+# The brain dir holding this event's own transcript — which is also where its
+# PARENT conversation lives, since a subagent runs on the surface that spawned
+# it. Derived per event because each product has its own brain dir, and the
+# hardcoded default above names only the CLI's: subagents spawned in the IDE or
+# the 2.0 app resolved no parent at all and orphaned into their own session.
+# transcriptPath is `<brain>/<conversationId>/.system_generated/logs/…`.
+brain_dir_from_transcript() {
+  case "$1" in
+    */brain/*/.system_generated/logs/*) printf '%s/brain' "${1%%/brain/*}" ;;
+  esac
+}
 
 # Display name from the spawning call: `invoke_subagent`'s args carry a `Role`
 # per subagent ("Cat Rhymer"), and the INVOKE_SUBAGENT result row lists the
@@ -217,8 +380,14 @@ resolve_subagent_parent() {
 
 # Rewrite BODY's subagent conversationId to its parent and set SUBAGENT_ID/NAME.
 reattribute_subagent() {
-  _cid=$(printf '%s' "$BODY" | sed -n 's/.*"conversationId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  _cid=$(json_field conversationId "$BODY")
   [ -n "$_cid" ] || return
+
+  # Search the surface's own brain dir; an explicit override still wins.
+  if [ -z "${ROGUE_ANTIGRAVITY_BRAIN_DIR:-}" ]; then
+    _bd=$(brain_dir_from_transcript "$(json_field transcriptPath "$BODY")")
+    [ -n "$_bd" ] && BRAIN_DIR="$_bd"
+  fi
 
   _cache_file="$SUBMAP_DIR/$_cid"
   _map=""
@@ -267,10 +436,18 @@ BODY="$(cat)"
 # Heartbeat on the first invocation of a session (invocationNum == 0). Fire
 # detached so the hook itself returns immediately regardless of heartbeat.sh's
 # own latency.
+#
+# The surface is passed along because only the hook can know it: three products
+# share this one install, each with its own state dir, and the surface is
+# readable from the payload's transcriptPath (mirrors the backend's
+# surfaceFromTranscript). heartbeat.sh alone can only guess from the filesystem,
+# and on a machine with more than one installed it guesses wrong — collapsing
+# every surface into one roster row.
 if [ "$EVENT" = "PreInvocation" ]; then
   case "$BODY" in
     *'"invocationNum":0'*|*'"invocationNum": 0'*)
-      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" >/dev/null 2>&1 & ) ;;
+      _hb_agent=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$_hb_agent" >/dev/null 2>&1 & ) ;;
   esac
 fi
 
@@ -279,22 +456,57 @@ fi
 # the appended base64 blob.
 reattribute_subagent
 
-case "$EVENT" in
-  PreInvocation|PostInvocation|Stop) BODY="$(augment_with_transcript "$BODY")" ;;
-esac
+# Enrichment is per surface, because the surfaces differ in WHEN the transcript
+# exists:
+#   2.0 app / agy CLI — written live, so every one of the three events can read
+#     the pending turn from the tail, exactly as before.
+#   IDE — written only at invocation boundaries and Stop. Tailing it on
+#     Pre/PostInvocation can only ever return the PREVIOUS turn, and waiting for
+#     the current one cannot work (measured: the file appears ~4s later, at Stop),
+#     so the wait was pure latency on the event that blocks the developer. The
+#     prompt comes from the conversation store instead.
+_surface=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+if [ "$_surface" = "antigravity_ide" ]; then
+  case "$EVENT" in
+    # The pending prompt, before the model call that would consume it.
+    PreInvocation)  BODY="$(augment_from_store prompt rogueDbPromptB64 "$BODY")" ;;
+    # What the finished invocation produced — its prose and, crucially, the tool
+    # results the NEXT model call would read. This event owns `terminate`, so it is
+    # the last point at which untrusted tool output can be stopped before the model
+    # sees it (the transcript does not have it until the following boundary).
+    PostInvocation) BODY="$(augment_from_store steps rogueDbStepsB64 "$BODY")" ;;
+    # Kept as the fallback source for machines that cannot read the store; when the
+    # capability flag is set the backend ignores it, because everything already
+    # arrived from the store at the two events above.
+    Stop)           BODY="$(augment_with_transcript "$BODY")"
+                    BODY="$(mark_db_prompt_capable "$BODY")" ;;
+  esac
+else
+  case "$EVENT" in
+    PreInvocation|PostInvocation|Stop) BODY="$(augment_with_transcript "$BODY")" ;;
+  esac
+fi
 
 # Capture body + HTTP status. -w appends a final line "<code>"; on any
 # transport failure curl exits non-zero and the code is 000. Relay the body
 # ONLY on a clean HTTP 200 so an error page (401/404/500) is never handed to
 # Antigravity as a decision.
-# Subagent headers ride ONLY re-attributed events: the backend's
-# enrichFromHeaders tags every canonical message of the event with
-# subagent_id/subagent_name (aidr_message columns) so the rows are
-# distinguishable inside the parent's transcript. Passed via a positional set so
-# they are omitted entirely — not sent empty — on main-agent events.
+# The agent tag rides in HEADERS, never in the body: the POSTed event must stay
+# byte-identical to what Antigravity handed us, so `rawPayload` is the vendor's
+# own event and nothing we synthesised. (Copilot puts it in the body; that
+# difference is known and deliberate here.)
+#
+# The name is base64 so an arbitrary subagent `Role` — accents, emoji — cannot
+# produce an invalid header value; the id is a bare UUID and needs no encoding.
+# Both are omitted entirely, never sent empty, on main-agent events. Passed via a
+# positional set so the curl call below stays a single expression.
 set --
 if [ -n "$SUBAGENT_ID" ]; then
-  set -- -H "x-rogue-subagent-id: $SUBAGENT_ID" -H "x-rogue-subagent-name: $SUBAGENT_NAME"
+  set -- -H "x-rogue-agent-id: $SUBAGENT_ID"
+  if [ -n "$SUBAGENT_NAME" ]; then
+    _agent_name_b64=$(printf '%s' "$SUBAGENT_NAME" | base64 2>/dev/null | tr -d '\r\n')
+    [ -n "$_agent_name_b64" ] && set -- "$@" -H "x-rogue-agent-name-b64: $_agent_name_b64"
+  fi
 fi
 
 RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
