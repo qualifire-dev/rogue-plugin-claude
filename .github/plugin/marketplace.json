@@ -1,0 +1,24 @@
+{
+  "name": "rogue-copilot",
+  "version": "1.2.0",
+  "description": "Rogue Security extensions for GitHub Copilot CLI",
+  "owner": {
+    "name": "Qualifire (Rogue Security)",
+    "email": "support@rogue.security",
+    "url": "https://www.rogue.security"
+  },
+  "plugins": [
+    {
+      "name": "rogue",
+      "version": "1.2.0",
+      "description": "Rogue Security AIDR — real-time AI agent detection and response for GitHub Copilot CLI",
+      "author": {
+        "name": "Rogue Security",
+        "url": "https://www.rogue.security"
+      },
+      "homepage": "https://docs.rogue.security/integrations/github-copilot",
+      "category": "security",
+      "source": "./plugins/copilot"
+    }
+  ]
+}
