@@ -63,44 +63,63 @@ ide_runtime_candidates() {
 }
 
 # $1 may be a transcriptPath or a state dir; reduce it to the state dir.
-STATE_DIR=""
-case "$1" in
-  */brain/*) STATE_DIR=${1%%/brain/*} ;;
-  ?*)        STATE_DIR="$1" ;;
-esac
+state_dir_from() {
+  case "$1" in
+    */brain/*) printf '%s' "${1%%/brain/*}" ;;
+    ?*)        printf '%s' "$1" ;;
+  esac
+}
 
-# 1. Explicit override wins — the MDM / air-gapped / test answer.
-if [ -n "${ROGUE_ANTIGRAVITY_NODE:-}" ]; then
-  probe "$ROGUE_ANTIGRAVITY_NODE" && { printf '%s' "$ROGUE_ANTIGRAVITY_NODE"; exit 0; }
+# The resolution chain, in preference order. Echoes the runtime path (or nothing)
+# and is the only thing that decides — main just prints what it returns.
+resolve_runtime() {
+  _state_dir=$(state_dir_from "$1")
+
+  # 1. Explicit override wins — the MDM / air-gapped / test answer. It is an
+  #    answer either way: a bad override resolves to nothing rather than falling
+  #    through to a runtime the operator did not choose.
+  if [ -n "${ROGUE_ANTIGRAVITY_NODE:-}" ]; then
+    probe "$ROGUE_ANTIGRAVITY_NODE" && printf '%s' "$ROGUE_ANTIGRAVITY_NODE"
+    return 0
+  fi
+
+  # 2. Cache. A stale entry (IDE upgraded/moved) falls through to a fresh resolve.
+  if [ -r "$CACHE" ]; then
+    _cached=$(cut -f2 -d'	' < "$CACHE" 2>/dev/null | head -1)
+    _kind=$(cut -f1 -d'	' < "$CACHE" 2>/dev/null | head -1)
+    [ "$_kind" = "none" ] && return 0
+    if [ -n "$_cached" ] && [ -x "$_cached" ]; then printf '%s' "$_cached"; return 0; fi
+  fi
+
+  # 3. The IDE's bundled Electron — the only candidate guaranteed present on the
+  #    surface that needs it. The loop runs in a subshell (it is the right-hand
+  #    side of a pipe), so it cannot return from here: it PRINTS the winner and
+  #    `grep .` reports whether there was one.
+  _ide=$(ide_runtime_candidates "$_state_dir" | while IFS= read -r _c; do
+    [ -n "$_c" ] || continue
+    probe "$_c" && { emit ide-electron "$_c"; exit 0; }
+  done | grep .)
+  if [ -n "$_ide" ]; then printf '%s' "$_ide"; return 0; fi
+
+  # 4. Antigravity 2.0's shim, present when 2.0 is co-installed (node 24.x).
+  for _c in "$HOME/Library/Application Support/Antigravity/bin/agy-node" \
+            "$HOME/.gemini/antigravity/bin/agy-node"; do
+    probe "$_c" && { emit app-electron "$_c"; return 0; }
+  done
+
+  # 5. System node, accepted only if it passes the probe (often it will not).
+  _sys=$(command -v node 2>/dev/null)
+  if [ -n "$_sys" ] && probe "$_sys"; then emit system-node "$_sys"; return 0; fi
+
+  # 6. Nothing qualifies: remember that, so later events cost one file read.
+  mkdir -p "$(dirname "$CACHE")" 2>/dev/null
+  printf 'none\t\n' > "$CACHE" 2>/dev/null
+  return 0
+}
+
+main() {
+  resolve_runtime "${1:-}"
   exit 0
-fi
+}
 
-# 2. Cache. A stale entry (IDE upgraded/moved) falls through to a fresh resolve.
-if [ -r "$CACHE" ]; then
-  _cached=$(cut -f2 -d'	' < "$CACHE" 2>/dev/null | head -1)
-  _kind=$(cut -f1 -d'	' < "$CACHE" 2>/dev/null | head -1)
-  [ "$_kind" = "none" ] && exit 0
-  if [ -n "$_cached" ] && [ -x "$_cached" ]; then printf '%s' "$_cached"; exit 0; fi
-fi
-
-# 3. The IDE's bundled Electron — the only candidate guaranteed present on the
-#    surface that needs it.
-ide_runtime_candidates "$STATE_DIR" | while IFS= read -r _c; do
-  [ -n "$_c" ] || continue
-  probe "$_c" && { emit ide-electron "$_c"; exit 0; }
-done | grep . && exit 0
-
-# 4. Antigravity 2.0's shim, present when 2.0 is co-installed (node 24.x).
-for _c in "$HOME/Library/Application Support/Antigravity/bin/agy-node" \
-          "$HOME/.gemini/antigravity/bin/agy-node"; do
-  probe "$_c" && { emit app-electron "$_c"; exit 0; }
-done
-
-# 5. System node, accepted only if it passes the probe (often it will not).
-_sys=$(command -v node 2>/dev/null)
-if [ -n "$_sys" ] && probe "$_sys"; then emit system-node "$_sys"; exit 0; fi
-
-# 6. Nothing qualifies: remember that, so later events cost one file read.
-mkdir -p "$(dirname "$CACHE")" 2>/dev/null
-printf 'none\t\n' > "$CACHE" 2>/dev/null
-exit 0
+main "$@"

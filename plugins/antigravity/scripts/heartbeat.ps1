@@ -7,10 +7,24 @@
 #
 # Takes the surface positionally so hook.ps1 can pass what it read off the
 # event's transcriptPath (see the surface block below).
+#
+# Main-and-functions, like hook.ps1: everything below is a function and only
+# `Invoke-Main` runs. Shared state lives in the script-scoped variables declared
+# under it, and every write to one is `$script:`-qualified — an unqualified
+# assignment inside a function writes to a local copy that vanishes on return.
 param([string]$Agent = '')
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
+
+$pluginRoot = ''
+$creds      = @{}
+$apiKey     = ''
+$baseUrl    = ''
+$actorName  = ''
+$actorEmail = ''
+$ver        = 'unknown'   # plugin version, from the bundled VERSION file
+$agent      = ''          # which of the three surfaces this install reports for
 
 function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.WriteLine("[rogue-heartbeat] $Msg") } }
 
@@ -40,61 +54,81 @@ function ConvertFrom-ShellQuoted {
     return $sb.ToString()
 }
 
-try {
-    [Net.ServicePointManager]::SecurityProtocol = `
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-} catch {}
+function Initialize-Tls {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch {}
+}
 
 # Stand down on non-Windows (pwsh on macOS/Linux runs heartbeat.sh instead).
-if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
+function Stop-OnNonWindows {
+    if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
+}
 
 # Self-locate from $PSCommandPath (<root>\scripts\heartbeat.ps1); fall back to CWD.
-$pluginRoot = ''
-if ($PSCommandPath) { $pluginRoot = Split-Path (Split-Path $PSCommandPath -Parent) -Parent }
-if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
-
-# ── credential resolution ──────────────────────────────────────────────────
-$creds = @{}
-foreach ($f in @((Join-Path $pluginRoot 'env'), 'C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
-    if (-not $f -or -not (Test-Path -LiteralPath $f)) { continue }
-    foreach ($line in (Get-Content -LiteralPath $f)) {
-        if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
-            $creds[$Matches[1]] = ConvertFrom-ShellQuoted ($Matches[2].Trim())
-        }
+function Resolve-PluginRoot {
+    if ($PSCommandPath) { $script:pluginRoot = Split-Path (Split-Path $PSCommandPath -Parent) -Parent }
+    if (-not $script:pluginRoot) {
+        try { $script:pluginRoot = (Get-Location).Path } catch { $script:pluginRoot = '.' }
     }
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL') {
-    $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $creds[$k] = $val }
+
+# ── credential resolution ──────────────────────────────────────────────────
+function Import-Credentials {
+    $script:creds = @{}
+    foreach ($f in @((Join-Path $pluginRoot 'env'), 'C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
+        if (-not $f -or -not (Test-Path -LiteralPath $f)) { continue }
+        foreach ($line in (Get-Content -LiteralPath $f)) {
+            if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
+                $script:creds[$Matches[1]] = ConvertFrom-ShellQuoted ($Matches[2].Trim())
+            }
+        }
+    }
+    foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL') {
+        $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $script:creds[$k] = $val }
+    }
+    $script:apiKey = $script:creds['ROGUE_API_KEY']
 }
 
-$apiKey = $creds['ROGUE_API_KEY']
-if (-not $apiKey) { Dbg 'not configured -> no-op'; exit 0 }
+# Not configured → no-op (mirrors heartbeat.sh).
+function Assert-ApiKey {
+    if ($apiKey) { return }
+    Dbg 'not configured -> no-op'
+    exit 0
+}
 
-$baseUrl = $creds['ROGUE_BASE_URL']; if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
-$baseUrl = $baseUrl.TrimEnd('/')
+function Resolve-BaseUrl {
+    $script:baseUrl = $creds['ROGUE_BASE_URL']
+    if (-not $script:baseUrl) { $script:baseUrl = 'https://api.rogue.security' }
+    $script:baseUrl = $script:baseUrl.TrimEnd('/')
+}
 
 # ── actor resolution (mirrors actor.sh) ────────────────────────────────────
-$actorName = $creds['ROGUE_ACTOR_NAME']
-if (-not $actorName) { try { $actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorName) { $actorName = $env:USERNAME }
+function Resolve-Actor {
+    $script:actorName = $creds['ROGUE_ACTOR_NAME']
+    if (-not $script:actorName) { try { $script:actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
+    if (-not $script:actorName) { $script:actorName = $env:USERNAME }
 
-$actorEmail = $creds['ROGUE_ACTOR_EMAIL']
-if (-not $actorEmail) { try { $actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorEmail) {
-    if ($env:USERNAME -and $env:COMPUTERNAME) { $actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
-    elseif ($env:USERNAME) { $actorEmail = $env:USERNAME } else { $actorEmail = $env:COMPUTERNAME }
+    $script:actorEmail = $creds['ROGUE_ACTOR_EMAIL']
+    if (-not $script:actorEmail) { try { $script:actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
+    if (-not $script:actorEmail) {
+        if ($env:USERNAME -and $env:COMPUTERNAME) { $script:actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
+        elseif ($env:USERNAME) { $script:actorEmail = $env:USERNAME } else { $script:actorEmail = $env:COMPUTERNAME }
+    }
 }
 
 # ── plugin version (from the bundled VERSION file, NOT plugin.json — the
 #    Antigravity manifest schema is additionalProperties:false with no
 #    version field, so the version lives in its own file at the plugin root) ──
-$ver = 'unknown'
-$versionFile = Join-Path $pluginRoot 'VERSION'
-if (Test-Path -LiteralPath $versionFile) {
-    try {
-        $first = Get-Content -LiteralPath $versionFile -TotalCount 1
-        if ($first) { $ver = $first.Trim() }
-    } catch {}
+function Resolve-Version {
+    $versionFile = Join-Path $pluginRoot 'VERSION'
+    if (Test-Path -LiteralPath $versionFile) {
+        try {
+            $first = Get-Content -LiteralPath $versionFile -TotalCount 1
+            if ($first) { $script:ver = $first.Trim() }
+        } catch {}
+    }
 }
 
 # ── surface: -Agent when the caller knows it. hook.ps1 reads it off the event's
@@ -102,33 +136,55 @@ if (Test-Path -LiteralPath $versionFile) {
 #    IDE, the `agy` CLI) share one install, so the fallback below cannot
 #    tell which is running and picks the CLI whenever it sits alongside another.
 #    Validated, not trusted verbatim: the value ends up in a roster row. ──
-$agent = $Agent
-if (@('antigravity', 'antigravity_ide', 'antigravity_cli') -notcontains $agent) {
+function Resolve-Surface {
+    $script:agent = $Agent
+    if (@('antigravity', 'antigravity_ide', 'antigravity_cli') -contains $script:agent) { return }
     # Default to the 2.0 app — the current flagship; flip to the CLI surface if
     # the `agy` binary is on PATH or the CLI's config dir exists.
-    $agent = 'antigravity'
+    $script:agent = 'antigravity'
     $agyCmd = Get-Command agy -ErrorAction SilentlyContinue
     $agyCliDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
-    if ($agyCmd -or (Test-Path -LiteralPath $agyCliDir)) { $agent = 'antigravity_cli' }
+    if ($agyCmd -or (Test-Path -LiteralPath $agyCliDir)) { $script:agent = 'antigravity_cli' }
 }
 
-$host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
+function Send-Heartbeat {
+    $host_ = $env:COMPUTERNAME
+    if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 
-$body = @{
-    agent_family = 'antigravity'
-    agent        = $agent
-    version      = $ver
-    host         = $host_
-    actor_email  = [string]$actorEmail
-    actor_name   = [string]$actorName
-} | ConvertTo-Json -Compress
+    $body = @{
+        agent_family = 'antigravity'
+        agent        = $agent
+        version      = $ver
+        host         = $host_
+        actor_email  = [string]$actorEmail
+        actor_name   = [string]$actorName
+    } | ConvertTo-Json -Compress
 
-try {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-    Invoke-WebRequest -Uri "$baseUrl/api/v1/hooks/status" -Method Post `
-        -Headers @{ 'x-rogue-api-key' = $apiKey } -ContentType 'application/json' `
-        -Body $bytes -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop | Out-Null
-    Dbg 'heartbeat sent'
-} catch { Dbg "heartbeat failed: $($_.Exception.Message)" }
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        Invoke-WebRequest -Uri "$baseUrl/api/v1/hooks/status" -Method Post `
+            -Headers @{ 'x-rogue-api-key' = $apiKey } -ContentType 'application/json' `
+            -Body $bytes -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop | Out-Null
+        Dbg 'heartbeat sent'
+    } catch { Dbg "heartbeat failed: $($_.Exception.Message)" }
+}
 
-exit 0
+# ── main ───────────────────────────────────────────────────────────────────
+# Same order as heartbeat.sh: stand down, configure, then fire and forget.
+function Invoke-Main {
+    Initialize-Tls
+    Stop-OnNonWindows
+    Resolve-PluginRoot
+    Import-Credentials
+    Assert-ApiKey      # exits 0 when this install is not configured
+    Resolve-BaseUrl
+    Resolve-Actor
+    Resolve-Version
+    Resolve-Surface
+    Send-Heartbeat
+    exit 0
+}
+
+# Test seam, as in hook.ps1: `if (-not …)` and never a bare `return`, which would
+# unwind a test that dot-sources this file.
+if (-not $env:ROGUE_PS_LIB_ONLY) { Invoke-Main }

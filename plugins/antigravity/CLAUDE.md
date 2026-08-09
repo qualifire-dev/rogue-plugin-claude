@@ -47,13 +47,19 @@ skills/status/       /status — read-only, model-invocable
 That is why the version lives in `VERSION`. Do not "fix" this by adding
 `version` to `plugin.json`; it will be rejected.
 
-### Both dispatchers are main-and-functions
+### The scripts are main-and-functions
 
-Everything in `hook.sh` and `hook.ps1` is a function. The only thing that runs at
-file scope is the last line — `main "$@"` / `Invoke-Main` — so the flow reads as
-the pipeline it is (stand down → configure → read → enrich → post) instead of a
-few hundred lines of interleaved statements, and the two files can be diffed
+Everything in `hook.sh`, `hook.ps1`, `heartbeat.sh`, `heartbeat.ps1` and
+`resolve-runtime.sh` is a function. The only thing that runs at file scope is the
+last line — `main "$@"` / `Invoke-Main` — so each flow reads as the pipeline it is
+(the dispatchers: stand down → configure → read → enrich → post) instead of a few
+hundred lines of interleaved statements, and the sh/ps1 pairs can be diffed
 against each other step for step.
+
+`setup.sh` / `setup.ps1` are deliberately left as they are: ~30 linear lines that
+write `~/.rogue-env`, where a `main` wrapper would be ceremony around a script you
+can already read at a glance. `actor.sh` is sourced, not run, so it has no entry
+point by design; `db-prompt.mjs` already had a `main()`.
 
 Three orderings inside `main` are load-bearing; keep them if you touch it:
 

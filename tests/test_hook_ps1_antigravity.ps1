@@ -45,7 +45,11 @@ param([ValidateSet('all', 'parse', 'scope', 'shape', 'helpers')][string]$Only = 
 $ErrorActionPreference = 'Stop'
 function Test-Section { param([string]$Name) return ($Only -eq 'all' -or $Only -eq $Name) }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$hook = Join-Path (Split-Path -Parent $here) 'plugins/antigravity/scripts/hook.ps1'
+$scripts = Join-Path (Split-Path -Parent $here) 'plugins/antigravity/scripts'
+$hook = Join-Path $scripts 'hook.ps1'
+# heartbeat.ps1 is main-and-functions for the same reasons and carries the same
+# scope hazard, so the structural sections check both files.
+$structural = @($hook, (Join-Path $scripts 'heartbeat.ps1'))
 
 $failures = 0
 
@@ -53,21 +57,25 @@ $failures = 0
 # Parsed on demand so a section that does not need the AST does not pay for it:
 # under emulation the AST walk plus a later dot-source is what tips the runtime
 # over, and section independence is the whole point of -Only.
-$ast = $null
-function Get-HookAst {
-    if ($script:ast) { return $script:ast }
+$astCache = @{}
+function Get-ScriptAst {
+    param([string]$Path)
+    if ($script:astCache.ContainsKey($Path)) { return $script:astCache[$Path] }
     $errs = $null; $toks = $null
-    $script:ast = [System.Management.Automation.Language.Parser]::ParseFile($hook, [ref]$toks, [ref]$errs)
+    $parsed = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$toks, [ref]$errs)
     if ($errs) {
-        $errs | ForEach-Object { Write-Host "FAIL [parse]: line $($_.Extent.StartLineNumber): $($_.Message)" }
+        $errs | ForEach-Object { Write-Host "FAIL [parse]: $(Split-Path $Path -Leaf) line $($_.Extent.StartLineNumber): $($_.Message)" }
         exit 1
     }
-    return $script:ast
+    $script:astCache[$Path] = $parsed
+    return $parsed
 }
 
 if (Test-Section 'parse') {
-    [void](Get-HookAst)
-    Write-Host '  ok: hook.ps1 parses'
+    foreach ($f in $structural) {
+        [void](Get-ScriptAst $f)
+        Write-Host "  ok: $(Split-Path $f -Leaf) parses"
+    }
 }
 
 # ── 2. every write to shared state is $script:-qualified ───────────────────
@@ -75,12 +83,15 @@ if (Test-Section 'scope') {
 $shared = @(
     'logFile', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail', 'payload',
     'subagentId', 'subagentName', 'brainDir', 'submapDir', 'payloadTp',
-    'isIdeSurface', 'PluginRoot'
+    'isIdeSurface', 'PluginRoot',
+    # heartbeat.ps1's own shared state
+    'pluginRoot', 'baseUrl', 'ver', 'agent'
 )
+foreach ($file in $structural) {
 $unscoped = @()
 # Materialised with @(): FindAll returns a lazy enumerable, and nesting a second
 # walk inside the first one's iteration silently yields null elements.
-$functions = @((Get-HookAst).FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+$functions = @((Get-ScriptAst $file).FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
 foreach ($fn in $functions) {
     if (-not $fn -or -not $fn.Body) { continue }
     foreach ($a in @($fn.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))) {
@@ -95,18 +106,21 @@ foreach ($fn in $functions) {
     }
 }
 if ($unscoped) {
-    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: assigned without `$script: — $_" }
+    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: — $_" }
     $failures += $unscoped.Count
 } else {
-    Write-Host '  ok: every shared-state write inside a function is $script:-qualified'
+    Write-Host "  ok: $(Split-Path $file -Leaf): every shared-state write inside a function is `$script:-qualified"
+}
 }
 }
 
 # ── 3. main-and-functions: nothing runs at file scope but Invoke-Main ───────
 # Top-level command calls are what would run before the stand-down.
 if (Test-Section 'shape') {
+foreach ($file in $structural) {
+$entry = if ($file -eq $hook) { 'Invoke-Main' } else { 'Invoke-Main' }
 $topLevelCalls = @()
-foreach ($st in @((Get-HookAst).EndBlock.Statements)) {
+foreach ($st in @((Get-ScriptAst $file).EndBlock.Statements)) {
     if ($st -is [System.Management.Automation.Language.FunctionDefinitionAst]) { continue }
     foreach ($c in @($st.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $false))) {
         if (-not $c) { continue }
@@ -114,11 +128,12 @@ foreach ($st in @((Get-HookAst).EndBlock.Statements)) {
         if ($name) { $topLevelCalls += $name }
     }
 }
-$stray = @($topLevelCalls | Where-Object { $_ -ne 'Invoke-Main' })
-if ($stray.Count -eq 0) { Write-Host '  ok: nothing is invoked at file scope except Invoke-Main' }
-else { Write-Host "FAIL [file scope]: these run before the stand-down: $($stray -join ', ')"; $failures++ }
-if ($topLevelCalls -contains 'Invoke-Main') { Write-Host '  ok: Invoke-Main is actually called' }
-else { Write-Host 'FAIL [file scope]: Invoke-Main is never called'; $failures++ }
+$stray = @($topLevelCalls | Where-Object { $_ -ne $entry })
+if ($stray.Count -eq 0) { Write-Host "  ok: $(Split-Path $file -Leaf): nothing is invoked at file scope except $entry" }
+else { Write-Host "FAIL [file scope]: $(Split-Path $file -Leaf) runs these before the stand-down: $($stray -join ', ')"; $failures++ }
+if ($topLevelCalls -contains $entry) { Write-Host "  ok: $(Split-Path $file -Leaf): $entry is actually called" }
+else { Write-Host "FAIL [file scope]: $(Split-Path $file -Leaf) never calls $entry"; $failures++ }
+}
 }
 
 # ── 4. unit tests over the helpers (loaded without running the hook) ───────
