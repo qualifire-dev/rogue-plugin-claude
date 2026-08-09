@@ -47,6 +47,35 @@ skills/status/       /status — read-only, model-invocable
 That is why the version lives in `VERSION`. Do not "fix" this by adding
 `version` to `plugin.json`; it will be rejected.
 
+### Both dispatchers are main-and-functions
+
+Everything in `hook.sh` and `hook.ps1` is a function. The only thing that runs at
+file scope is the last line — `main "$@"` / `Invoke-Main` — so the flow reads as
+the pipeline it is (stand down → configure → read → enrich → post) instead of a
+few hundred lines of interleaved statements, and the two files can be diffed
+against each other step for step.
+
+Three orderings inside `main` are load-bearing; keep them if you touch it:
+
+1. **The stand-down runs first.** Git Bash (`hook.sh`) and non-Windows (`hook.ps1`)
+   must emit nothing before any env sourcing, actor resolution or POST, or a
+   machine running both handlers double-POSTs and double-decides.
+2. **Env sourcing precedes every default derived from it.** `load_env` computes
+   `ROGUE_LOG_FILE`, `DB_PROMPT_MODE`, `MISS_DIR`, `BRAIN_DIR`, `SUBMAP_DIR` and
+   the URL *after* reading the env files. Hoisting any of them back to file scope
+   silently freezes the built-in default and ignores the user's `~/.rogue-env`.
+3. **The API-key check precedes reading stdin.** An unconfigured machine exits
+   without consuming the payload.
+
+**PowerShell scoping is the trap in `hook.ps1`.** Reading a script variable from a
+function is implicit, but *assigning* one needs the `$script:` prefix or the write
+lands in a function-local copy and vanishes with no error — a silent
+"the POST sent an unenriched body" class of bug. Every write to shared state
+(`$payload`, `$subagentId`, `$apiKey`, `$url`, `$payloadTp`, …) is therefore
+`$script:`-qualified, and `tests/test_hook_ps1_antigravity.ps1` fails the build if
+one is not. `hook.ps1` also honours `ROGUE_PS_LIB_ONLY=1`, which loads the
+functions without running the hook, so they can be exercised off-Windows.
+
 ## hooks.json — the shape is a trap (verified)
 
 Antigravity's plugin `hooks.json` is keyed by a **plugin namespace** (`"rogue"`),

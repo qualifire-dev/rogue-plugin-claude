@@ -81,29 +81,63 @@ function ConvertFrom-ShellQuoted {
     return $sb.ToString()
 }
 
+# ── Shape of this file ─────────────────────────────────────────────────────
+# Everything is a function; `Invoke-Main` at the bottom is the only thing that
+# runs, and it reads as the pipeline it is (stand down → configure → read →
+# enrich → post). Mirrors hook.sh's `main`, step for step.
+#
+# The state those steps thread between them lives in the script-scoped variables
+# declared below. PowerShell scoping makes that explicit and easy to get wrong:
+# reading a script variable from a function is implicit, but ASSIGNING one needs
+# the `$script:` prefix or the write lands in a function-local copy and silently
+# vanishes. Every write to shared state below is therefore `$script:`-qualified.
+$logFile    = ''   # resolved in Initialize-Logging
+$creds      = @{}  # credential files + process env, by Import-Credentials
+$apiKey     = ''
+$url        = ''
+$actorName  = ''
+$actorEmail = ''
+$payload    = ''   # the hook payload, as received then enriched
+$subagentId = ''   # set by Resolve-Subagent when this event is a subagent's
+$subagentName = ''
+$brainDir   = ''
+$submapDir  = ''
+$payloadTp  = ''   # transcriptPath, unescaped and folded to forward slashes
+$isIdeSurface = $false
+
 # Windows PowerShell 5.1 may negotiate only TLS 1.0/1.1 by default; add TLS 1.2.
-try {
-    [Net.ServicePointManager]::SecurityProtocol = `
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-} catch {}
+function Initialize-Tls {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch {}
+}
 
 # Stand down on non-Windows (Antigravity runs hook.sh there for real work; this
 # guards a stray pwsh). Emit NOTHING (not `{}`) so this entry never
 # contributes a decision alongside the sh entry — see the exactly-one-runs
-# note above.
-if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
-
-if (-not $EventName) { Write-Raw (Get-FailOpenDefault); exit 0 }
-Dbg "event=$EventName"
+# note above. Must run before ANY other work, like hook.sh's Git Bash check.
+function Stop-OnNonWindows {
+    if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
+}
 
 # Self-locate the plugin root from the 2nd argument (hooks.json passes
 # (Get-Location).Path). $PSCommandPath is empty under
 # [scriptblock]::Create, so there is no file-path fallback here — fall
 # straight back to the current working directory.
-if (-not $PluginRoot) { try { $PluginRoot = (Get-Location).Path } catch { $PluginRoot = '.' } }
+function Resolve-PluginRoot {
+    if (-not $PluginRoot) {
+        try { $script:PluginRoot = (Get-Location).Path } catch { $script:PluginRoot = '.' }
+    }
+}
 
-$logFile = $env:ROGUE_LOG_FILE
-if (-not $logFile) { $logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log' }
+function Initialize-Logging {
+    $script:logFile = $env:ROGUE_LOG_FILE
+    if (-not $script:logFile) {
+        $script:logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log'
+    }
+}
+
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
 
 # Append raw JSON text ($Fields, each piece leading with its own comma) to an
@@ -130,56 +164,65 @@ function Log {
 }
 
 # ── credential resolution (later file wins; process env wins over all) ─────
-$creds = @{}
-foreach ($f in @((Join-Path $PluginRoot 'env'), 'C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
-    if (-not $f -or -not (Test-Path -LiteralPath $f)) { continue }
-    foreach ($line in (Get-Content -LiteralPath $f)) {
-        if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
-            $creds[$Matches[1]] = ConvertFrom-ShellQuoted ($Matches[2].Trim())
+function Import-Credentials {
+    $script:creds = @{}
+    foreach ($f in @((Join-Path $PluginRoot 'env'), 'C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
+        if (-not $f -or -not (Test-Path -LiteralPath $f)) { continue }
+        foreach ($line in (Get-Content -LiteralPath $f)) {
+            if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
+                $script:creds[$Matches[1]] = ConvertFrom-ShellQuoted ($Matches[2].Trim())
+            }
         }
     }
+    foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL') {
+        $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $script:creds[$k] = $val }
+    }
+    $script:apiKey = $script:creds['ROGUE_API_KEY']
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL') {
-    $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $creds[$k] = $val }
-}
-
-$apiKey = $creds['ROGUE_API_KEY']
 
 # Not configured: never POST without a key. Emit the per-event fail-open
-# default so PreToolUse still resolves to an explicit allow decision.
-if (-not $apiKey) {
+# default so PreToolUse still resolves to an explicit allow decision. Ends the
+# script, deliberately before stdin is read.
+function Assert-ApiKey {
+    if ($apiKey) { return }
     Log 'outcome=unconfigured'
     Write-Raw (Get-FailOpenDefault)
     exit 0
 }
 
 # URL: explicit ROGUE_API_URL wins, else base + path.
-$url = $creds['ROGUE_API_URL']
-if (-not $url) {
-    $baseUrl = $creds['ROGUE_BASE_URL']; if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
-    $url = "$($baseUrl.TrimEnd('/'))/api/v1/hooks/antigravity"
+function Resolve-Url {
+    $script:url = $creds['ROGUE_API_URL']
+    if (-not $script:url) {
+        $baseUrl = $creds['ROGUE_BASE_URL']; if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
+        $script:url = "$($baseUrl.TrimEnd('/'))/api/v1/hooks/antigravity"
+    }
 }
 
 # ── actor resolution (mirrors actor.sh) ────────────────────────────────────
-$actorName = $creds['ROGUE_ACTOR_NAME']
-if (-not $actorName) { try { $actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorName) { $actorName = $env:USERNAME }
+function Resolve-Actor {
+    $script:actorName = $creds['ROGUE_ACTOR_NAME']
+    if (-not $script:actorName) { try { $script:actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
+    if (-not $script:actorName) { $script:actorName = $env:USERNAME }
 
-$actorEmail = $creds['ROGUE_ACTOR_EMAIL']
-if (-not $actorEmail) { try { $actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorEmail) {
-    if ($env:USERNAME -and $env:COMPUTERNAME) { $actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
-    elseif ($env:USERNAME) { $actorEmail = $env:USERNAME } else { $actorEmail = $env:COMPUTERNAME }
+    $script:actorEmail = $creds['ROGUE_ACTOR_EMAIL']
+    if (-not $script:actorEmail) { try { $script:actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
+    if (-not $script:actorEmail) {
+        if ($env:USERNAME -and $env:COMPUTERNAME) { $script:actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
+        elseif ($env:USERNAME) { $script:actorEmail = $env:USERNAME } else { $script:actorEmail = $env:COMPUTERNAME }
+    }
 }
 
 # ── payload from stdin (recover UTF-8, strip BOM) ──────────────────────────
-$payload = [Console]::In.ReadToEnd()
-if (-not $payload) { $payload = '{}' }
-try {
-    $raw = [Console]::InputEncoding.GetBytes($payload)
-    $payload = [System.Text.Encoding]::UTF8.GetString($raw)
-} catch {}
-$payload = $payload.TrimStart([char]0xFEFF)
+function Read-Payload {
+    $script:payload = [Console]::In.ReadToEnd()
+    if (-not $script:payload) { $script:payload = '{}' }
+    try {
+        $raw = [Console]::InputEncoding.GetBytes($script:payload)
+        $script:payload = [System.Text.Encoding]::UTF8.GetString($raw)
+    } catch {}
+    $script:payload = $script:payload.TrimStart([char]0xFEFF)
+}
 
 # Which Antigravity product fired this event, from the state dir its transcript
 # lives in. Slash-anchored and ordered specific → general because the bare
@@ -215,7 +258,9 @@ function Get-PayloadTranscriptPath {
 # detached (Start-Process -WindowStyle Hidden) so the hook itself returns
 # immediately regardless of heartbeat.ps1's own latency — mirrors hook.sh's
 # `( nohup sh heartbeat.sh & )`.
-if ($EventName -eq 'PreInvocation' -and ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) {
+function Invoke-Heartbeat {
+    if ($EventName -ne 'PreInvocation') { return }
+    if (-not ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) { return }
     try {
         $hbPath = Join-Path $PluginRoot 'scripts/heartbeat.ps1'
         # Pass the surface along: only the hook can know it (three products share
@@ -304,24 +349,28 @@ function Resolve-TranscriptPath {
 # able from a main conversation — so the verdict is cached per conversation BOTH
 # ways ('main' for ordinary ones) to keep it at one scan per conversation.
 # Fail-open: unresolved → payload untouched.
-$subagentId = ''
-$subagentName = ''
+
 # Prefer the brain dir holding THIS event's transcript — which is also where its
 # parent conversation lives, since a subagent runs on the surface that spawned
 # it. Each product has its own brain dir, so the CLI-only default below left
 # subagents in the IDE / 2.0 app unresolved, orphaning them into their own
 # session. transcriptPath is `<brain>/<conversationId>/.system_generated/logs/…`.
 # Mirrors hook.sh's brain_dir_from_transcript. An explicit override still wins.
-$brainDir = $env:ROGUE_ANTIGRAVITY_BRAIN_DIR
-if (-not $brainDir) {
-    $tpForBrain = ([regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value `
-        -replace '\\\\', '\' -replace '\\/', '/' -replace '\\', '/')
-    $m2 = [regex]::Match($tpForBrain, '^(?<root>.*)/brain/[^/]+/\.system_generated/logs/')
-    if ($m2.Success) { $brainDir = Join-Path $m2.Groups['root'].Value 'brain' }
+#
+# Depends on $payload, so this runs from Invoke-Main after Read-Payload, not at
+# file scope.
+function Initialize-SubagentDirs {
+    $script:brainDir = $env:ROGUE_ANTIGRAVITY_BRAIN_DIR
+    if (-not $script:brainDir) {
+        $tpForBrain = ([regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value `
+            -replace '\\\\', '\' -replace '\\/', '/' -replace '\\', '/')
+        $m2 = [regex]::Match($tpForBrain, '^(?<root>.*)/brain/[^/]+/\.system_generated/logs/')
+        if ($m2.Success) { $script:brainDir = Join-Path $m2.Groups['root'].Value 'brain' }
+    }
+    if (-not $script:brainDir) { $script:brainDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\brain' }
+    $script:submapDir = $env:ROGUE_ANTIGRAVITY_SUBMAP_DIR
+    if (-not $script:submapDir) { $script:submapDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'antigravity-submap' }
 }
-if (-not $brainDir) { $brainDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli\brain' }
-$submapDir = $env:ROGUE_ANTIGRAVITY_SUBMAP_DIR
-if (-not $submapDir) { $submapDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'antigravity-submap' }
 
 function Get-SubagentDisplayName {
     # Primary: the spawning call. invoke_subagent's args carry a `Role` per
@@ -388,34 +437,36 @@ function Resolve-SubagentParent {
     return ''
 }
 
-try {
-    $cm = [regex]::Match($payload, '"conversationId"\s*:\s*"([^"]*)"')
-    if ($cm.Success -and $cm.Groups[1].Value) {
-        $cid = $cm.Groups[1].Value
-        $cacheFile = Join-Path $submapDir $cid
-        $map = $null
-        if (Test-Path -LiteralPath $cacheFile) {
-            $map = @(Get-Content -LiteralPath $cacheFile -ErrorAction SilentlyContinue)
-        } else {
-            $parent = Resolve-SubagentParent $cid
-            if ($parent) { $map = @($parent, (Get-SubagentDisplayName $parent $cid)) } else { $map = @('main') }
-            try {
-                if (-not (Test-Path -LiteralPath $submapDir)) { New-Item -ItemType Directory -Path $submapDir -Force | Out-Null }
-                Set-Content -LiteralPath $cacheFile -Value $map -Encoding UTF8
-            } catch {}
+function Resolve-Subagent {
+    try {
+        $cm = [regex]::Match($payload, '"conversationId"\s*:\s*"([^"]*)"')
+        if ($cm.Success -and $cm.Groups[1].Value) {
+            $cid = $cm.Groups[1].Value
+            $cacheFile = Join-Path $submapDir $cid
+            $map = $null
+            if (Test-Path -LiteralPath $cacheFile) {
+                $map = @(Get-Content -LiteralPath $cacheFile -ErrorAction SilentlyContinue)
+            } else {
+                $parent = Resolve-SubagentParent $cid
+                if ($parent) { $map = @($parent, (Get-SubagentDisplayName $parent $cid)) } else { $map = @('main') }
+                try {
+                    if (-not (Test-Path -LiteralPath $submapDir)) { New-Item -ItemType Directory -Path $submapDir -Force | Out-Null }
+                    Set-Content -LiteralPath $cacheFile -Value $map -Encoding UTF8
+                } catch {}
+            }
+            if ($map -and $map.Count -ge 1 -and $map[0] -and $map[0] -ne 'main') {
+                $script:subagentId = $cid
+                if ($map.Count -ge 2) { $script:subagentName = [string]$map[1] }
+                # Normalize to compact form, tolerating whitespace around the colon.
+                $script:payload = [regex]::Replace(
+                    $payload,
+                    '"conversationId"\s*:\s*"' + [regex]::Escape($cid) + '"',
+                    '"conversationId":"' + $map[0] + '"')
+                Log "subagent=$cid parent=$($map[0]) name=$(Sanitize $script:subagentName)"
+            }
         }
-        if ($map -and $map.Count -ge 1 -and $map[0] -and $map[0] -ne 'main') {
-            $subagentId = $cid
-            if ($map.Count -ge 2) { $subagentName = [string]$map[1] }
-            # Normalize to compact form, tolerating whitespace around the colon.
-            $payload = [regex]::Replace(
-                $payload,
-                '"conversationId"\s*:\s*"' + [regex]::Escape($cid) + '"',
-                '"conversationId":"' + $map[0] + '"')
-            Log "subagent=$cid parent=$($map[0]) name=$(Sanitize $subagentName)"
-        }
-    }
-} catch { Dbg "subagent re-attribution failed: $($_.Exception.Message)" }
+    } catch { Dbg "subagent re-attribution failed: $($_.Exception.Message)" }
+}
 
 # ── IDE prompt recovery (mirrors hook.sh's augment_with_db_prompt) ──────────
 # The IDE writes transcript.jsonl only at invocation boundaries and Stop, so the
@@ -578,19 +629,24 @@ function Add-StoreRead {
 
 # Resolved once and shared by the three IDE-gated behaviors below (store read,
 # Stop-only tail, capability flag) so they can never disagree about the surface.
-$payloadTp = Get-PayloadTranscriptPath $payload
-$isIdeSurface = $payloadTp -like '*/antigravity-ide/*'
+function Resolve-Surface {
+    $script:payloadTp = Get-PayloadTranscriptPath $payload
+    $script:isIdeSurface = $script:payloadTp -like '*/antigravity-ide/*'
+}
 
-if ($EventName -eq 'PreInvocation')  { Add-StoreRead 'prompt' 'rogueDbPromptB64' }
-if ($EventName -eq 'PostInvocation') { Add-StoreRead 'steps'  'rogueDbStepsB64' }
+function Add-StoreReadForEvent {
+    if ($EventName -eq 'PreInvocation')  { Add-StoreRead 'prompt' 'rogueDbPromptB64' }
+    if ($EventName -eq 'PostInvocation') { Add-StoreRead 'steps'  'rogueDbStepsB64' }
+}
 
 # Transcript enrichment is per surface: the 2.0 app and the CLI write the file
 # live so all three events can tail it, but on the IDE only Stop can — at
 # Pre/PostInvocation the file holds at most the PREVIOUS turn, and waiting for the
 # current one cannot work (it appears ~4s later, at Stop). Mirrors hook.sh.
-$tailEvents = if ($isIdeSurface) { @('Stop') }
-              else { @('PreInvocation', 'PostInvocation', 'Stop') }
-if ($tailEvents -contains $EventName) {
+function Add-TranscriptTail {
+    $tailEvents = if ($isIdeSurface) { @('Stop') }
+                  else { @('PreInvocation', 'PostInvocation', 'Stop') }
+    if ($tailEvents -notcontains $EventName) { return }
     try {
         $m = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"')
         if ($m.Success) {
@@ -620,7 +676,7 @@ if ($tailEvents -contains $EventName) {
                         if ($read -gt 0) {
                             $b64 = [Convert]::ToBase64String($buf, 0, $read)
                             if ($b64) {
-                                $payload = Add-JsonFields $payload `
+                                $script:payload = Add-JsonFields $payload `
                                     (',"transcriptTailB64":"' + $b64 + '"')
                                 Log "tail=$($b64.Length) path=$tp"
                             }
@@ -637,8 +693,9 @@ if ($tailEvents -contains $EventName) {
 # recorded at PreInvocation, so every user message lands twice. It also reports
 # whichever halves of the turn the store failed to deliver, so the backend rebuilds
 # exactly those from the tail. Mirrors hook.sh's mark_db_prompt_capable.
-if ($EventName -eq 'Stop' -and $isIdeSurface `
-    -and $env:ROGUE_ANTIGRAVITY_DB_PROMPT -ne '0') {
+function Add-CapabilityFlag {
+    if ($EventName -ne 'Stop' -or -not $isIdeSurface) { return }
+    if ($env:ROGUE_ANTIGRAVITY_DB_PROMPT -eq '0') { return }
     try {
         # Consume the markers whether or not a runtime still resolves, so a stale one
         # cannot leak into a later turn.
@@ -652,54 +709,103 @@ if ($EventName -eq 'Stop' -and $isIdeSurface `
         }
         if (Get-JsRuntime (($payloadTp -split '/brain/')[0])) {
             if ($missed) { Log "dbstore=stop missed=$($missed.TrimStart(','))" }
-            $payload = Add-JsonFields $payload ($missed + ',"rogueDbPromptCapable":true')
+            $script:payload = Add-JsonFields $payload ($missed + ',"rogueDbPromptCapable":true')
         }
     } catch { Dbg "capability flag failed: $($_.Exception.Message)" }
 }
 
 # ── POST (fail-open) → relay verbatim ──────────────────────────────────────
-$headers = @{
-    'x-rogue-api-key'     = $apiKey
-    'x-rogue-event'       = $EventName
-    'x-rogue-actor-email' = $actorEmail
-    'x-rogue-actor-name'  = $actorName
-}
-# The agent tag rides in HEADERS, never in the body: the POSTed event must stay
-# byte-identical to what Antigravity handed us, so the stored raw payload is the
-# vendor's own event and nothing we synthesised. The name is base64 so an arbitrary
-# subagent Role (accents, emoji) cannot produce an invalid header value. Both are
-# omitted entirely — never sent empty — on main-agent events. Mirrors hook.sh.
-if ($subagentId) {
-    $headers['x-rogue-agent-id'] = $subagentId
-    if ($subagentName) {
-        $headers['x-rogue-agent-name-b64'] =
-            [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($subagentName))
+function Invoke-Post {
+    $headers = @{
+        'x-rogue-api-key'     = $apiKey
+        'x-rogue-event'       = $EventName
+        'x-rogue-actor-email' = $actorEmail
+        'x-rogue-actor-name'  = $actorName
     }
-}
-$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
-$resp = ''
-try {
-    $r = Invoke-WebRequest -Uri $url -Method Post `
-        -Headers $headers -ContentType 'application/json' -Body $bodyBytes `
-        -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
-    if ($r.StatusCode -eq 200) {
-        try { $resp = [System.Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) }
-        catch { $resp = [string]$r.Content }
+    # The agent tag rides in HEADERS, never in the body: the POSTed event must stay
+    # byte-identical to what Antigravity handed us, so the stored raw payload is the
+    # vendor's own event and nothing we synthesised. The name is base64 so an arbitrary
+    # subagent Role (accents, emoji) cannot produce an invalid header value. Both are
+    # omitted entirely — never sent empty — on main-agent events. Mirrors hook.sh.
+    if ($subagentId) {
+        $headers['x-rogue-agent-id'] = $subagentId
+        if ($subagentName) {
+            $headers['x-rogue-agent-name-b64'] =
+                [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($subagentName))
+        }
     }
-} catch { Dbg "POST failed: $($_.Exception.Message)"; $resp = '' }
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $resp = ''
+    try {
+        $r = Invoke-WebRequest -Uri $url -Method Post `
+            -Headers $headers -ContentType 'application/json' -Body $bodyBytes `
+            -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        if ($r.StatusCode -eq 200) {
+            try { $resp = [System.Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) }
+            catch { $resp = [string]$r.Content }
+        }
+    } catch { Dbg "POST failed: $($_.Exception.Message)"; $resp = '' }
 
-$respHead = if ($resp.Length -gt 400) { $resp.Substring(0, 400) } else { $resp }
-Log "raw=$(Sanitize $respHead)"
+    $respHead = if ($resp.Length -gt 400) { $resp.Substring(0, 400) } else { $resp }
+    Log "raw=$(Sanitize $respHead)"
 
-# Fail-open on transport error, any non-200, or an empty body: emit the
-# per-event default rather than relaying garbage as a decision.
-if (-not $resp) {
-    Log 'outcome=allow'
-    Write-Raw (Get-FailOpenDefault)
+    # Fail-open on transport error, any non-200, or an empty body: emit the
+    # per-event default rather than relaying garbage as a decision.
+    if (-not $resp) {
+        Log 'outcome=allow'
+        Write-Raw (Get-FailOpenDefault)
+        return
+    }
+
+    # rogue-api already returns the correct native Antigravity shape; relay it
+    # verbatim.
+    Write-Raw $resp
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+# The whole hook, in the order the steps must happen — the same sequence as
+# hook.sh's `main`. Each step fails open on its own; the two that can end the run
+# early (Stop-OnNonWindows, Assert-ApiKey) exit 0 with the right stdout for their
+# case.
+function Invoke-Main {
+    Initialize-Tls
+    Stop-OnNonWindows
+    if (-not $EventName) { Write-Raw (Get-FailOpenDefault); exit 0 }
+    Dbg "event=$EventName"
+
+    Resolve-PluginRoot
+    Initialize-Logging
+    Import-Credentials
+    Assert-ApiKey          # exits before stdin is read when there is no key
+    Resolve-Url
+    Resolve-Actor
+    Read-Payload
+
+    Invoke-Heartbeat
+    Initialize-SubagentDirs
+    # Re-attribute BEFORE enriching: the enrichers re-close the JSON object by
+    # hand, so mutating conversationId afterwards would have to skip past the
+    # appended base64 blob.
+    Resolve-Subagent
+
+    Resolve-Surface
+    Add-StoreReadForEvent
+    Add-TranscriptTail
+    Add-CapabilityFlag
+
+    Invoke-Post
+    # This script MUST always exit 0: a block is carried in the relayed JSON body
+    # on stdout, never in the exit code.
     exit 0
 }
 
-# rogue-api already returns the correct native Antigravity shape; relay it
-# verbatim.
-Write-Raw $resp
-exit 0
+# Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
+# without running the hook, so they can be exercised on any platform (the other
+# plugins' hook.ps1 have the same seam).
+#
+# Guarded with `if (-not …)` rather than the sibling plugins' bare `return`: a
+# dot-sourced script shares the CALLER's scope, so its `return` unwinds the
+# caller. In a test that dot-sources this file, every assertion after the load was
+# skipped and the run still reported success — a false pass. This form cannot do
+# that.
+if (-not $env:ROGUE_PS_LIB_ONLY) { Invoke-Main }

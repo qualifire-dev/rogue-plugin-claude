@@ -30,27 +30,62 @@
 #   2. /etc/rogue/env            (MDM-provisioned)
 #   3. $HOME/.rogue-env          (per-user / installer-written)
 
-EVENT="$1"
+# ── Shape of this file ─────────────────────────────────────────────────────
+# Everything is a function; `main` at the bottom is the only thing that runs, and
+# it reads as the pipeline it is (stand down → configure → read → enrich → post).
+# The state that pipeline threads between its steps lives in the few globals
+# below, declared here rather than materialising mid-file.
+#
+# ORDER IS LOAD-BEARING inside `main`, in three places: the Git Bash stand-down
+# has to precede every other action, the env files have to be sourced before any
+# default derived from them, and stdin is only read once a key exists to POST it
+# with. See the comments on each step.
+
+EVENT=""          # hook event name, from $1
+PLUGIN_ROOT=""    # <root> of this plugin, derived from $0
+BODY=""           # the hook payload, as received then enriched
+URL=""            # where to POST it
+SUBAGENT_ID=""    # set by reattribute_subagent when this event is a subagent's
+SUBAGENT_NAME=""
 
 # --- Git Bash stand-down: emit NOTHING so the PowerShell handler owns Windows.
 # Must run before ANY other work (env sourcing, actor resolution, POST) so a
 # machine running both handlers never double-POSTs / double-decides.
-_uname="${ROGUE_FORCE_UNAME:-$(uname -s 2>/dev/null)}"
-case "$_uname" in
-  MINGW*|MSYS*|CYGWIN*) exit 0 ;;   # empty stdout — no decision contributed
-esac
+stand_down_under_git_bash() {
+  _uname="${ROGUE_FORCE_UNAME:-$(uname -s 2>/dev/null)}"
+  case "$_uname" in
+    MINGW*|MSYS*|CYGWIN*) exit 0 ;;   # empty stdout — no decision contributed
+  esac
+}
 
 # Self-locate the plugin root from $0 (the path we were invoked with:
 # <root>/scripts/hook.sh).
-PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
-[ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="."
+locate_plugin_root() {
+  PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
+  [ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="."
+}
 
-# Env precedence (later wins): bundled → MDM → per-user.
-[ -r "${PLUGIN_ROOT}/env" ] && . "${PLUGIN_ROOT}/env"
-[ -r /etc/rogue/env ]       && . /etc/rogue/env
-[ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
+# Env precedence (later wins): bundled → MDM → per-user. Every default derived
+# from the environment is computed HERE, after the sourcing, because a user's
+# `~/.rogue-env` must be able to set any of them — computing them at file scope
+# would freeze the built-in default before the file that overrides it is read.
+load_env() {
+  [ -r "${PLUGIN_ROOT}/env" ] && . "${PLUGIN_ROOT}/env"
+  [ -r /etc/rogue/env ]       && . /etc/rogue/env
+  [ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
 
-ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+  ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+  # IDE store reads: off entirely with 0, read-but-never-attach with `log`.
+  DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
+  MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"
+  BRAIN_DIR="${ROGUE_ANTIGRAVITY_BRAIN_DIR:-$HOME/.gemini/antigravity-cli/brain}"
+  SUBMAP_DIR="${ROGUE_ANTIGRAVITY_SUBMAP_DIR:-$HOME/.rogue/antigravity-submap}"
+  # Trim a trailing slash so a user-set ROGUE_BASE_URL with one doesn't yield
+  # "//" in the composed URL (mirrors hook.ps1's .TrimEnd('/')).
+  ROGUE_BASE_URL="${ROGUE_BASE_URL%/}"
+  URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/antigravity}"
+}
+
 log() {
   mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
   printf '%s provider=antigravity event=%s %s\n' \
@@ -191,10 +226,10 @@ augment_with_transcript() {
 # append it for the backend to evaluate. IDE only — the 2.0 app and the CLI write
 # the transcript live, so their existing tail already carries the prompt.
 #
-# Off by default for anything but the IDE, and killable without a reinstall:
+# Off by default for anything but the IDE, and killable without a reinstall
+# (`DB_PROMPT_MODE`, set in load_env):
 #   ROGUE_ANTIGRAVITY_DB_PROMPT=0    never read
 #   ROGUE_ANTIGRAVITY_DB_PROMPT=log  read and log, never attach
-DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
 
 # Absolute path of a runtime that can load node:sqlite, or empty. The resolver
 # caches its answer (including "none"), so the steady-state cost is one file read.
@@ -215,10 +250,9 @@ resolve_js_runtime() {
 # exactly the missing halves from the transcript. No marker means delivered, which
 # keeps the behaviour identical for an older backend that ignores these fields.
 #
-# Markers are per conversation and consumed at `Stop`. A crash before `Stop` leaves
-# one behind and costs the NEXT turn a duplicated message rather than a lost one —
-# the safe direction.
-MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"
+# Markers are per conversation (under `MISS_DIR`, set in load_env) and consumed at
+# `Stop`. A crash before `Stop` leaves one behind and costs the NEXT turn a
+# duplicated message rather than a lost one — the safe direction.
 
 # Conversation ids are UUIDs; anything else is filtered out rather than trusted,
 # because this value becomes a path component.
@@ -377,11 +411,8 @@ augment_from_store() {
 # conversation, ~25ms.
 #
 # Fail-open: unresolved → body untouched (today's orphaned behaviour, never
-# worse).
-SUBAGENT_ID=""
-SUBAGENT_NAME=""
-BRAIN_DIR="${ROGUE_ANTIGRAVITY_BRAIN_DIR:-$HOME/.gemini/antigravity-cli/brain}"
-SUBMAP_DIR="${ROGUE_ANTIGRAVITY_SUBMAP_DIR:-$HOME/.rogue/antigravity-submap}"
+# worse). `SUBAGENT_ID` / `SUBAGENT_NAME` are the globals this writes for the POST
+# headers; `BRAIN_DIR` / `SUBMAP_DIR` are set in load_env.
 
 # The brain dir holding this event's own transcript — which is also where its
 # PARENT conversation lives, since a subagent runs on the surface that spawned
@@ -517,25 +548,30 @@ reattribute_subagent() {
   log "subagent=$_cid parent=$_parent name=$(sanitize "$SUBAGENT_NAME")"
 }
 
+# ── main's steps ───────────────────────────────────────────────────────────
+
 # Not configured: never POST without a key. Emit the per-event fail-open
-# default so PreToolUse still resolves to an explicit allow decision.
-if [ -z "${ROGUE_API_KEY:-}" ]; then
+# default so PreToolUse still resolves to an explicit allow decision. Exits the
+# script, deliberately BEFORE stdin is read: there is nothing to do with it.
+require_api_key() {
+  [ -n "${ROGUE_API_KEY:-}" ] && return 0
   log "outcome=unconfigured"
   fail_open_default
   exit 0
-fi
+}
 
-[ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
-
-# Trim a trailing slash so a user-set ROGUE_BASE_URL with one doesn't yield
-# "//" in the composed URL (mirrors hook.ps1's .TrimEnd('/')).
-ROGUE_BASE_URL="${ROGUE_BASE_URL%/}"
-
-URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/antigravity}"
+# ROGUE_ACTOR_EMAIL / ROGUE_ACTOR_NAME, resolved by the shared cascade
+# (env → git config --global → hostname/whoami).
+load_actor() {
+  [ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
+  return 0
+}
 
 # Buffer stdin so we can enrich it (PreInvocation/PostInvocation/Stop) before
 # POSTing.
-BODY="$(cat)"
+read_body() {
+  BODY="$(cat)"
+}
 
 # Heartbeat on the first invocation of a session (invocationNum == 0). Fire
 # detached so the hook itself returns immediately regardless of heartbeat.sh's
@@ -547,18 +583,14 @@ BODY="$(cat)"
 # surfaceFromTranscript). heartbeat.sh alone can only guess from the filesystem,
 # and on a machine with more than one installed it guesses wrong — collapsing
 # every surface into one roster row.
-if [ "$EVENT" = "PreInvocation" ]; then
+maybe_heartbeat() {
+  [ "$EVENT" = "PreInvocation" ] || return 0
   case "$BODY" in
     *'"invocationNum":0'*|*'"invocationNum": 0'*)
       _hb_agent=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
       ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$_hb_agent" >/dev/null 2>&1 & ) ;;
   esac
-fi
-
-# Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON
-# object by hand, so mutating conversationId afterwards would have to skip past
-# the appended base64 blob.
-reattribute_subagent
+}
 
 # Enrichment is per surface, because the surfaces differ in WHEN the transcript
 # exists:
@@ -569,27 +601,29 @@ reattribute_subagent
 #     the current one cannot work (measured: the file appears ~4s later, at Stop),
 #     so the wait was pure latency on the event that blocks the developer. The
 #     prompt comes from the conversation store instead.
-_surface=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
-if [ "$_surface" = "antigravity_ide" ]; then
-  case "$EVENT" in
-    # The pending prompt, before the model call that would consume it.
-    PreInvocation)  BODY="$(augment_from_store prompt rogueDbPromptB64 "$BODY")" ;;
-    # What the finished invocation produced — its prose and, crucially, the tool
-    # results the NEXT model call would read. This event owns `terminate`, so it is
-    # the last point at which untrusted tool output can be stopped before the model
-    # sees it (the transcript does not have it until the following boundary).
-    PostInvocation) BODY="$(augment_from_store steps rogueDbStepsB64 "$BODY")" ;;
-    # Kept as the fallback source for machines that cannot read the store; when the
-    # capability flag is set the backend ignores it, because everything already
-    # arrived from the store at the two events above.
-    Stop)           BODY="$(augment_with_transcript "$BODY")"
-                    BODY="$(mark_db_prompt_capable "$BODY")" ;;
-  esac
-else
-  case "$EVENT" in
-    PreInvocation|PostInvocation|Stop) BODY="$(augment_with_transcript "$BODY")" ;;
-  esac
-fi
+enrich_body() {
+  _surface=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  if [ "$_surface" = "antigravity_ide" ]; then
+    case "$EVENT" in
+      # The pending prompt, before the model call that would consume it.
+      PreInvocation)  BODY="$(augment_from_store prompt rogueDbPromptB64 "$BODY")" ;;
+      # What the finished invocation produced — its prose and, crucially, the tool
+      # results the NEXT model call would read. This event owns `terminate`, so it is
+      # the last point at which untrusted tool output can be stopped before the model
+      # sees it (the transcript does not have it until the following boundary).
+      PostInvocation) BODY="$(augment_from_store steps rogueDbStepsB64 "$BODY")" ;;
+      # Kept as the fallback source for machines that cannot read the store; when the
+      # capability flag is set the backend ignores it, because everything already
+      # arrived from the store at the two events above.
+      Stop)           BODY="$(augment_with_transcript "$BODY")"
+                      BODY="$(mark_db_prompt_capable "$BODY")" ;;
+    esac
+  else
+    case "$EVENT" in
+      PreInvocation|PostInvocation|Stop) BODY="$(augment_with_transcript "$BODY")" ;;
+    esac
+  fi
+}
 
 # Capture body + HTTP status. -w appends a final line "<code>"; on any
 # transport failure curl exits non-zero and the code is 000. Relay the body
@@ -603,39 +637,70 @@ fi
 # The name is base64 so an arbitrary subagent `Role` — accents, emoji — cannot
 # produce an invalid header value; the id is a bare UUID and needs no encoding.
 # Both are omitted entirely, never sent empty, on main-agent events. Passed via a
-# positional set so the curl call below stays a single expression.
-set --
-if [ -n "$SUBAGENT_ID" ]; then
-  set -- -H "x-rogue-agent-id: $SUBAGENT_ID"
-  if [ -n "$SUBAGENT_NAME" ]; then
-    _agent_name_b64=$(printf '%s' "$SUBAGENT_NAME" | base64 2>/dev/null | tr -d '\r\n')
-    [ -n "$_agent_name_b64" ] && set -- "$@" -H "x-rogue-agent-name-b64: $_agent_name_b64"
+# positional set — the function's own, not the script's — so the curl call stays a
+# single expression.
+post_and_relay() {
+  set --
+  if [ -n "$SUBAGENT_ID" ]; then
+    set -- -H "x-rogue-agent-id: $SUBAGENT_ID"
+    if [ -n "$SUBAGENT_NAME" ]; then
+      _agent_name_b64=$(printf '%s' "$SUBAGENT_NAME" | base64 2>/dev/null | tr -d '\r\n')
+      [ -n "$_agent_name_b64" ] && set -- "$@" -H "x-rogue-agent-name-b64: $_agent_name_b64"
+    fi
   fi
-fi
 
-RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
-  -H "x-rogue-api-key: $ROGUE_API_KEY" \
-  -H "x-rogue-event: $EVENT" \
-  -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
-  -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
-  "$@" \
-  -H 'Content-Type: application/json' \
-  --data-binary @- --max-time 15 -w '\n%{http_code}')
-RC=$?
-CODE=$(printf '%s' "$RAW" | tail -n1)
-RESP_BODY=$(printf '%s' "$RAW" | sed '$d')
+  _raw=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
+    -H "x-rogue-api-key: $ROGUE_API_KEY" \
+    -H "x-rogue-event: $EVENT" \
+    -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
+    -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+    "$@" \
+    -H 'Content-Type: application/json' \
+    --data-binary @- --max-time 15 -w '\n%{http_code}')
+  _rc=$?
+  _code=$(printf '%s' "$_raw" | tail -n1)
+  _resp=$(printf '%s' "$_raw" | sed '$d')
 
-log "http=$CODE rc=$RC raw=$(sanitize "$RESP_BODY" | head -c 400)"
+  log "http=$_code rc=$_rc raw=$(sanitize "$_resp" | head -c 400)"
 
-# Fail-open on transport error, any non-200, or an empty body: emit the
-# per-event default rather than relaying garbage as a decision.
-if [ "$RC" -ne 0 ] || [ "$CODE" != "200" ] || [ -z "$RESP_BODY" ]; then
-  log "outcome=allow http=$CODE rc=$RC"
-  fail_open_default
+  # Fail-open on transport error, any non-200, or an empty body: emit the
+  # per-event default rather than relaying garbage as a decision.
+  if [ "$_rc" -ne 0 ] || [ "$_code" != "200" ] || [ -z "$_resp" ]; then
+    log "outcome=allow http=$_code rc=$_rc"
+    fail_open_default
+    return 0
+  fi
+
+  # rogue-api already returns the correct native Antigravity shape; relay it
+  # verbatim.
+  printf '%s' "$_resp"
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+# The whole hook, in the order the steps must happen. Every step is fail-open on
+# its own; the two that can end the run early (`stand_down_under_git_bash`,
+# `require_api_key`) exit 0 with the right stdout for their case.
+main() {
+  EVENT="$1"
+
+  stand_down_under_git_bash
+  locate_plugin_root
+  load_env               # sources the env files, then every default derived from them
+  require_api_key        # exits before stdin is read when there is no key
+  load_actor
+  read_body
+
+  maybe_heartbeat
+  # Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON
+  # object by hand, so mutating conversationId afterwards would have to skip past
+  # the appended base64 blob.
+  reattribute_subagent
+  enrich_body
+
+  post_and_relay
+  # This script MUST always exit 0: a block is carried in the relayed JSON body
+  # on stdout, never in the exit code.
   exit 0
-fi
+}
 
-# rogue-api already returns the correct native Antigravity shape; relay it
-# verbatim.
-printf '%s' "$RESP_BODY"
-exit 0
+main "$@"
