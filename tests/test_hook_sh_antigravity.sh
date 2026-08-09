@@ -558,6 +558,13 @@ field_present() { posted | python3 -c "import json,sys; print('$1' in json.load(
 
 # A runtime with node:sqlite is required for the positive cases. Absent (CI, or a
 # machine with no Antigravity), the negative cases still run.
+#
+# The probe MUST NOT touch the developer's real cache: resolve-runtime.sh writes
+# its verdict to ${ROGUE_ANTIGRAVITY_RUNTIME_CACHE:-$HOME/.rogue/antigravity-runtime},
+# and a `none` sentinel written from here would disable the IDE prompt gate in
+# that user's own Antigravity sessions until they deleted the file.
+ROGUE_ANTIGRAVITY_RUNTIME_CACHE="$DBT/runtime-cache"
+export ROGUE_ANTIGRAVITY_RUNTIME_CACHE
 RUNTIME=$(sh "$REPO/plugins/antigravity/scripts/resolve-runtime.sh" "$IDE_STATE" 2>/dev/null || true)
 if [ -z "$RUNTIME" ] && [ -d "$HOME/.gemini/antigravity-ide" ]; then
   RUNTIME=$(sh "$REPO/plugins/antigravity/scripts/resolve-runtime.sh" "$HOME/.gemini/antigravity-ide" 2>/dev/null || true)

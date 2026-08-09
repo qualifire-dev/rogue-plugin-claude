@@ -89,6 +89,8 @@ Report from the JSON response (HTTP 200 = connected): organization name, running
 
 - macOS / Linux:
 ```bash
+PLUGIN_ENV=$(find "$HOME/.gemini" -maxdepth 5 -type f -name env -path '*rogue*' 2>/dev/null | head -1)
+[ -n "$PLUGIN_ENV" ] && [ -r "$PLUGIN_ENV" ] && . "$PLUGIN_ENV"
 [ -r /etc/rogue/env ]     && . /etc/rogue/env
 [ -r "$HOME/.rogue-env" ] && . "$HOME/.rogue-env"
 curl -s -H "x-rogue-api-key: $ROGUE_API_KEY" \

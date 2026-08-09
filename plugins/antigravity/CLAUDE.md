@@ -77,10 +77,9 @@ then by event name. The two event kinds take **different array shapes**:
 
   The parse error is **fatal for the whole file** — all five events go dead and
   nothing is monitored, while the CLI keeps running normally. This bit us during
-  CLI testing; that is why the flat form is now used. `tests/test_hooks_json_antigravity.sh`
-  still asserts the old nested form for all five events and therefore **fails
-  today** — fix the test to expect flat handlers for the three matcher-less
-  events when you touch it.
+  CLI testing; that is why the flat form is now used.
+  `tests/test_hooks_json_antigravity.sh` asserts the flat form for the three
+  matcher-less events and passes — keep it that way if you touch the shape.
 
 - A handler is `{ "type": "command", "command": "…", "timeout": 30 }`. `timeout`
   is in **seconds** (default 30 if omitted); the dispatchers' own HTTP timeout is
@@ -142,6 +141,12 @@ injected step can't be used as a marker either.
 This shipped as a real bug: a flagged prompt returned an `ephemeralMessage`, so
 it produced **no enforcement at all** — neither the model nor the user ever saw
 it, even though the finding was recorded and the UI showed it blocked.
+
+One exception, on the backend side: for `antigravity_ide` `PreInvocation` the
+formatter injects the undocumented fourth arm, `systemMessage`, because on IDE
+2.1.1 `userMessage` gets talked past while `systemMessage` actually makes the
+model refuse (see `blockSystemMessage` in `antigravity-hook-formatter.ts`). 2.0
+and the CLI still use `userMessage`. `ephemeralMessage` remains never-use.
 
 ### What a flagged *prompt* can and cannot do
 
@@ -267,7 +272,8 @@ invocation have run but **before the next model call that would consume them**,
 and its window already covers those rows. `terminationBehavior: "terminate"`
 there halts the loop — verified live: with it forced on, the transcript ends at
 the tool-result row and no further model turn exists. The formatter pairs it with
-an `injectSteps` `ephemeralMessage` so the stop carries the reason.
+an `injectSteps` `userMessage` so the stop carries the reason — never
+`ephemeralMessage`, which is a silent no-op (see the section above).
 
 Consequences to keep in mind:
 

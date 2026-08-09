@@ -245,28 +245,37 @@ function decodeStep(row) {
   };
 }
 
-// ── dedup: one high-water mark per conversation ─────────────────────────────
-// Step indices only grow, so a single "last emitted idx" both stops a tool-loop
-// turn re-sending what it already sent and makes it impossible to read back our
-// own injected block message. An unreadable cache is treated as "already sent" —
-// never risk a duplicate.
-function cacheFile(conversationId) {
-  return join(CACHE_DIR, conversationId.replace(/[^A-Za-z0-9._-]/g, "_"));
+// ── dedup: one high-water mark per conversation PER MODE ────────────────────
+// Step indices only grow, so a "last emitted idx" stops a tool-loop turn
+// re-sending what it already sent. An unreadable cache is treated as "already
+// sent" — never risk a duplicate. (Reading back our OWN injected block message
+// is prevented by the OWN_INJECTION_PREFIX skip below, not by this mark, so
+// splitting the mark per mode cannot reopen that loop.)
+//
+// The mark is keyed by mode. The two modes scan the same `steps` table from
+// opposite ends — `prompt` takes the newest USER_INPUT below the current step,
+// `steps` sweeps forward over everything the invocation produced — so a shared
+// mark let `steps` advance past a USER_INPUT that `prompt` had not read yet.
+// The next `prompt` read then found nothing, exited 0 ("nothing new"), wrote no
+// missed marker, and `Stop` suppressed the transcript fallback: the prompt was
+// dropped entirely, unevaluated.
+function cacheFile(conversationId, mode) {
+  return join(CACHE_DIR, `${conversationId.replace(/[^A-Za-z0-9._-]/g, "_")}.${mode}`);
 }
 
-function highWater(conversationId) {
+function highWater(conversationId, mode) {
   try {
-    const idx = Number.parseInt(readFileSync(cacheFile(conversationId), "utf8").trim(), 10);
+    const idx = Number.parseInt(readFileSync(cacheFile(conversationId, mode), "utf8").trim(), 10);
     return Number.isFinite(idx) ? idx : Infinity;
   } catch (err) {
     return err && err.code === "ENOENT" ? -1 : Infinity;
   }
 }
 
-function setHighWater(conversationId, idx) {
+function setHighWater(conversationId, mode, idx) {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
-    writeFileSync(cacheFile(conversationId), `${idx}\n`);
+    writeFileSync(cacheFile(conversationId, mode), `${idx}\n`);
     return true;
   } catch {
     return false;
@@ -317,7 +326,7 @@ function main() {
   // content we cannot see, not an empty turn.
   if (!existsSync(dbPath)) return EXIT_UNREAD;
 
-  const already = highWater(conversationId);
+  const already = highWater(conversationId, mode);
   let db;
   let rows = [];
   let userVersion = -1;
@@ -384,7 +393,7 @@ function main() {
   // content but are not delivering it, so the turn is NOT accounted for.
   if (performance.now() - started > DEADLINE_MS) return EXIT_UNREAD;
   const maxIdx = Math.max(...steps.map((s) => s.idx));
-  if (!setHighWater(conversationId, maxIdx)) return EXIT_UNREAD;
+  if (!setHighWater(conversationId, mode, maxIdx)) return EXIT_UNREAD;
 
   const common = {
     v: 1,

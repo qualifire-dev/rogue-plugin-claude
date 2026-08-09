@@ -15,7 +15,7 @@ a flagged model turn is terminated at `PostInvocation`.
 | `PostToolUse` | ✅ | — | tool/shell/MCP results |
 | `PreInvocation` | ✅ | — | the user prompt / model invocation |
 | `PostInvocation` | ✅ | ✅ | the model's turn — terminates it if flagged |
-| `Stop` | ✅ | — | end of session |
+| `Stop` | ✅ | — | end of an agent run (payload carries `executionNum`; can fire more than once per session) |
 
 ## Design
 
@@ -51,7 +51,7 @@ Antigravity IDE reads its plugins from), and — when the `agy` CLI is present �
 also registers it via:
 
 ```bash
-agy plugin install rogue
+agy plugin install ~/.gemini/config/plugins/rogue
 ```
 
 Then, inside Antigravity (IDE or `agy` CLI):

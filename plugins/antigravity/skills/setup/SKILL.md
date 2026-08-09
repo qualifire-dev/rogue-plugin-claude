@@ -54,8 +54,12 @@ sh "./scripts/setup.sh" "$ROGUE_API_KEY" "<EMAIL>" "<NAME>"
 ```
 - Windows (PowerShell):
 ```powershell
-powershell -NoProfile -File "./scripts/setup.ps1" "<API_KEY>" "<EMAIL>" "<NAME>"
+powershell -NoProfile -File "./scripts/setup.ps1" $ROGUE_API_KEY "<EMAIL>" "<NAME>"
 ```
+
+Pass the key by variable (`$ROGUE_API_KEY`, captured in Step 3), never as a
+literal — a literal lands in PSReadLine history and in the child process's
+command line, where any local process can read it.
 
 This writes `~/.rogue-env` (mode 600) on macOS/Linux, or `%USERPROFILE%\.rogue-env` (restricted to your user) on Windows. Hooks read this file at runtime — no shell profile changes needed. The file is shared with the other Rogue plugins (Claude Code, Codex, Cursor, Gemini CLI).
 

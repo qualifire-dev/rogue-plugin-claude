@@ -306,7 +306,13 @@ augment_from_store() {
   _out=$(printf '%s' "$_body" | ELECTRON_RUN_AS_NODE=1 "$_rt" --no-warnings \
     --experimental-sqlite "${PLUGIN_ROOT}/scripts/db-prompt.mjs" "$_mode" 2>/dev/null &
     _pid=$!
-    ( sleep 1; kill -9 "$_pid" 2>/dev/null ) 2>/dev/null &
+    # `>/dev/null` is load-bearing, not tidiness: the watchdog inherits this
+    # command substitution's stdout, and `$(...)` only returns at EOF on that
+    # pipe. `kill "$_watch"` signals the subshell, not the `sleep` it forked, so
+    # under bash-as-/bin/sh the orphaned `sleep` holds the write end open and
+    # EVERY store read — including a 20ms one — blocks for the full second,
+    # against the reader's own 150ms deadline. dash happens not to show it.
+    ( sleep 1; kill -9 "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
     _watch=$!
     wait "$_pid" 2>/dev/null
     _rc=$?
@@ -465,6 +471,16 @@ resolve_subagent_parent() {
 reattribute_subagent() {
   _cid=$(json_field conversationId "$BODY")
   [ -n "$_cid" ] || return
+  # Vendor-supplied text that becomes BOTH a path component and part of a `sed`
+  # s/// expression below. Antigravity ids are UUIDs, so anything else is not an
+  # id we can act on: a `/` would terminate the sed expression (stderr noise,
+  # which Antigravity logs at E level for every event, and a silently skipped
+  # rewrite that orphans the subagent), and `..` would escape SUBMAP_DIR. Same
+  # allowlist the Copilot plugin applies to its tool-call ids; bail rather than
+  # sanitize, since a mangled id must not alias another conversation's cache.
+  case "$_cid" in
+    *[!0-9A-Za-z_-]*) log "subagent=skip reason=bad-id"; return ;;
+  esac
 
   # Search the surface's own brain dir; an explicit override still wins.
   if [ -z "${ROGUE_ANTIGRAVITY_BRAIN_DIR:-}" ]; then
@@ -488,6 +504,11 @@ reattribute_subagent() {
   _parent=$(printf '%s' "$_map" | sed -n '1p')
   SUBAGENT_NAME=$(printf '%s' "$_map" | sed -n '2p')
   [ -n "$_parent" ] || return
+  # It lands in the sed REPLACEMENT, where `/` and `&` are equally special.
+  # It is a brain-dir name so it should already be a UUID; bail if it is not.
+  case "$_parent" in
+    *[!0-9A-Za-z_-]*) log "subagent=skip reason=bad-parent"; return ;;
+  esac
   SUBAGENT_ID="$_cid"
   # Tolerate whitespace around the key/colon (a pretty-printed payload) and
   # normalize to compact form; a non-matching rewrite would leave the body

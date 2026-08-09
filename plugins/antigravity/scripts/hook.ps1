@@ -105,6 +105,20 @@ if (-not $PluginRoot) { try { $PluginRoot = (Get-Location).Path } catch { $Plugi
 $logFile = $env:ROGUE_LOG_FILE
 if (-not $logFile) { $logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log' }
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+
+# Append raw JSON text ($Fields, each piece leading with its own comma) to an
+# object body. Strips exactly ONE trailing '}' — mirrors hook.sh's "${_body%\}}".
+# String.TrimEnd('}') strips ALL trailing braces, so a body whose last value is
+# itself an object ({"toolArgs":{"command":"x"}}) came back unbalanced and the
+# backend dropped the whole event. Never re-serialize (no ConvertTo-Json): the
+# payload is relayed as received apart from these appends.
+function Add-JsonFields {
+    param([string]$Json, [string]$Fields)
+    $p = $Json.TrimEnd()
+    if ($p.EndsWith('}')) { $p = $p.Substring(0, $p.Length - 1) }
+    return $p + $Fields + '}'
+}
+
 function Log {
     param([string]$Msg)
     try {
@@ -180,6 +194,21 @@ function Get-AntigravitySurface {
     if ($p -like '*/antigravity-ide/*') { return 'antigravity_ide' }
     if ($p -like '*/antigravity/*')     { return 'antigravity' }
     return ''
+}
+
+# The payload's transcriptPath, JSON-unescaped and folded to forward slashes.
+#
+# Everything downstream keys off this ONE form. On Windows the raw payload holds
+# `C:\\Users\\…\\antigravity-ide\\brain\\…`, so a test against the raw JSON for
+# '/antigravity-ide/' can NEVER match and every Windows IDE session silently
+# loses store recovery, Stop-only tail selection, and the capability flag. The
+# same fold is what makes `-split '/brain/'` work there. Forward slashes are
+# fine for Test-Path / Join-Path on Windows.
+function Get-PayloadTranscriptPath {
+    param([string]$Json)
+    $m = [regex]::Match($Json, '"transcriptPath"\s*:\s*"([^"]*)"')
+    if (-not $m.Success) { return '' }
+    return $m.Groups[1].Value.Replace('\/', '/').Replace('\\', '\').Replace('\', '/')
 }
 
 # Heartbeat on the first invocation of a session (invocationNum == 0). Fire
@@ -485,12 +514,10 @@ function Clear-StoreMiss {
 
 function Add-StoreRead {
     param([string]$Mode, [string]$Field)
-    if ($payload -notmatch '/antigravity-ide/') { return }
+    if (-not $isIdeSurface) { return }
     if ($env:ROGUE_ANTIGRAVITY_DB_PROMPT -eq '0') { return }
     try {
-        $tpm = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"')
-        $dbTp = $tpm.Groups[1].Value.Replace('\/', '/').Replace('\\', '\')
-        $runtime = Get-JsRuntime (($dbTp -split '/brain/')[0])
+        $runtime = Get-JsRuntime (($payloadTp -split '/brain/')[0])
         if (-not $runtime) { Log "dbstore=none mode=$Mode reason=no-runtime"; return }
 
         $reader = Join-Path (Join-Path $PluginRoot 'scripts') 'db-prompt.mjs'
@@ -501,13 +528,23 @@ function Add-StoreRead {
         $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
         $proc = [System.Diagnostics.Process]::Start($psi)
+        # Start draining BOTH pipes before waiting. The reader's base64 output
+        # routinely exceeds the pipe buffer (4-64 KB), and a child that fills it
+        # blocks on write and never exits — WaitForExit would time out, we would
+        # kill it, and a perfectly good read would be recorded as a miss, exactly
+        # on the large turns that matter most. stderr is drained for the same
+        # reason even though its content is discarded.
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        [void]$proc.StandardError.ReadToEndAsync()
         $proc.StandardInput.Write($payload); $proc.StandardInput.Close()
         $b64 = ''
         # The exit status is what separates "read it, nothing new" (0) from "could
         # not read it"; a timeout is the latter.
         $readOk = $false
         if ($proc.WaitForExit(1000)) {
-            $b64 = $proc.StandardOutput.ReadToEnd().Trim()
+            # The process is gone, so both pipes are at EOF and these are already
+            # complete — Result just unwraps them.
+            $b64 = $outTask.Result.Trim()
             $readOk = ($proc.ExitCode -eq 0)
         } else { try { $proc.Kill() } catch {} }
 
@@ -519,25 +556,30 @@ function Add-StoreRead {
                 # Read but deliberately not attached, so nothing was delivered:
                 # recording the miss keeps this mode observational.
                 Mark-StoreMiss $Mode
-                $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+                $script:payload = Add-JsonFields $payload ',"rogueDbPromptCapable":true'
             } else {
                 Log "dbstore=hit mode=$Mode len=$($b64.Length)"
                 # This half is delivered, so an earlier failure for it costs nothing.
                 Clear-StoreMiss $Mode
-                $script:payload = $payload.TrimEnd().TrimEnd('}') +
-                    ',"' + $Field + '":"' + $b64 + '","rogueDbPromptCapable":true}'
+                $script:payload = Add-JsonFields $payload `
+                    (',"' + $Field + '":"' + $b64 + '","rogueDbPromptCapable":true')
             }
         } elseif ($readOk -and -not $b64) {
             # Nothing new to send: the ordinary case on a turn's later invocations.
             Log "dbstore=miss mode=$Mode reason=nothing-new capable=1"
-            $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+            $script:payload = Add-JsonFields $payload ',"rogueDbPromptCapable":true'
         } else {
             Log "dbstore=fail mode=$Mode capable=1"
             Mark-StoreMiss $Mode
-            $script:payload = $payload.TrimEnd().TrimEnd('}') + ',"rogueDbPromptCapable":true}'
+            $script:payload = Add-JsonFields $payload ',"rogueDbPromptCapable":true'
         }
     } catch { Dbg "store read failed ($Mode): $($_.Exception.Message)" }
 }
+
+# Resolved once and shared by the three IDE-gated behaviors below (store read,
+# Stop-only tail, capability flag) so they can never disagree about the surface.
+$payloadTp = Get-PayloadTranscriptPath $payload
+$isIdeSurface = $payloadTp -like '*/antigravity-ide/*'
 
 if ($EventName -eq 'PreInvocation')  { Add-StoreRead 'prompt' 'rogueDbPromptB64' }
 if ($EventName -eq 'PostInvocation') { Add-StoreRead 'steps'  'rogueDbStepsB64' }
@@ -546,7 +588,7 @@ if ($EventName -eq 'PostInvocation') { Add-StoreRead 'steps'  'rogueDbStepsB64' 
 # live so all three events can tail it, but on the IDE only Stop can — at
 # Pre/PostInvocation the file holds at most the PREVIOUS turn, and waiting for the
 # current one cannot work (it appears ~4s later, at Stop). Mirrors hook.sh.
-$tailEvents = if ($payload -match '/antigravity-ide/') { @('Stop') }
+$tailEvents = if ($isIdeSurface) { @('Stop') }
               else { @('PreInvocation', 'PostInvocation', 'Stop') }
 if ($tailEvents -contains $EventName) {
     try {
@@ -577,13 +619,9 @@ if ($tailEvents -contains $EventName) {
                         }
                         if ($read -gt 0) {
                             $b64 = [Convert]::ToBase64String($buf, 0, $read)
-                            # Strip exactly ONE trailing '}' (mirrors hook.sh's
-                            # "${_body%\}}"). String.TrimEnd('}') would strip ALL
-                            # trailing braces and corrupt a body ending in "}}".
-                            $p = $payload.TrimEnd()
-                            if ($p.EndsWith('}')) { $p = $p.Substring(0, $p.Length - 1) }
                             if ($b64) {
-                                $payload = $p + ',"transcriptTailB64":"' + $b64 + '"}'
+                                $payload = Add-JsonFields $payload `
+                                    (',"transcriptTailB64":"' + $b64 + '"')
                                 Log "tail=$($b64.Length) path=$tp"
                             }
                         }
@@ -599,7 +637,7 @@ if ($tailEvents -contains $EventName) {
 # recorded at PreInvocation, so every user message lands twice. It also reports
 # whichever halves of the turn the store failed to deliver, so the backend rebuilds
 # exactly those from the tail. Mirrors hook.sh's mark_db_prompt_capable.
-if ($EventName -eq 'Stop' -and $payload -match '/antigravity-ide/' `
+if ($EventName -eq 'Stop' -and $isIdeSurface `
     -and $env:ROGUE_ANTIGRAVITY_DB_PROMPT -ne '0') {
     try {
         # Consume the markers whether or not a runtime still resolves, so a stale one
@@ -612,10 +650,9 @@ if ($EventName -eq 'Stop' -and $payload -match '/antigravity-ide/' `
             $field = if ($kind -eq 'prompt') { 'rogueDbPromptMissed' } else { 'rogueDbStepsMissed' }
             $missed += ',"' + $field + '":true'
         }
-        $stopTp = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value.Replace('\/', '/').Replace('\\', '\')
-        if (Get-JsRuntime (($stopTp -split '/brain/')[0])) {
+        if (Get-JsRuntime (($payloadTp -split '/brain/')[0])) {
             if ($missed) { Log "dbstore=stop missed=$($missed.TrimStart(','))" }
-            $payload = $payload.TrimEnd().TrimEnd('}') + $missed + ',"rogueDbPromptCapable":true}'
+            $payload = Add-JsonFields $payload ($missed + ',"rogueDbPromptCapable":true')
         }
     } catch { Dbg "capability flag failed: $($_.Exception.Message)" }
 }
