@@ -115,6 +115,133 @@ function Repair-DoubleEncodedUtf8 {
     return $Text
 }
 
+# ── SCA pre-image (preToolUse only) — lockstep with hook.sh ────────────────
+# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so a scan
+# of it cannot tell a dependency the agent just added from one that has been in
+# the manifest for a year. The file on disk still holds the PRE-edit content at
+# this point, so we attach it as `rogueFilePreImageB64` and the server subtracts
+# it, reporting only what the edit introduces.
+#
+# A NON-EXISTENT FILE YIELDS AN EMPTY PRE-IMAGE, AND THAT IS THE CREATE SIGNAL —
+# no Cursor payload field distinguishes a create from an overwrite.
+#
+# MULTI-HUNK EDITS NEED NO SPECIAL HANDLING: Cursor emits one full cycle PER
+# HUNK, so by hunk 2 the file on disk already contains hunk 1 and the pre-image
+# IS the correct per-hunk baseline. Never "fix" this into reading the whole
+# turn's pre-state.
+#
+# Fail-open in every branch. An OVER-CAP file sends NO pre-image rather than a
+# truncated one: a baseline cut at the cap is worse than none, because every
+# dependency past the cut vanishes from the old side and resurfaces as newly
+# introduced.
+$RogueFilePreImageMaxBytes = 262144
+
+# Only SCA consumes the pre-image, so read only what SCA parses. Mirrors
+# hook.sh's _is_manifest_path and classifyManifest() on the server.
+function Test-RogueManifestPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $base = ''
+    try { $base = [System.IO.Path]::GetFileName($Path).ToLowerInvariant() } catch { return $false }
+    $exact = @(
+        'package.json','composer.json','pyproject.toml','cargo.toml','go.mod','gemfile',
+        'pom.xml','build.gradle','build.gradle.kts','build.sbt','deps.edn',
+        'packages.config','paket.dependencies','pubspec.yaml','package.yaml',
+        'mix.exs','rebar.config'
+    )
+    if ($exact -contains $base) { return $true }
+    if ($base -like 'requirements*.txt') { return $true }
+    if ($base -like '*.csproj' -or $base -like '*.fsproj' -or $base -like '*.cabal') { return $true }
+    # Split-file layout: requirements/{base,dev,prod}.txt
+    if ($Path -match '[\\/]requirements[\\/][^\\/]*\.txt$') { return $true }
+    return $false
+}
+
+function Add-FilePreImage {
+    # Deliberately NOT ConvertTo-Json on the whole payload: a full parse +
+    # reserialize could alter the vendor's JSON in ways we don't control (and
+    # truncates below its default -Depth 2). Every failure path returns the body
+    # unchanged — we lose attribution, never the relay.
+    param([string]$Body)
+    try {
+        # First unescaped "file_path" key. A `"` inside a JSON string value is
+        # always backslash-escaped, so this cannot match a path that merely
+        # appears inside the file CONTENT the same payload carries.
+        $m = [regex]::Match($Body, '"file_path"\s*:\s*"([^"]*)"')
+        if (-not $m.Success) { return $Body }
+        # JSON-escaped backslashes in a Windows path are the norm, so unescape
+        # the two sequences a path can legitimately contain. hook.sh instead
+        # BAILS on a backslash: it only ever runs on POSIX, where such a path is
+        # pathological. The divergence is deliberate, not a lockstep slip.
+        $path = $m.Groups[1].Value.Replace('\\', '\').Replace('\/', '/')
+        # Rooted paths only: a relative path would resolve against the hook's
+        # cwd, and a wrongly-"missing" file reads as a CREATE, attributing every
+        # dependency in the manifest to this edit.
+        if ($path -notmatch '^([A-Za-z]:[\\/]|\\\\)') { return $Body }
+        if (-not (Test-RogueManifestPath $path)) { return $Body }
+
+        $b64 = ''
+        if (Test-Path -LiteralPath $path) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $Body }
+            # FileShare ReadWrite: the editor may still hold the file open.
+            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+            try {
+                $len = $fs.Length
+                if ($len -gt $RogueFilePreImageMaxBytes) {
+                    Dbg "pre-image $len B over cap -> sending none"
+                    return $Body
+                }
+                if ($len -gt 0) {
+                    $buf = New-Object byte[] ([int]$len)
+                    $read = $fs.Read($buf, 0, [int]$len)
+                    if ($read -le 0) { return $Body }
+                    $b64 = [Convert]::ToBase64String($buf, 0, $read)
+                }
+            } finally { $fs.Close() }
+        }
+        Dbg "pre-image attached for $path ($($b64.Length) b64 chars)"
+
+        # Same jq-or-string-concat duality as hook.sh: jq when it is on PATH,
+        # otherwise strip the trailing '}', append, re-close.
+        if (Get-Command jq -ErrorAction SilentlyContinue) {
+            # Pipe/read as UTF-8 explicitly: the default native-command encoding
+            # is the OEM code page on PS 5.1, which would mangle non-ASCII
+            # payload text on the round trip through jq — a silent corruption.
+            $prevOut = $OutputEncoding
+            $prevConsole = $null
+            try { $prevConsole = [Console]::OutputEncoding } catch {}
+            $out = ''
+            try {
+                $utf8 = New-Object System.Text.UTF8Encoding($false)
+                $OutputEncoding = $utf8
+                try { [Console]::OutputEncoding = $utf8 } catch {}
+                # $b64 is double-quoted so PowerShell passes it as one literal
+                # argument (base64 carries '+', '/' and '='); the jq filter is
+                # single-quoted so PS leaves its $b64 reference alone.
+                $out = ($Body | & jq -c --arg b64 "$b64" '. + {rogueFilePreImageB64:$b64}' 2>$null) -join ''
+            } finally {
+                $OutputEncoding = $prevOut
+                if ($prevConsole) { try { [Console]::OutputEncoding = $prevConsole } catch {} }
+            }
+            if ($out -and $out.StartsWith('{') -and $out.EndsWith('}')) { return $out }
+        }
+
+        # Trim trailing whitespace so the single-'}' strip lands on the real
+        # closing brace, then strip exactly ONE '}' (TrimEnd('}') would strip ALL
+        # of them and corrupt a body ending in "}}") — mirrors hook.sh.
+        $p = $Body.TrimEnd()
+        if (-not $p.EndsWith('}')) { return $Body }
+        $p = $p.Substring(0, $p.Length - 1)
+        # An empty object needs no separator ({} -> {"rogueFilePreImageB64":…}).
+        $sep = ','
+        if ($p -eq '{') { $sep = '' }
+        return $p + $sep + '"rogueFilePreImageB64":"' + $b64 + '"}'
+    } catch {
+        Dbg "pre-image failed: $($_.Exception.Message)"
+        return $Body
+    }
+}
+
 # Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
 # (e.g. ConvertFrom-ShellQuoted) without running the dispatcher. Production
 # never sets this, so the hook always runs its main body.
@@ -219,6 +346,11 @@ $payload = $payload.TrimStart([char]0xFEFF)
 # Repair Cursor's UTF-8 -> CP1252 -> UTF-8 double-encoding of assistant text,
 # which happens on clients with a non-UTF-8 Windows locale (out of our control).
 $payload = Repair-DoubleEncodedUtf8 $payload
+
+# SCA pre-image (see Add-FilePreImage) — the one place this dispatcher adds to
+# the vendor payload. It only ever appends a field; a failure leaves the body
+# byte-identical.
+if ($EventName -eq 'preToolUse') { $payload = Add-FilePreImage $payload }
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
 $headers = @{

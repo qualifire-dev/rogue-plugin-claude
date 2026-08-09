@@ -21,6 +21,8 @@
 #
 # Pass-through: read the Cursor event payload from stdin, POST it to the Rogue
 # AIDR backend, relay the server's response bytes verbatim. No client policy.
+# The ONE exception is the SCA pre-image (see `augment_with_pre_image`), which
+# adds a field the payload cannot express and never removes or rewrites one.
 #
 # Fail-open everywhere: missing API key, missing curl, network error, non-200,
 # empty body all yield `{}` on stdout, exit 0. Cursor
@@ -119,6 +121,115 @@ PAYLOAD="$(cat 2>/dev/null)"
 # invalid JSON and the API rejects it with HTTP 400. No-op when absent.
 _bom="$(printf '\357\273\277')"
 PAYLOAD="${PAYLOAD#"$_bom"}"
+
+# ── SCA pre-image (preToolUse only) ────────────────────────────────────────
+# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so a scan
+# of it cannot tell a dependency the agent just added from one that has been in
+# the manifest for a year — and blocking on the latter is a false positive on an
+# edit that introduced nothing. The file on disk still holds the PRE-edit content
+# at this point, so we attach it as `rogueFilePreImageB64`; the server subtracts
+# it and reports only what the edit introduces.
+#
+# A NON-EXISTENT FILE YIELDS AN EMPTY PRE-IMAGE, AND THAT IS THE CREATE SIGNAL.
+# No Cursor payload field distinguishes a create from an overwrite (`old_string`
+# is "" for both an insertion into an existing file and a create), so this is the
+# only mechanism that gets creates right. Do not add a separate `rogueFileExists`
+# flag: two mechanisms for one fact, at double the lockstep cost.
+#
+# MULTI-HUNK EDITS NEED NO SPECIAL HANDLING, and this is load-bearing: Cursor
+# emits one full preToolUse/afterFileEdit/postToolUse cycle PER HUNK, so by hunk
+# 2 the file on disk already contains hunk 1 and the pre-image IS the correct
+# per-hunk baseline. Never "fix" this into reading the whole turn's pre-state.
+#
+# Fail-open in every branch — a missing path, an unreadable file, a read error or
+# an over-cap file leaves the relayed body byte-identical. Note that an over-cap
+# file sends NO pre-image rather than a truncated one: a baseline cut at the cap
+# is WORSE than none, because every dependency past the cut vanishes from the old
+# side and resurfaces as newly introduced, producing spurious blocks on exactly
+# the large manifests most likely to hit the cap.
+PRE_IMAGE_MAX_BYTES=262144
+
+# Only SCA consumes the pre-image, so read only what SCA parses. Mirrors
+# classifyManifest() in packages/evaluation-core/src/lib/sca/parsers/manifest.ts.
+_is_manifest_path() {
+  _base=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')
+  case "$_base" in
+    package.json|composer.json|pyproject.toml|cargo.toml|go.mod|gemfile) return 0 ;;
+    pom.xml|build.gradle|build.gradle.kts|build.sbt|deps.edn) return 0 ;;
+    packages.config|paket.dependencies|pubspec.yaml|package.yaml) return 0 ;;
+    mix.exs|rebar.config) return 0 ;;
+    requirements*.txt|*.csproj|*.fsproj|*.cabal) return 0 ;;
+  esac
+  # Split-file layout: requirements/{base,dev,prod}.txt
+  case "$1" in */requirements/*.txt) return 0 ;; esac
+  return 1
+}
+
+# First unescaped "file_path" key in the body. A `"` inside a JSON string value
+# is always backslash-escaped, so this pattern cannot match a path that merely
+# appears inside the file CONTENT the same payload carries.
+_pre_image_target() {
+  printf '%s' "$1" \
+    | grep -o '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null \
+    | head -1 \
+    | sed -e 's/^"file_path"[[:space:]]*:[[:space:]]*"//' -e 's/"$//'
+}
+
+augment_with_pre_image() {
+  _body="$1"
+  _fp="$(_pre_image_target "$_body")"
+  # Absolute paths only. A relative path would resolve against the hook's cwd,
+  # and a wrongly-"missing" file reads as a CREATE — which would attribute every
+  # dependency in the manifest to this edit.
+  case "$_fp" in /*) : ;; *) printf '%s' "$_body"; return ;; esac
+  # A backslash means the JSON value carried an escape we are not unescaping.
+  # Deliberate divergence from hook.ps1, which DOES unescape `\\` and `\/`:
+  # this script only ever runs on POSIX, where a path needing either is
+  # pathological, while on Windows every path arrives escaped.
+  case "$_fp" in *\\*) printf '%s' "$_body"; return ;; esac
+  _is_manifest_path "$_fp" || { printf '%s' "$_body"; return; }
+
+  if [ -e "$_fp" ]; then
+    { [ -f "$_fp" ] && [ -r "$_fp" ]; } || { printf '%s' "$_body"; return; }
+    _sz=$(wc -c < "$_fp" 2>/dev/null | tr -d ' ')
+    case "$_sz" in ''|*[!0-9]*) printf '%s' "$_body"; return ;; esac
+    if [ "$_sz" -gt "$PRE_IMAGE_MAX_BYTES" ]; then
+      dbg "pre-image $_sz B over cap -> sending none"
+      printf '%s' "$_body"; return
+    fi
+    if [ "$_sz" -eq 0 ]; then
+      _b64=""
+    else
+      _b64=$(base64 < "$_fp" 2>/dev/null | tr -d '\r\n')
+      [ -n "$_b64" ] || { printf '%s' "$_body"; return; }
+    fi
+  else
+    _b64=""   # create
+  fi
+  dbg "pre-image attached for $_fp (${#_b64} b64 chars)"
+
+  # Same jq-or-string-concat duality as the Copilot dispatcher: jq when it is on
+  # PATH, otherwise strip the trailing `}`, append, re-close. base64 contains no
+  # JSON-special characters, so the concat is safe.
+  if command -v jq >/dev/null 2>&1; then
+    _out=$(printf '%s' "$_body" | jq -c --arg b64 "$_b64" \
+      '. + {rogueFilePreImageB64:$b64}' 2>/dev/null)
+    # Only trust a complete object back; anything else falls through to concat.
+    case "$_out" in '{'*'}') printf '%s' "$_out"; return ;; esac
+  fi
+  # Trim trailing whitespace so the single-'}' strip lands on the real closing
+  # brace (mirrors the Copilot dispatcher and hook.ps1's TrimEnd()).
+  _trimmed="${_body%"${_body##*[![:space:]]}"}"
+  case "$_trimmed" in *'}') : ;; *) printf '%s' "$_body"; return ;; esac
+  _pre="${_trimmed%\}}"
+  # An empty object needs no separator ({} -> {"rogueFilePreImageB64":…}).
+  if [ "$_pre" = "{" ]; then _sep=""; else _sep=","; fi
+  printf '%s%s"rogueFilePreImageB64":"%s"}' "$_pre" "$_sep" "$_b64"
+}
+
+if [ "$event" = "preToolUse" ]; then
+  PAYLOAD="$(augment_with_pre_image "$PAYLOAD")"
+fi
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
 command -v curl >/dev/null 2>&1 || { dbg "curl not found -> {}"; printf '{}'; exit 0; }
