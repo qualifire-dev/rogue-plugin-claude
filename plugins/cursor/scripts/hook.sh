@@ -21,7 +21,7 @@
 #
 # Pass-through: read the Cursor event payload from stdin, POST it to the Rogue
 # AIDR backend, relay the server's response bytes verbatim. No client policy.
-# The ONE exception is the SCA pre-image (see `augment_with_pre_image`), which
+# The ONE exception is the file pre-image (see `augment_with_pre_image`), which
 # adds a field the payload cannot express and never removes or rewrites one.
 #
 # Fail-open everywhere: missing API key, missing curl, network error, non-200,
@@ -122,13 +122,11 @@ PAYLOAD="$(cat 2>/dev/null)"
 _bom="$(printf '\357\273\277')"
 PAYLOAD="${PAYLOAD#"$_bom"}"
 
-# ── SCA pre-image (preToolUse only) ────────────────────────────────────────
-# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so a scan
-# of it cannot tell a dependency the agent just added from one that has been in
-# the manifest for a year — and blocking on the latter is a false positive on an
-# edit that introduced nothing. The file on disk still holds the PRE-edit content
-# at this point, so we attach it as `rogueFilePreImageB64`; the server subtracts
-# it and reports only what the edit introduces.
+# ── File pre-image (preToolUse only) ───────────────────────────────────────
+# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so the
+# payload alone cannot say which part of the file this edit is responsible for.
+# The file on disk still holds the PRE-edit content at this point, so we attach
+# it as `rogueFilePreImageB64` and the API can compare the two.
 #
 # A NON-EXISTENT FILE YIELDS AN EMPTY PRE-IMAGE, AND THAT IS THE CREATE SIGNAL.
 # No Cursor payload field distinguishes a create from an overwrite (`old_string`
@@ -143,14 +141,13 @@ PAYLOAD="${PAYLOAD#"$_bom"}"
 #
 # Fail-open in every branch — a missing path, an unreadable file, a read error or
 # an over-cap file leaves the relayed body byte-identical. Note that an over-cap
-# file sends NO pre-image rather than a truncated one: a baseline cut at the cap
-# is WORSE than none, because every dependency past the cut vanishes from the old
-# side and resurfaces as newly introduced, producing spurious blocks on exactly
-# the large manifests most likely to hit the cap.
+# file sends NO pre-image rather than a truncated one: a partial pre-image is
+# WORSE than none, because it misrepresents the file's pre-edit state instead of
+# admitting we don't know it.
 PRE_IMAGE_MAX_BYTES=262144
 
-# Only SCA consumes the pre-image, so read only what SCA parses. Mirrors
-# classifyManifest() in packages/evaluation-core/src/lib/sca/parsers/manifest.ts.
+# The pre-image is only useful for files whose contents are compared, so keep
+# the read narrow rather than shipping the bytes of every file the agent writes.
 _is_manifest_path() {
   _base=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')
   case "$_base" in
@@ -165,26 +162,45 @@ _is_manifest_path() {
   return 1
 }
 
-# First unescaped "file_path" key in the body. A `"` inside a JSON string value
-# is always backslash-escaped, so this pattern cannot match a path that merely
-# appears inside the file CONTENT the same payload carries.
-_pre_image_target() {
+# One JSON string field: jq when it is on PATH, the text scan only when it is
+# not. jq is preferred because it understands nesting and unescaping, both of
+# which the scan gets only by luck — `file_path` sits under `tool_input` on a
+# tool event, and the scan takes whichever copy appears first. The scan stays
+# safe for this narrow use because a `"` inside a JSON string value is always
+# backslash-escaped, so `"file_path":"…"` cannot match text that merely appears
+# inside the file CONTENT the same payload carries.
+#
+# $1 body, $2 jq filter, $3 key for the fallback scan.
+_json_string_field() {
+  _jsf_key="$3"
+  if command -v jq >/dev/null 2>&1; then
+    if _jsf_val=$(printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null); then
+      printf '%s' "$_jsf_val"
+      return
+    fi
+  fi
   printf '%s' "$1" \
-    | grep -o '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null \
+    | grep -o "\"$_jsf_key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null \
     | head -1 \
-    | sed -e 's/^"file_path"[[:space:]]*:[[:space:]]*"//' -e 's/"$//'
+    | sed -e "s/^\"$_jsf_key\"[[:space:]]*:[[:space:]]*\"//" -e 's/"$//'
 }
 
 augment_with_pre_image() {
   _body="$1"
-  _fp="$(_pre_image_target "$_body")"
+  # Only the file-writing tools have a file to pre-image. A preToolUse for
+  # Shell, Read, Grep or an MCP call carries no relevant path, and reading one
+  # off such a payload would be a wasted stat at best. `Edit` is listed
+  # defensively — Cursor has only ever been observed sending `Write`.
+  _tool="$(_json_string_field "$_body" '.tool_name' tool_name)"
+  case "$_tool" in Write|Edit) : ;; *) printf '%s' "$_body"; return ;; esac
+  _fp="$(_json_string_field "$_body" '.tool_input.file_path // .file_path' file_path)"
   # Absolute paths only. A relative path would resolve against the hook's cwd,
-  # and a wrongly-"missing" file reads as a CREATE — which would attribute every
-  # dependency in the manifest to this edit.
+  # and a wrongly-"missing" file reads as a CREATE — the one wrong answer that
+  # is worse than no answer, since it claims the whole file is new.
   case "$_fp" in /*) : ;; *) printf '%s' "$_body"; return ;; esac
-  # A backslash means the JSON value carried an escape we are not unescaping.
-  # Deliberate divergence from hook.ps1, which DOES unescape `\\` and `\/`:
-  # this script only ever runs on POSIX, where a path needing either is
+  # A backslash means the JSON value carried an escape the fallback scan did not
+  # unescape. Deliberate divergence from hook.ps1, which DOES unescape `\\` and
+  # `\/`: this script only ever runs on POSIX, where a path needing either is
   # pathological, while on Windows every path arrives escaped.
   case "$_fp" in *\\*) printf '%s' "$_body"; return ;; esac
   _is_manifest_path "$_fp" || { printf '%s' "$_body"; return; }

@@ -115,12 +115,11 @@ function Repair-DoubleEncodedUtf8 {
     return $Text
 }
 
-# ── SCA pre-image (preToolUse only) — lockstep with hook.sh ────────────────
-# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so a scan
-# of it cannot tell a dependency the agent just added from one that has been in
-# the manifest for a year. The file on disk still holds the PRE-edit content at
-# this point, so we attach it as `rogueFilePreImageB64` and the server subtracts
-# it, reporting only what the edit introduces.
+# ── File pre-image (preToolUse only) — lockstep with hook.sh ───────────────
+# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so the
+# payload alone cannot say which part of the file this edit is responsible for.
+# The file on disk still holds the PRE-edit content at this point, so we attach
+# it as `rogueFilePreImageB64` and the API can compare the two.
 #
 # A NON-EXISTENT FILE YIELDS AN EMPTY PRE-IMAGE, AND THAT IS THE CREATE SIGNAL —
 # no Cursor payload field distinguishes a create from an overwrite.
@@ -131,13 +130,13 @@ function Repair-DoubleEncodedUtf8 {
 # turn's pre-state.
 #
 # Fail-open in every branch. An OVER-CAP file sends NO pre-image rather than a
-# truncated one: a baseline cut at the cap is worse than none, because every
-# dependency past the cut vanishes from the old side and resurfaces as newly
-# introduced.
+# truncated one: a partial pre-image is worse than none, because it
+# misrepresents the file's pre-edit state instead of admitting we don't know it.
 $RogueFilePreImageMaxBytes = 262144
 
-# Only SCA consumes the pre-image, so read only what SCA parses. Mirrors
-# hook.sh's _is_manifest_path and classifyManifest() on the server.
+# The pre-image is only useful for files whose contents are compared, so keep
+# the read narrow rather than shipping the bytes of every file the agent writes.
+# Mirrors hook.sh's _is_manifest_path.
 function Test-RogueManifestPath {
     param([string]$Path)
     if (-not $Path) { return $false }
@@ -157,26 +156,72 @@ function Test-RogueManifestPath {
     return $false
 }
 
+# Run jq with UTF-8 on the wire in both directions. PS 5.1 defaults native
+# command encoding to the OEM code page, which silently mangles non-ASCII text
+# on the round trip. Returns $null when jq is absent or exits non-zero, which is
+# the caller's signal to use its own fallback.
+function Invoke-RogueJq {
+    param([string]$Body, [string[]]$JqArgs)
+    if (-not (Get-Command jq -ErrorAction SilentlyContinue)) { return $null }
+    $prevOut = $OutputEncoding
+    $prevConsole = $null
+    try { $prevConsole = [Console]::OutputEncoding } catch {}
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $OutputEncoding = $utf8
+        try { [Console]::OutputEncoding = $utf8 } catch {}
+        $out = ($Body | & jq @JqArgs 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return $out
+    } catch {
+        return $null
+    } finally {
+        $OutputEncoding = $prevOut
+        if ($prevConsole) { try { [Console]::OutputEncoding = $prevConsole } catch {} }
+    }
+}
+
+# One JSON string field: jq when it is on PATH, the regex only when it is not.
+# jq is preferred because it understands nesting and unescaping, both of which
+# the regex gets only by luck — `file_path` sits under `tool_input` on a tool
+# event, and the regex takes whichever copy appears first. The regex stays safe
+# for this narrow use because a `"` inside a JSON string value is always
+# backslash-escaped, so `"file_path":"…"` cannot match text that merely appears
+# inside the file CONTENT the same payload carries. Lockstep with hook.sh's
+# _json_string_field.
+function Get-RogueJsonStringField {
+    param([string]$Body, [string]$JqFilter, [string]$Key)
+    $viaJq = Invoke-RogueJq $Body @('-r', ($JqFilter + ' // empty'))
+    if ($null -ne $viaJq) { return $viaJq.Trim() }
+    $m = [regex]::Match($Body, '"' + [regex]::Escape($Key) + '"\s*:\s*"([^"]*)"')
+    if (-not $m.Success) { return '' }
+    # JSON-escaped backslashes in a Windows path are the norm, so unescape the
+    # two sequences a path can legitimately contain (jq has already done this on
+    # the other branch). hook.sh instead BAILS on a backslash: it only ever runs
+    # on POSIX, where such a path is pathological. The divergence is deliberate,
+    # not a lockstep slip.
+    return $m.Groups[1].Value.Replace('\\', '\').Replace('\/', '/')
+}
+
 function Add-FilePreImage {
     # Deliberately NOT ConvertTo-Json on the whole payload: a full parse +
     # reserialize could alter the vendor's JSON in ways we don't control (and
     # truncates below its default -Depth 2). Every failure path returns the body
-    # unchanged — we lose attribution, never the relay.
+    # unchanged — we lose the pre-image, never the relay.
     param([string]$Body)
     try {
-        # First unescaped "file_path" key. A `"` inside a JSON string value is
-        # always backslash-escaped, so this cannot match a path that merely
-        # appears inside the file CONTENT the same payload carries.
-        $m = [regex]::Match($Body, '"file_path"\s*:\s*"([^"]*)"')
-        if (-not $m.Success) { return $Body }
-        # JSON-escaped backslashes in a Windows path are the norm, so unescape
-        # the two sequences a path can legitimately contain. hook.sh instead
-        # BAILS on a backslash: it only ever runs on POSIX, where such a path is
-        # pathological. The divergence is deliberate, not a lockstep slip.
-        $path = $m.Groups[1].Value.Replace('\\', '\').Replace('\/', '/')
+        # Only the file-writing tools have a file to pre-image. A preToolUse for
+        # Shell, Read, Grep or an MCP call carries no relevant path. `Edit` is
+        # listed defensively — Cursor has only ever been observed sending
+        # `Write`.
+        $tool = Get-RogueJsonStringField $Body '.tool_name' 'tool_name'
+        if ($tool -ne 'Write' -and $tool -ne 'Edit') { return $Body }
+        $path = Get-RogueJsonStringField $Body '.tool_input.file_path // .file_path' 'file_path'
+        if (-not $path) { return $Body }
         # Rooted paths only: a relative path would resolve against the hook's
-        # cwd, and a wrongly-"missing" file reads as a CREATE, attributing every
-        # dependency in the manifest to this edit.
+        # cwd, and a wrongly-"missing" file reads as a CREATE — the one wrong
+        # answer that is worse than no answer, since it claims the whole file
+        # is new.
         if ($path -notmatch '^([A-Za-z]:[\\/]|\\\\)') { return $Body }
         if (-not (Test-RogueManifestPath $path)) { return $Body }
 
@@ -202,29 +247,12 @@ function Add-FilePreImage {
         Dbg "pre-image attached for $path ($($b64.Length) b64 chars)"
 
         # Same jq-or-string-concat duality as hook.sh: jq when it is on PATH,
-        # otherwise strip the trailing '}', append, re-close.
-        if (Get-Command jq -ErrorAction SilentlyContinue) {
-            # Pipe/read as UTF-8 explicitly: the default native-command encoding
-            # is the OEM code page on PS 5.1, which would mangle non-ASCII
-            # payload text on the round trip through jq — a silent corruption.
-            $prevOut = $OutputEncoding
-            $prevConsole = $null
-            try { $prevConsole = [Console]::OutputEncoding } catch {}
-            $out = ''
-            try {
-                $utf8 = New-Object System.Text.UTF8Encoding($false)
-                $OutputEncoding = $utf8
-                try { [Console]::OutputEncoding = $utf8 } catch {}
-                # $b64 is double-quoted so PowerShell passes it as one literal
-                # argument (base64 carries '+', '/' and '='); the jq filter is
-                # single-quoted so PS leaves its $b64 reference alone.
-                $out = ($Body | & jq -c --arg b64 "$b64" '. + {rogueFilePreImageB64:$b64}' 2>$null) -join ''
-            } finally {
-                $OutputEncoding = $prevOut
-                if ($prevConsole) { try { [Console]::OutputEncoding = $prevConsole } catch {} }
-            }
-            if ($out -and $out.StartsWith('{') -and $out.EndsWith('}')) { return $out }
-        }
+        # otherwise strip the trailing '}', append, re-close. `$b64` is passed
+        # as its own argument (base64 carries '+', '/' and '='); the jq filter
+        # is single-quoted so PS leaves its own $b64 reference alone.
+        $out = Invoke-RogueJq $Body @('-c', '--arg', 'b64', $b64, '. + {rogueFilePreImageB64:$b64}')
+        # Only trust a complete object back; anything else falls through.
+        if ($out -and $out.StartsWith('{') -and $out.EndsWith('}')) { return $out }
 
         # Trim trailing whitespace so the single-'}' strip lands on the real
         # closing brace, then strip exactly ONE '}' (TrimEnd('}') would strip ALL
@@ -347,7 +375,7 @@ $payload = $payload.TrimStart([char]0xFEFF)
 # which happens on clients with a non-UTF-8 Windows locale (out of our control).
 $payload = Repair-DoubleEncodedUtf8 $payload
 
-# SCA pre-image (see Add-FilePreImage) — the one place this dispatcher adds to
+# File pre-image (see Add-FilePreImage) — the one place this dispatcher adds to
 # the vendor payload. It only ever appends a field; a failure leaves the body
 # byte-identical.
 if ($EventName -eq 'preToolUse') { $payload = Add-FilePreImage $payload }
