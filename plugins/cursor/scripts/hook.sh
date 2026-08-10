@@ -146,19 +146,33 @@ PAYLOAD="${PAYLOAD#"$_bom"}"
 # admitting we don't know it.
 PRE_IMAGE_MAX_BYTES=262144
 
-# The pre-image is only useful for files whose contents are compared, so keep
-# the read narrow rather than shipping the bytes of every file the agent writes.
-_is_manifest_path() {
+# Every file the agent writes gets a pre-image, subject to the size cap above.
+# The extension list below is the one exclusion: base64 of a PNG or a zip is
+# pure payload with no text in it to compare, and binaries are also the files
+# most likely to be large. An UNKNOWN extension is treated as text — the cost of
+# shipping a binary we failed to recognize is bytes, while the cost of skipping
+# a text file is losing the comparison entirely.
+#
+# COST: for a file write this roughly doubles the request body, since the event
+# payload already carries the post-edit content. The size cap bounds the worst
+# case; nothing is sent for a file above it.
+_is_binary_path() {
   _base=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')
   case "$_base" in
-    package.json|composer.json|pyproject.toml|cargo.toml|go.mod|gemfile) return 0 ;;
-    pom.xml|build.gradle|build.gradle.kts|build.sbt|deps.edn) return 0 ;;
-    packages.config|paket.dependencies|pubspec.yaml|package.yaml) return 0 ;;
-    mix.exs|rebar.config) return 0 ;;
-    requirements*.txt|*.csproj|*.fsproj|*.cabal) return 0 ;;
+    # images
+    *.png|*.jpg|*.jpeg|*.gif|*.bmp|*.tif|*.tiff|*.ico|*.icns|*.webp|*.avif|*.heic|*.psd) return 0 ;;
+    # fonts
+    *.ttf|*.otf|*.woff|*.woff2|*.eot) return 0 ;;
+    # archives and packages
+    *.zip|*.tar|*.gz|*.tgz|*.bz2|*.xz|*.zst|*.7z|*.rar|*.jar|*.war|*.ear) return 0 ;;
+    *.whl|*.egg|*.nupkg|*.dmg|*.iso|*.pkg|*.deb|*.rpm) return 0 ;;
+    # audio and video
+    *.mp3|*.wav|*.flac|*.ogg|*.m4a|*.mp4|*.mov|*.avi|*.mkv|*.webm) return 0 ;;
+    # compiled artifacts
+    *.exe|*.dll|*.so|*.dylib|*.o|*.a|*.lib|*.obj|*.pdb|*.class|*.pyc|*.pyo|*.wasm|*.node|*.bin) return 0 ;;
+    # documents and databases
+    *.pdf|*.doc|*.docx|*.xls|*.xlsx|*.ppt|*.pptx|*.db|*.sqlite|*.sqlite3|*.mdb) return 0 ;;
   esac
-  # Split-file layout: requirements/{base,dev,prod}.txt
-  case "$1" in */requirements/*.txt) return 0 ;; esac
   return 1
 }
 
@@ -203,7 +217,7 @@ augment_with_pre_image() {
   # `\/`: this script only ever runs on POSIX, where a path needing either is
   # pathological, while on Windows every path arrives escaped.
   case "$_fp" in *\\*) printf '%s' "$_body"; return ;; esac
-  _is_manifest_path "$_fp" || { printf '%s' "$_body"; return; }
+  if _is_binary_path "$_fp"; then printf '%s' "$_body"; return; fi
 
   if [ -e "$_fp" ]; then
     { [ -f "$_fp" ] && [ -r "$_fp" ]; } || { printf '%s' "$_body"; return; }

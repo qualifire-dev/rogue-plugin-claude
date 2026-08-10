@@ -134,26 +134,41 @@ function Repair-DoubleEncodedUtf8 {
 # misrepresents the file's pre-edit state instead of admitting we don't know it.
 $RogueFilePreImageMaxBytes = 262144
 
-# The pre-image is only useful for files whose contents are compared, so keep
-# the read narrow rather than shipping the bytes of every file the agent writes.
-# Mirrors hook.sh's _is_manifest_path.
-function Test-RogueManifestPath {
+# Every file the agent writes gets a pre-image, subject to the size cap above.
+# The extension list below is the one exclusion: base64 of a PNG or a zip is
+# pure payload with no text in it to compare, and binaries are also the files
+# most likely to be large. An UNKNOWN extension is treated as text — the cost of
+# shipping a binary we failed to recognize is bytes, while the cost of skipping
+# a text file is losing the comparison entirely.
+#
+# COST: for a file write this roughly doubles the request body, since the event
+# payload already carries the post-edit content. The size cap bounds the worst
+# case; nothing is sent for a file above it.
+#
+# Mirrors hook.sh's _is_binary_path. GetExtension returns the LAST extension, so
+# `.tar.gz` matches on `.gz` exactly as the shell glob does.
+function Test-RogueBinaryPath {
     param([string]$Path)
     if (-not $Path) { return $false }
-    $base = ''
-    try { $base = [System.IO.Path]::GetFileName($Path).ToLowerInvariant() } catch { return $false }
-    $exact = @(
-        'package.json','composer.json','pyproject.toml','cargo.toml','go.mod','gemfile',
-        'pom.xml','build.gradle','build.gradle.kts','build.sbt','deps.edn',
-        'packages.config','paket.dependencies','pubspec.yaml','package.yaml',
-        'mix.exs','rebar.config'
+    $ext = ''
+    try { $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant() } catch { return $false }
+    if (-not $ext) { return $false }
+    $binary = @(
+        # images
+        '.png','.jpg','.jpeg','.gif','.bmp','.tif','.tiff','.ico','.icns','.webp','.avif','.heic','.psd',
+        # fonts
+        '.ttf','.otf','.woff','.woff2','.eot',
+        # archives and packages
+        '.zip','.tar','.gz','.tgz','.bz2','.xz','.zst','.7z','.rar','.jar','.war','.ear',
+        '.whl','.egg','.nupkg','.dmg','.iso','.pkg','.deb','.rpm',
+        # audio and video
+        '.mp3','.wav','.flac','.ogg','.m4a','.mp4','.mov','.avi','.mkv','.webm',
+        # compiled artifacts
+        '.exe','.dll','.so','.dylib','.o','.a','.lib','.obj','.pdb','.class','.pyc','.pyo','.wasm','.node','.bin',
+        # documents and databases
+        '.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.db','.sqlite','.sqlite3','.mdb'
     )
-    if ($exact -contains $base) { return $true }
-    if ($base -like 'requirements*.txt') { return $true }
-    if ($base -like '*.csproj' -or $base -like '*.fsproj' -or $base -like '*.cabal') { return $true }
-    # Split-file layout: requirements/{base,dev,prod}.txt
-    if ($Path -match '[\\/]requirements[\\/][^\\/]*\.txt$') { return $true }
-    return $false
+    return $binary -contains $ext
 }
 
 # Run jq with UTF-8 on the wire in both directions. PS 5.1 defaults native
@@ -223,7 +238,7 @@ function Add-FilePreImage {
         # answer that is worse than no answer, since it claims the whole file
         # is new.
         if ($path -notmatch '^([A-Za-z]:[\\/]|\\\\)') { return $Body }
-        if (-not (Test-RogueManifestPath $path)) { return $Body }
+        if (Test-RogueBinaryPath $path) { return $Body }
 
         $b64 = ''
         if (Test-Path -LiteralPath $path) {
