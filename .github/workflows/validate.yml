@@ -21,6 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned so the Gemini dispatcher is actually exercised: tests/test_hook_logs.sh
+      # SKIPS its gemini leg when `node` is missing, which would pass silently.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Validate JSON is well-formed
         run: |
           set -euo pipefail
@@ -109,4 +115,5 @@ jobs:
           set -euo pipefail
           pwsh -NoProfile -File tests/test_hook_ps1.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1
+          pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
           pwsh -NoProfile -File tests/test_hook_logs.ps1

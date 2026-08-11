@@ -121,7 +121,14 @@ try {
 } catch { "Status check failed: $($_.Exception.Message)" }
 "Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
 "Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
-Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\gemini.log" -ErrorAction SilentlyContinue
+$logPath = $creds['ROGUE_LOG_FILE']
+if (-not $logPath) {
+  $logDir = $creds['ROGUE_LOG_DIR']
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'gemini.log'
+}
+"Log: $logPath"
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
 
 Report the same fields as Step 2.

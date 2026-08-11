@@ -82,7 +82,20 @@ and so on. `<file>.1` is the previous rotation, if any.
 tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/codex.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
 
-On Windows, use `Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\codex.log"`.
+On Windows, resolve the same precedence before reading:
+
+```powershell
+$logPath = $env:ROGUE_LOG_FILE
+if (-not $logPath) {
+  $logDir = $env:ROGUE_LOG_DIR
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'codex.log'
+}
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
+```
+
+A `ROGUE_LOG_DIR` set in `~/.rogue-env` or `C:\ProgramData\rogue\env` also wins over
+the default — check those files if this shows no activity on a healthy connection.
 
 ## Step 5: Confirm hooks are trusted
 

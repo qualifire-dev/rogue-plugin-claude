@@ -45,7 +45,20 @@ echo "--- recent hook activity ---"
 tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/cursor.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
 
-On Windows, use `Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\cursor.log"`.
+On Windows, resolve the same precedence before reading:
+
+```powershell
+$logPath = $env:ROGUE_LOG_FILE
+if (-not $logPath) {
+  $logDir = $env:ROGUE_LOG_DIR
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'cursor.log'
+}
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
+```
+
+A `ROGUE_LOG_DIR` set in `~/.rogue-env` or `C:\ProgramData\rogue\env` also wins over
+the default — check those files if this shows no activity on a healthy connection.
 
 Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
 `cursor.log` only — a sibling agent's activity lives in `claude.log`,

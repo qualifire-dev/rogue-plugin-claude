@@ -39,21 +39,40 @@ function emit(obj) {
   process.exit(0);
 }
 
+// ── Resolved configuration ───────────────────────────────────────────────────
+// Read the env files ONCE, here at module load, because the log destination below
+// is derived from them. `loadEnvFiles()` returns a MERGED OBJECT and deliberately
+// does not mutate `process.env`, so reading `process.env.ROGUE_LOG_DIR` directly
+// would silently ignore `~/.rogue-env` / `/etc/rogue/env` — the exact bug this
+// replaced. Precedence inside the merge: bundled env → MDM → per-user, then
+// process env wins (see shared.mjs).
+// Wrapped: a throw here would kill the hook before it could emit anything, and
+// Gemini must always get a body. An empty env degrades to "unconfigured".
+let ENV = {};
+try {
+  ENV = loadEnvFiles();
+} catch {
+  /* fail-open: no credentials and no overrides */
+}
+
 // ── Logging (file only; stdout is reserved for Gemini) ───────────────────────
 // ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a machine running
 // Gemini CLI + Claude Code + Cursor + … used to interleave all of them into a
 // single hook.log with no way to tell whose line was whose. Precedence:
 // explicit file → directory override → per-agent default.
-const LOG_DIR = process.env.ROGUE_LOG_DIR || path.join(HOME, ".rogue", "logs");
-const LOG_FILE =
-  process.env.ROGUE_LOG_FILE || path.join(LOG_DIR, `${PROVIDER}.log`);
+const LOG_DIR = ENV.ROGUE_LOG_DIR || path.join(HOME, ".rogue", "logs");
+const LOG_FILE = ENV.ROGUE_LOG_FILE || path.join(LOG_DIR, `${PROVIDER}.log`);
 // Size cap. Over it, the current log is renamed to <file>.1 (exactly one
-// generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
-// rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
+// generation kept, so worst case on disk is 2x this). A NUMERIC ZERO disables
+// rotation; a NON-NUMERIC value falls back to the default rather than disabling
+// it, so a typo can never leave the log growing unbounded. `Number("00") === 0`,
+// so any zero-padded zero disables too — matching the sh dispatchers' `-gt 0`
+// test and PowerShell's [int64] cast.
+// Enforced on the WRITE PATH and not by a periodic job on purpose: an
 // UNCONFIGURED install writes a line per event and never runs anything else, so
 // a cap enforced anywhere else would not hold.
-const LOG_MAX_BYTES = /^\d+$/.test(process.env.ROGUE_LOG_MAX_BYTES ?? "")
-  ? Number(process.env.ROGUE_LOG_MAX_BYTES)
+const LOG_MAX_BYTES = /^\d+$/.test(ENV.ROGUE_LOG_MAX_BYTES ?? "")
+  ? Number(ENV.ROGUE_LOG_MAX_BYTES)
   : 2 * 1024 * 1024;
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
@@ -142,7 +161,9 @@ function readStdin() {
 }
 
 async function main() {
-  const env = loadEnvFiles();
+  // Already merged at module load (the log destination depends on it) — reuse it
+  // rather than re-reading the same three files.
+  const env = ENV;
   const apiKey = env.ROGUE_API_KEY || "";
 
   // SessionStart: fire the detached roster heartbeat, then fall through to POST

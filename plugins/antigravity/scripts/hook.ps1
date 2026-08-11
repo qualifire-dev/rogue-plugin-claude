@@ -91,7 +91,8 @@ function ConvertFrom-ShellQuoted {
 # reading a script variable from a function is implicit, but ASSIGNING one needs
 # the `$script:` prefix or the write lands in a function-local copy and silently
 # vanishes. Every write to shared state below is therefore `$script:`-qualified.
-$logFile    = ''   # resolved in Initialize-Logging
+$logFile     = ''       # resolved in Initialize-Logging
+$logMaxBytes = 2097152  # ditto; the default stands until then
 $creds      = @{}  # credential files + process env, by Import-Credentials
 $apiKey     = ''
 $url        = ''
@@ -134,24 +135,38 @@ function Resolve-PluginRoot {
 # ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
 # machine running Antigravity + Claude Code + Cursor + … used to interleave all of
 # them into a single hook.log with no way to tell whose line was whose.
-# Precedence: $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/antigravity.log → default.
-#
-# NOTE the sh/ps asymmetry, which predates this change: hook.sh resolves these in
-# load_env, i.e. AFTER sourcing the env files, so `~/.rogue-env` can set them
-# there. Here they come from the PROCESS environment only.
+# Resolved AFTER Import-Credentials, exactly like hook.sh's load_env resolves
+# these after sourcing the env files — so `~/.rogue-env`, `C:\ProgramData\rogue\env`
+# (MDM) and a bundled `env` can all relocate the log. Reading $env: directly here
+# instead would silently ignore every one of those files, which is a real defect
+# for a fleet that relocates logs by policy AND would make the log shipper and the
+# dispatcher disagree on the path.
 function Initialize-Logging {
-    $script:logFile = $env:ROGUE_LOG_FILE
-    if (-not $script:logFile) {
-        $logDir = $env:ROGUE_LOG_DIR
-        if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
-        $script:logFile = Join-Path $logDir 'antigravity.log'
+    # $Creds is the merged credential map (bundled env → MDM → per-user file, then
+    # process env last), so precedence is already correct by the time we read it.
+    # $HOME backs up USERPROFILE so this also works dot-sourced on macOS/Linux
+    # through the ROGUE_PS_LIB_ONLY seam (tests) — without it $logFile resolves to
+    # $null there and every line is silently dropped.
+    param([hashtable]$Creds = @{})
+    $f = $Creds['ROGUE_LOG_FILE']
+    if (-not $f) {
+        $logDir = $Creds['ROGUE_LOG_DIR']
+        if (-not $logDir) {
+            $userHome = $env:USERPROFILE
+            if (-not $userHome) { $userHome = $HOME }
+            if ($userHome) { $logDir = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+        }
+        if ($logDir) { $f = Join-Path $logDir 'antigravity.log' }
     }
-    # Size cap; over it the current log is renamed to <file>.1 (one generation
-    # kept, so worst case on disk is 2x this). 0/non-numeric disables rotation.
-    $script:logMaxBytes = 2097152
-    if ($env:ROGUE_LOG_MAX_BYTES -match '^[0-9]+$') {
-        $script:logMaxBytes = [int64]$env:ROGUE_LOG_MAX_BYTES
-    }
+    $script:logFile = $f
+    # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+    # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+    # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+    # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
+    # zero disables too — matching hook.sh's `-gt 0` test).
+    $cap = $Creds['ROGUE_LOG_MAX_BYTES']
+    if ($cap -match '^[0-9]+$') { $script:logMaxBytes = [int64]$cap }
+    else { $script:logMaxBytes = 2097152 }
 }
 
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
@@ -177,6 +192,11 @@ function Rotate-Log {
     try {
         $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
         if ($fi -and $fi.Length -ge $logMaxBytes) {
+            # Delete the previous generation first: `Move-Item -Force` onto an
+            # EXISTING destination is not reliable on Windows PowerShell 5.1, and
+            # with -ErrorAction SilentlyContinue a failure here would silently
+            # stop all further rotation and let the live log grow unbounded.
+            Remove-Item -LiteralPath "$logFile.1" -Force -ErrorAction SilentlyContinue
             Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
         }
     } catch {}
@@ -185,11 +205,21 @@ function Rotate-Log {
 function Log {
     param([string]$Msg)
     try {
+        if (-not $logFile) { return }
         $dir = Split-Path $logFile
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         Rotate-Log
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp provider=antigravity event=$EventName $Msg" -Encoding UTF8
+        # AppendAllText with an explicit BOM-less UTF-8, NOT `Add-Content -Encoding
+        # UTF8`: on Windows PowerShell 5.1 that switch writes a UTF-8 BOM when it
+        # creates the file, so the first line of every new log (and of every file
+        # produced by a rotation) would start with EF BB BF and fail any parser
+        # that anchors on the timestamp. "`n" keeps the line ending identical to
+        # what the sh dispatchers write, so one log format covers both platforms.
+        [System.IO.File]::AppendAllText(
+            $logFile,
+            "$stamp provider=antigravity event=$EventName $Msg`n",
+            (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
 
@@ -204,7 +234,10 @@ function Import-Credentials {
             }
         }
     }
-    foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL') {
+    # ROGUE_LOG_* ride the same list so a process-env value still beats the files,
+    # which is what makes the resolved precedence identical to hook.sh's load_env.
+    foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL',
+                   'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES') {
         $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $script:creds[$k] = $val }
     }
     $script:apiKey = $script:creds['ROGUE_API_KEY']
@@ -804,8 +837,12 @@ function Invoke-Main {
     Dbg "event=$EventName"
 
     Resolve-PluginRoot
-    Initialize-Logging
+    # Credentials FIRST: Initialize-Logging reads ROGUE_LOG_* out of the merged
+    # map, so the env files can relocate the log exactly as they can under
+    # hook.sh's load_env. Both still precede Assert-ApiKey, so an unconfigured
+    # machine records `outcome=unconfigured` before it exits.
     Import-Credentials
+    Initialize-Logging $script:creds
     Assert-ApiKey          # exits before stdin is read when there is no key
     Resolve-Url
     Resolve-Actor

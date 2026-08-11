@@ -60,42 +60,65 @@ function ConvertFrom-ShellQuoted {
 # ── logging ────────────────────────────────────────────────────────────────
 # ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
 # machine running Codex + Claude Code + Cursor + … used to interleave all of them
-# into a single hook.log with no way to tell whose line was whose. Precedence:
-# $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/codex.log → default.
-# $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
-# through the ROGUE_PS_LIB_ONLY seam below (tests).
+# into a single hook.log with no way to tell whose line was whose.
 #
-# NOTE the sh/ps asymmetry, which predates this change: hook.sh resolves these
-# AFTER sourcing the env files, so `~/.rogue-env` can set them there. Here they
-# come from the PROCESS environment only, because logging is initialised before
-# credential parsing (Log has to work on the unconfigured path below).
-$logFile = $env:ROGUE_LOG_FILE
-if (-not $logFile) {
-    $logDir = $env:ROGUE_LOG_DIR
-    if (-not $logDir) {
-        $userHome = $env:USERPROFILE
-        if (-not $userHome) { $userHome = $HOME }
-        if ($userHome) { $logDir = Join-Path (Join-Path $userHome '.rogue') 'logs' }
-    }
-    if ($logDir) { $logFile = Join-Path $logDir 'codex.log' }
-}
-# Size cap. Over it the current log is renamed to <file>.1 (exactly one
-# generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
-# rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
-# UNCONFIGURED install writes a line per event and never runs anything else, so
-# a cap enforced anywhere else would not hold.
+# Resolved by Initialize-Logging AFTER the credential files are parsed, exactly
+# like hook.sh resolves these after sourcing them — so `~/.rogue-env`,
+# `C:\ProgramData\rogue\env` (MDM) and a bundled `env` can all relocate the log.
+# Reading $env: directly here instead would silently ignore every one of those
+# files, which is a real defect for a fleet that relocates logs by policy AND
+# would make the log shipper and the dispatcher disagree on the path.
+# Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
+# dot-source the helpers, and so Log is safe to call before initialisation.
+$logFile = $null
 $logMaxBytes = 2097152
-if ($env:ROGUE_LOG_MAX_BYTES -match '^[0-9]+$') { $logMaxBytes = [int64]$env:ROGUE_LOG_MAX_BYTES }
+
+function Initialize-Logging {
+    # $Creds is the merged credential map (bundled env → MDM → per-user file, then
+    # process env last), so precedence is already correct by the time we read it.
+    # $HOME backs up USERPROFILE so this also works dot-sourced on macOS/Linux.
+    param([hashtable]$Creds = @{})
+    $f = $Creds['ROGUE_LOG_FILE']
+    if (-not $f) {
+        $d = $Creds['ROGUE_LOG_DIR']
+        if (-not $d) {
+            $userHome = $env:USERPROFILE
+            if (-not $userHome) { $userHome = $HOME }
+            if ($userHome) { $d = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+        }
+        if ($d) { $f = Join-Path $d 'codex.log' }
+    }
+    $script:logFile = $f
+    # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+    # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+    # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+    # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
+    # zero disables too — matching hook.sh's `-gt 0` test).
+    $cap = $Creds['ROGUE_LOG_MAX_BYTES']
+    if ($cap -match '^[0-9]+$') { $script:logMaxBytes = [int64]$cap }
+    else { $script:logMaxBytes = 2097152 }
+}
+
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+
+# Rotation is enforced on the WRITE PATH rather than by a periodic job because an
+# UNCONFIGURED install writes a line per event and never runs anything else - a
+# cap enforced anywhere else would not hold.
 function Rotate-Log {
     if (-not $logFile -or $logMaxBytes -le 0) { return }
     try {
         $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
         if ($fi -and $fi.Length -ge $logMaxBytes) {
+            # Delete the previous generation first: `Move-Item -Force` onto an
+            # EXISTING destination is not reliable on Windows PowerShell 5.1, and
+            # with -ErrorAction SilentlyContinue a failure here would silently
+            # stop all further rotation and let the live log grow unbounded.
+            Remove-Item -LiteralPath "$logFile.1" -Force -ErrorAction SilentlyContinue
             Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
         }
     } catch {}
 }
+
 function Log {
     param([string]$Msg)
     try {
@@ -104,7 +127,16 @@ function Log {
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         Rotate-Log
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp provider=codex event=$EventName $Msg" -Encoding UTF8
+        # AppendAllText with an explicit BOM-less UTF-8, NOT `Add-Content -Encoding
+        # UTF8`: on Windows PowerShell 5.1 that switch writes a UTF-8 BOM when it
+        # creates the file, so the first line of every new log (and of every file
+        # produced by a rotation) would start with EF BB BF and fail any parser
+        # that anchors on the timestamp. "`n" keeps the line ending identical to
+        # what the sh dispatchers write, so one log format covers both platforms.
+        [System.IO.File]::AppendAllText(
+            $logFile,
+            "$stamp provider=codex event=$EventName $Msg`n",
+            (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
 
@@ -138,9 +170,18 @@ foreach ($f in @((Join-Path $pluginRoot 'env'), 'C:\ProgramData\rogue\env', (Joi
         }
     }
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL','ROGUE_CODEX_SURFACE') {
+# ROGUE_LOG_* ride the same list so a process-env value still beats the files,
+# which is what makes the resolved precedence identical to hook.sh's.
+foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL','ROGUE_CODEX_SURFACE',
+               'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES') {
     $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $creds[$k] = $val }
 }
+
+# Logging is initialised HERE - after the credential files are parsed, so they can
+# relocate the log - but BEFORE the API-key check below, so an unconfigured
+# install still records `outcome=unconfigured`.
+Initialize-Logging $creds
+Dbg "logFile=$logFile cap=$logMaxBytes"
 
 $apiKey = $creds['ROGUE_API_KEY']
 if (-not $apiKey) {

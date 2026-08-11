@@ -160,6 +160,81 @@ for slug in $SLUGS; do
 done
 
 echo
+echo "== ~/.rogue-env can relocate the log (env FILE, not just process env)"
+# The documented precedence is bundled env -> MDM -> ~/.rogue-env -> process env,
+# and every dispatcher resolves its log destination AFTER reading those files. The
+# process-env cases above cannot catch a dispatcher that reads its own environment
+# too early: `plugins/gemini/scripts/hook.mjs` did exactly that (module-level
+# consts, while loadEnvFiles() runs later and returns a merged object WITHOUT
+# mutating process.env), so ~/.rogue-env was silently ignored there.
+for slug in $SLUGS; do
+  home="$TMPROOT/envfile-$slug"; mkdir -p "$home/custom"
+  printf 'export ROGUE_LOG_DIR=%s\n' "$home/custom" > "$home/.rogue-env"
+  chmod 600 "$home/.rogue-env"
+  fire "$slug" "$home"
+  got=$(find "$home" -name '*.log' 2>/dev/null | sed "s|^$home||" | sort | tr '\n' ' ')
+  check "$slug honors ROGUE_LOG_DIR from ~/.rogue-env" "/custom/$slug.log " "$got"
+done
+
+echo
+echo "== a zero-padded zero cap (00) disables rotation, like 0"
+# sh compares with `-ge`, so a `case` glob that only matched a bare "0" left "00"
+# looking like a positive number and rotated on EVERY write. PowerShell's
+# [int64]'00' and Node's Number("00") are both 0, so all three must agree.
+for slug in $SLUGS; do
+  home="$TMPROOT/cap00-$slug"; mkdir -p "$home/.rogue/logs"
+  logf="$home/.rogue/logs/$slug.log"
+  i=0; while [ "$i" -lt 30 ]; do echo "OLD-LINE-$i" >> "$logf"; i=$((i + 1)); done
+  fire "$slug" "$home" "ROGUE_LOG_MAX_BYTES=00"
+  rotated=$([ -e "$logf.1" ] && echo yes || echo no)
+  check "$slug treats 00 as rotation-disabled" "no" "$rotated"
+  check "$slug appended instead of rotating" "31" "$(wc -l < "$logf" 2>/dev/null | tr -d '[:space:]')"
+done
+
+echo
+echo "== a non-numeric cap falls back to the default, it does NOT disable"
+# A typo must never leave the log growing unbounded. Seed just over the 2 MiB
+# default so "fell back to the default" is distinguishable from "disabled".
+for slug in $SLUGS; do
+  home="$TMPROOT/capbad-$slug"; mkdir -p "$home/.rogue/logs"
+  logf="$home/.rogue/logs/$slug.log"
+  head -c 2097153 /dev/zero | tr '\0' 'x' > "$logf"
+  fire "$slug" "$home" "ROGUE_LOG_MAX_BYTES=not-a-number"
+  rotated=$([ -e "$logf.1" ] && echo yes || echo no)
+  check "$slug still rotates at the 2 MiB default" "yes" "$rotated"
+done
+
+echo
+echo "== rotation replaces an EXISTING .1 rather than failing"
+for slug in $SLUGS; do
+  home="$TMPROOT/rot2-$slug"; mkdir -p "$home/.rogue/logs"
+  logf="$home/.rogue/logs/$slug.log"
+  echo "STALE-PREVIOUS-GENERATION" > "$logf.1"
+  i=0; while [ "$i" -lt 30 ]; do echo "OLD-LINE-$i" >> "$logf"; i=$((i + 1)); done
+  fire "$slug" "$home" "ROGUE_LOG_MAX_BYTES=100"
+  if grep -q 'STALE-PREVIOUS-GENERATION' "$logf.1" 2>/dev/null; then
+    fail "$slug left the stale .1 in place — rotation silently no-oped"
+  else
+    pass "$slug replaced the previous .1 generation"
+  fi
+done
+
+echo
+echo "== the log starts with the timestamp: no UTF-8 BOM, no leading blank"
+# PowerShell 5.1's `Add-Content -Encoding UTF8` writes EF BB BF on create, which
+# would break any parser anchored on the timestamp; the sh side must never grow
+# one either, so both halves of the suite assert it.
+for slug in $SLUGS; do
+  home="$TMPROOT/bom-$slug"; mkdir -p "$home"
+  fire "$slug" "$home"
+  head3=$(od -An -tx1 -N3 "$home/.rogue/logs/$slug.log" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')
+  case "$head3" in
+    "ef bb bf") fail "$slug log starts with a UTF-8 BOM" ;;
+    *)          pass "$slug log has no UTF-8 BOM (head: $head3)" ;;
+  esac
+done
+
+echo
 echo "== no dispatcher writes the legacy shared ~/.rogue/hook.log"
 for slug in $SLUGS; do
   home="$TMPROOT/legacy-$slug"; mkdir -p "$home"

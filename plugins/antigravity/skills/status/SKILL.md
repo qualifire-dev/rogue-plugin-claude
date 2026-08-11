@@ -115,7 +115,17 @@ tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/antigravity.lo
 ```
 - Windows (PowerShell):
 ```powershell
-Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\antigravity.log" -ErrorAction SilentlyContinue
+# Mirror the dispatcher's precedence: explicit file -> dir override -> default.
+# A value set in ~/.rogue-env or C:\ProgramData\rogue\env wins over the default
+# too; read it from there if this shows no activity but the connection is healthy.
+$logPath = $env:ROGUE_LOG_FILE
+if (-not $logPath) {
+  $logDir = $env:ROGUE_LOG_DIR
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'antigravity.log'
+}
+"Log: $logPath"
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
 
 ## Step 5: Summary

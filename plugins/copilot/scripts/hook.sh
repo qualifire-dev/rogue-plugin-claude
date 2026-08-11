@@ -49,17 +49,23 @@ PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
 # Precedence: explicit file → directory override → per-agent default.
 ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
 ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/copilot.log}"
-# Size cap. Over it, the current log is renamed to <file>.1 (exactly one
-# generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
-# rotation. This lives in log() rather than in a periodic job on purpose: an
-# UNCONFIGURED install writes a line per event and never runs anything else, so
-# a cap enforced anywhere but the write path would not hold.
+# Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+# generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+# rotation; a NON-NUMERIC value falls back to this default, so a typo can
+# never leave the log growing unbounded. Enforced on the WRITE PATH rather
+# than by a periodic job because an UNCONFIGURED install writes a line per
+# event and never runs anything else - a cap enforced anywhere else would
+# not hold.
 ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-2097152}"
+# Clamp per the rule above: anything non-numeric becomes the default.
+case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=2097152 ;; esac
 # NOTE: `_lsz` is not function-local (POSIX sh has no `local`) but is used
 # NOWHERE else in this file — unlike `_p`/`_n`, which are shared (see below).
 rotate_log() {
   [ -f "$ROGUE_LOG_FILE" ] || return 0
-  case "$ROGUE_LOG_MAX_BYTES" in ''|0|*[!0-9]*) return 0 ;; esac
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
   # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
   _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
   case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac

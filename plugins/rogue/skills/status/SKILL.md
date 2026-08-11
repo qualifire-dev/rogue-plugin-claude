@@ -180,7 +180,14 @@ try {
 "Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
 "Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
 '--- recent hook activity ---'
-Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\claude.log" -ErrorAction SilentlyContinue
+$logPath = $creds['ROGUE_LOG_FILE']
+if (-not $logPath) {
+  $logDir = $creds['ROGUE_LOG_DIR']
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'claude.log'
+}
+"Log: $logPath"
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
 
 Interpret the JSON response and report the same fields as Step 2 (connected,

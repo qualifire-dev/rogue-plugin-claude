@@ -80,9 +80,13 @@ load_env() {
   # Precedence: explicit file → directory override → per-agent default.
   ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
   ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/antigravity.log}"
-  # Size cap; over it the current log is renamed to <file>.1 (one generation
-  # kept, so worst case on disk is 2x this). 0/non-numeric disables rotation.
+  # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+  # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+  # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+  # never leave the log growing unbounded.
   ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-2097152}"
+  # Clamp per the rule above: anything non-numeric becomes the default.
+  case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=2097152 ;; esac
   # IDE store reads: off entirely with 0, read-but-never-attach with `log`.
   DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
   MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"
@@ -99,7 +103,9 @@ load_env() {
 # never runs anything else, so a cap enforced anywhere else would not hold.
 rotate_log() {
   [ -f "$ROGUE_LOG_FILE" ] || return 0
-  case "$ROGUE_LOG_MAX_BYTES" in ''|0|*[!0-9]*) return 0 ;; esac
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
   # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
   _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
   case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
