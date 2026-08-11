@@ -126,7 +126,8 @@ function Repair-DoubleEncodedUtf8 {
 #
 # ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a single hook.log
 # would interleave Cursor with Claude Code / Codex / … and lose attribution.
-# Precedence: $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/cursor.log → default.
+# Precedence: ROGUE_LOG_FILE → ROGUE_LOG_DIR/cursor.log → default, each read from
+# the merged credential map (so process env still wins, but the env files count).
 # $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
 # through the ROGUE_PS_LIB_ONLY seam below (tests).
 #

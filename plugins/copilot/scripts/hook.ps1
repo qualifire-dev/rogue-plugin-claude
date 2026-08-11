@@ -72,14 +72,17 @@ function ConvertFrom-ShellQuoted {
 # ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
 # machine running Copilot CLI + Claude Code + Cursor + … used to interleave all of
 # them into a single hook.log with no way to tell whose line was whose.
-# Precedence: $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/copilot.log → default.
+# Precedence: ROGUE_LOG_FILE → ROGUE_LOG_DIR/copilot.log → default, each read from
+# the merged credential map (so process env still wins, but the env files count).
 # $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
 # through the ROGUE_PS_LIB_ONLY seam below (tests).
 #
-# NOTE the sh/ps asymmetry, which predates this change: hook.sh resolves these
-# AFTER sourcing the env files, so `~/.rogue-env` can set them there. Here they
-# come from the PROCESS environment only, because logging is initialised before
-# credential parsing (Log has to work on the unconfigured path below).
+# Resolved by Initialize-Logging AFTER the credential files are parsed, exactly
+# like hook.sh resolves these after sourcing them — so `~/.rogue-env`,
+# `C:\ProgramData\rogue\env` (MDM) and a bundled `env` can all relocate the log.
+# Reading $env: directly here instead would silently ignore every one of those
+# files, which is a real defect for a fleet that relocates logs by policy AND
+# would make the log shipper and the dispatcher disagree on the path.
 # Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
 # dot-source the helpers, and so Log is safe to call before initialisation.
 $logFile = $null
