@@ -131,10 +131,26 @@ function Resolve-PluginRoot {
     }
 }
 
+# ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
+# machine running Antigravity + Claude Code + Cursor + … used to interleave all of
+# them into a single hook.log with no way to tell whose line was whose.
+# Precedence: $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/antigravity.log → default.
+#
+# NOTE the sh/ps asymmetry, which predates this change: hook.sh resolves these in
+# load_env, i.e. AFTER sourcing the env files, so `~/.rogue-env` can set them
+# there. Here they come from the PROCESS environment only.
 function Initialize-Logging {
     $script:logFile = $env:ROGUE_LOG_FILE
     if (-not $script:logFile) {
-        $script:logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log'
+        $logDir = $env:ROGUE_LOG_DIR
+        if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+        $script:logFile = Join-Path $logDir 'antigravity.log'
+    }
+    # Size cap; over it the current log is renamed to <file>.1 (one generation
+    # kept, so worst case on disk is 2x this). 0/non-numeric disables rotation.
+    $script:logMaxBytes = 2097152
+    if ($env:ROGUE_LOG_MAX_BYTES -match '^[0-9]+$') {
+        $script:logMaxBytes = [int64]$env:ROGUE_LOG_MAX_BYTES
     }
 }
 
@@ -153,11 +169,25 @@ function Add-JsonFields {
     return $p + $Fields + '}'
 }
 
+# Trim the log before appending. Rotation lives on the WRITE PATH and not in a
+# periodic job on purpose: an UNCONFIGURED install writes a line per event and
+# never runs anything else, so a cap enforced anywhere else would not hold.
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
 function Log {
     param([string]$Msg)
     try {
         $dir = Split-Path $logFile
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         Add-Content -LiteralPath $logFile -Value "$stamp provider=antigravity event=$EventName $Msg" -Encoding UTF8
     } catch {}

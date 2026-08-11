@@ -106,13 +106,20 @@ Parse the JSON response and display in a clear format:
 - **Active rulesets**: For each ruleset in `rulesets`, show name, category, mode
   (block/monitor), and severity
 
-## Step 4: Show identity
+## Step 4: Show identity + recent hook activity
 
 ```bash
 . /tmp/rogue-source-env.sh
 echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
 echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
+echo "--- recent hook activity ---"
+tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/claude.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
+
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`claude.log` only — a sibling agent's activity lives in `codex.log`,
+`cursor.log`, and so on. `<file>.1` is the previous rotation, if any. An empty or
+missing file with a healthy connection just means no events have fired yet.
 
 If either is unset:
 
@@ -172,6 +179,8 @@ try {
 } catch { "Status check failed: $($_.Exception.Message)" }
 "Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
 "Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
+'--- recent hook activity ---'
+Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\claude.log" -ErrorAction SilentlyContinue
 ```
 
 Interpret the JSON response and report the same fields as Step 2 (connected,

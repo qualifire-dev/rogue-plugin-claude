@@ -81,7 +81,7 @@ if (Test-Section 'parse') {
 # ── 2. every write to shared state is $script:-qualified ───────────────────
 if (Test-Section 'scope') {
 $shared = @(
-    'logFile', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail', 'payload',
+    'logFile', 'logMaxBytes', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail', 'payload',
     'subagentId', 'subagentName', 'brainDir', 'submapDir', 'payloadTp',
     'isIdeSurface', 'PluginRoot',
     # heartbeat.ps1's own shared state

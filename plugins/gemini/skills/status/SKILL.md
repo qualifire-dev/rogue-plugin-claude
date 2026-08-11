@@ -74,8 +74,12 @@ for f in "$HOME/.gemini/extensions/rogue/env" /etc/rogue/env "$HOME/.rogue-env";
 echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
 echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
 echo "--- recent hook activity ---"
-tail -n 20 "${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}" 2>/dev/null || echo "no hook activity yet"
+tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/gemini.log}" 2>/dev/null || echo "no hook activity yet"
 ```
+
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`gemini.log` only — a sibling agent's activity lives in `claude.log`,
+`cursor.log`, and so on. `<file>.1` is the previous rotation, if any.
 
 ## Step 5: Summary
 
@@ -117,7 +121,7 @@ try {
 } catch { "Status check failed: $($_.Exception.Message)" }
 "Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
 "Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
-Get-Content -Tail 20 "$env:USERPROFILE\.rogue\hook.log" -ErrorAction SilentlyContinue
+Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\gemini.log" -ErrorAction SilentlyContinue
 ```
 
 Report the same fields as Step 2.

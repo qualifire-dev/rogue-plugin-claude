@@ -69,24 +69,53 @@ function ConvertFrom-ShellQuoted {
 }
 
 # ── logging ────────────────────────────────────────────────────────────────
-# $env:ROGUE_LOG_FILE overrides; default ~/.rogue/hook.log (mirrors hook.sh).
+# ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
+# machine running Copilot CLI + Claude Code + Cursor + … used to interleave all of
+# them into a single hook.log with no way to tell whose line was whose.
+# Precedence: $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/copilot.log → default.
 # $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
 # through the ROGUE_PS_LIB_ONLY seam below (tests).
+#
+# NOTE the sh/ps asymmetry, which predates this change: hook.sh resolves these
+# AFTER sourcing the env files, so `~/.rogue-env` can set them there. Here they
+# come from the PROCESS environment only, because logging is initialised before
+# credential parsing (Log has to work on the unconfigured path below).
 $logFile = $env:ROGUE_LOG_FILE
 if (-not $logFile) {
-    $userHome = $env:USERPROFILE
-    if (-not $userHome) { $userHome = $HOME }
-    if ($userHome) { $logFile = Join-Path (Join-Path $userHome '.rogue') 'hook.log' }
+    $logDir = $env:ROGUE_LOG_DIR
+    if (-not $logDir) {
+        $userHome = $env:USERPROFILE
+        if (-not $userHome) { $userHome = $HOME }
+        if ($userHome) { $logDir = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+    }
+    if ($logDir) { $logFile = Join-Path $logDir 'copilot.log' }
 }
+# Size cap. Over it the current log is renamed to <file>.1 (exactly one
+# generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
+# rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
+# UNCONFIGURED install writes a line per event and never runs anything else, so
+# a cap enforced anywhere else would not hold.
+$logMaxBytes = 2097152
+if ($env:ROGUE_LOG_MAX_BYTES -match '^[0-9]+$') { $logMaxBytes = [int64]$env:ROGUE_LOG_MAX_BYTES }
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
 function Log {
     param([string]$Msg)
     try {
         if (-not $logFile) { return }
         $dir = Split-Path $logFile
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp provider=github_copilot event=$EventName $Msg" -Encoding UTF8
+        Add-Content -LiteralPath $logFile -Value "$stamp provider=copilot event=$EventName $Msg" -Encoding UTF8
     } catch {}
 }
 

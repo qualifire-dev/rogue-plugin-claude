@@ -72,17 +72,29 @@ curl -s -H "x-rogue-api-key: $ROGUE_API_KEY" \
 Parse and display: **Mode** (`settings.mode`), **Fail-open** (`settings.failOpen`),
 and each **ruleset** in `rulesets` (name, category, mode, severity).
 
-## Step 4: Confirm hooks are trusted
+## Step 4: Show the recent hook log
+
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`codex.log` only — a sibling agent's activity lives in `claude.log`, `cursor.log`,
+and so on. `<file>.1` is the previous rotation, if any.
+
+```bash
+tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/codex.log}" 2>/dev/null || echo "(no hook log yet)"
+```
+
+On Windows, use `Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\codex.log"`.
+
+## Step 5: Confirm hooks are trusted
 
 Remind the user that Codex skips untrusted command hooks. If no events are showing
 up in the dashboard, open `/hooks` in Codex and trust the Rogue entries.
 
-## Step 5: Summary
+## Step 6: Summary
 
 Present a clean summary: credential sources, connection status, mode + ruleset
 count, actor identity (`${ROGUE_ACTOR_EMAIL}` / `${ROGUE_ACTOR_NAME}`).
 
-## Step 6: False-positive escape hatch
+## Step 7: False-positive escape hatch
 
 > **Was a prompt blocked by mistake?** Prepend `rgx!` to your next prompt and
 > resubmit. Rogue allows that one prompt and marks the previous detection as a

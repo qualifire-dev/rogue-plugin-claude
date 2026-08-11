@@ -67,9 +67,13 @@ Three orderings inside `main` are load-bearing; keep them if you touch it:
    must emit nothing before any env sourcing, actor resolution or POST, or a
    machine running both handlers double-POSTs and double-decides.
 2. **Env sourcing precedes every default derived from it.** `load_env` computes
-   `ROGUE_LOG_FILE`, `DB_PROMPT_MODE`, `MISS_DIR`, `BRAIN_DIR`, `SUBMAP_DIR` and
-   the URL *after* reading the env files. Hoisting any of them back to file scope
-   silently freezes the built-in default and ignores the user's `~/.rogue-env`.
+   `ROGUE_LOG_DIR`, `ROGUE_LOG_FILE`, `ROGUE_LOG_MAX_BYTES`, `DB_PROMPT_MODE`,
+   `MISS_DIR`, `BRAIN_DIR`, `SUBMAP_DIR` and the URL *after* reading the env
+   files. Hoisting any of them back to file scope silently freezes the built-in
+   default and ignores the user's `~/.rogue-env`. (`hook.ps1`'s
+   `Initialize-Logging` reads the log vars from the **process env only** — the
+   documented sh/ps asymmetry shared by every plugin; see the root `CLAUDE.md`
+   section "The hook log".)
 3. **The API-key check precedes reading stdin.** An unconfigured machine exits
    without consuming the payload.
 

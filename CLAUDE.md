@@ -23,6 +23,7 @@ Mirrors the Claude plugin with deliberate differences:
 
 ### Cursor plugin (`plugins/cursor/`)
 A near-verbatim port of `qualifire-dev/rogue-plugin-cursor`'s `plugins/rogue/` (keep it in sync — re-pull on upstream changes). Mirrors the Claude/Codex dual-dispatcher with Cursor-native wiring:
+- **Logs like the other plugins.** It used to write nothing at all (only `ROGUE_DEBUG` stderr, which Cursor buries in its own per-session log and `/rogue:status` cannot read), so it had zero durable observability. Both dispatchers now append one line per invocation to `~/.rogue/logs/cursor.log` — same format, precedence and rotation as everyone else (see **The hook log**).
 - **Dual dispatcher (sh + PowerShell), PURE RELAY.** Each of the 18 Cursor events registers two `hooks.json` entries — `sh ./scripts/hook.sh <event>` (cwd-relative; Cursor runs hooks from the plugin root) and a PowerShell entry that loads `scripts/hook.ps1` via `$env:CURSOR_PLUGIN_ROOT`. Exactly one runs per machine (same arbitration as Claude). Endpoint `/api/v1/hooks/cursor`, header `x-rogue-source: cursor`, env var `CURSOR_PLUGIN_ROOT`. Reuses the shared `~/.rogue-env`. `setup.sh` / `setup.ps1` write it.
 - **Manifest is `.cursor-plugin/plugin.json`** (version is source of truth); the Cursor marketplace file is the repo-root `.cursor-plugin/marketplace.json` (source `./plugins/cursor`, plugin version must match plugin.json — enforced by `.github/workflows/validate.yml`), kept separate from `.claude-plugin/` and `.agents/plugins/`.
 - **No `auto-update.sh`.** The Cursor **Team Marketplace** (admin imports the repo via Dashboard) IS Cursor's native managed/auto-update path — we don't ship a script. Per-developer one-liner installs upgrade by re-running the installer.
@@ -98,7 +99,23 @@ Every event registers two entries — an `sh` one and a PowerShell one — point
 - Backgrounding (`( nohup ... & )`) only inside a single-quoted `sh -c '...'` wrapper — a single-quoted string is one inert token to PS 5.1, whereas a bare `&` is a parse error. Inside those single quotes use `"$CLAUDE_PLUGIN_ROOT"` (the env var, exported to every hook process), not the `${CLAUDE_PLUGIN_ROOT}` placeholder — sh doesn't expand placeholders inside single quotes.
 - The `shell: "powershell"` hook field is NOT a platform gate: on a Mac without pwsh it throws a visible "no PowerShell executable found" error. Don't use it.
 
-`scripts/hook.sh <EventName>` is the orchestrator: stands down under Git Bash, sources env files, fail-opens on missing API key, sources `scripts/actor.sh` for actor resolution, POSTs stdin to `/api/v1/hooks/claude` with the four `x-rogue-*` headers, parses the response for a block decision (log-only), and prints the API response to stdout. `hook.ps1` does the same on Windows. Logs every invocation to `$ROGUE_LOG_FILE` (default `~/.rogue/hook.log` / `%USERPROFILE%\.rogue\hook.log`); the logged `reason` is sanitized of control characters to prevent log forgery from server-controlled text.
+`scripts/hook.sh <EventName>` is the orchestrator: stands down under Git Bash, sources env files, fail-opens on missing API key, sources `scripts/actor.sh` for actor resolution, POSTs stdin to `/api/v1/hooks/claude` with the four `x-rogue-*` headers, parses the response for a block decision (log-only), and prints the API response to stdout. `hook.ps1` does the same on Windows. Logs every invocation to `$ROGUE_LOG_FILE` (default `~/.rogue/logs/claude.log` / `%USERPROFILE%\.rogue\logs\claude.log`) — see **The hook log** below; the logged `reason` is sanitized of control characters to prevent log forgery from server-controlled text.
+
+## The hook log
+
+**One file per agent, under `~/.rogue/logs/`** (`%USERPROFILE%\.rogue\logs\` on Windows): `claude.log`, `codex.log`, `cursor.log`, `gemini.log`, `copilot.log`, `antigravity.log`. All six plugins share `~/.rogue`, so before this split a machine with several coding agents interleaved every dispatcher into one `hook.log` with no reliable way to tell whose line was whose — and only three of the six stamped a `provider=` token at all. Cursor wrote **nothing**; it now logs like the rest.
+
+Line format, identical across all six dispatchers:
+
+```
+2026-08-11T11:26:16Z provider=claude event=PreToolUse outcome=unconfigured
+```
+
+- **`provider=` is the agent slug, which is also the file's basename.** The two are kept equal on purpose so a merged grep and a file listing use one vocabulary. It is deliberately **NOT** the heartbeat's `agent_family`/`agent` (the server keys its roster and version lookup on those): five of six coincide, but Codex's family is `openai` while its slug is `codex`, and the roster labels are `gemini_cli` / `github_copilot` where the slugs are `gemini` / `copilot`. Don't "align" them.
+- **Path precedence**: `ROGUE_LOG_FILE` (exact path, back-compat) → `ROGUE_LOG_DIR/<slug>.log` → `~/.rogue/logs/<slug>.log`. Prefer `ROGUE_LOG_DIR` when relocating: `~/.rogue-env` is **shared by every plugin**, so a `ROGUE_LOG_FILE` set there re-collapses all six into one file.
+- **Rotation** is size-capped at `ROGUE_LOG_MAX_BYTES` (default 2 MiB, `0`/non-numeric disables). Over the cap, the current file is renamed to `<file>.1` — exactly one generation kept, so worst case on disk is 2x the cap per agent. It lives **inside `log()`, on the write path**, not in a periodic job: an unconfigured install writes `outcome=unconfigured` once per event and never runs anything else, so a cap enforced anywhere else would not hold. Size is read with `wc -c` (BSD and GNU `stat` take different flags).
+- **sh/ps asymmetry, pre-existing and deliberate**: `hook.sh` resolves these variables *after* sourcing the env files, so `~/.rogue-env` can set them; the PowerShell dispatchers read them from the **process environment only**, because logging is initialised before credential parsing (`Log` has to work on the unconfigured path). Setting `ROGUE_LOG_DIR` in `~/.rogue-env` therefore has no effect on native Windows.
+- Everything logged is best-effort and wrapped: a full disk, a permission error, or a Windows `Add-Content` sharing violation is swallowed. **Logging never affects the hook's decision or exit code.**
 
 ### Exactly-one-runs (cross-platform arbitration)
 
@@ -140,4 +157,6 @@ Invariants to preserve when editing hooks (apply to **both** dispatchers — kee
 - The `SessionStart` event has **four separate hook groups** (auto-update kick-off, heartbeat kick-off, unconfigured-warning, API POST). They run independently so a failure in one doesn't suppress the others. auto-update/heartbeat are detached (`sh -c '( nohup ... & )'` on sh; `Start-Process -WindowStyle Hidden` on PowerShell) with short timeouts — the hook returns immediately. Don't "fix" the short timeout.
 - Release tarballs deliberately omit BOTH the version and an OS suffix from the filename, so `/releases/latest/download/rogue-plugin-claude.tar.gz` stays stable. The package is cross-platform by content (ships `.sh` and `.ps1`).
 - `install.sh` / `install.ps1` install via the Claude CLI marketplace (git clone), NOT by downloading the tarball. The tarball exists for `compile-customer-plugin.sh` (MDM bundles).
+- Log rotation is checked on **every** `log()` call rather than by a scheduled job, which looks wasteful (one `wc -c` per hook). It is the only placement that holds: an unconfigured install runs nothing but the dispatcher, and that dispatcher logs a line per event.
+- The hook log's `provider=` token intentionally differs from the heartbeat's `agent_family`/`agent` for Codex, Gemini and Copilot. It tracks the log **file name**, not the server's roster vocabulary — see **The hook log**.
 - `rgx!` prompt prefix is a server-side convention (false-positive escape hatch). The plugin itself doesn't parse it — the API does.

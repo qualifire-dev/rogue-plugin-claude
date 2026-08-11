@@ -25,10 +25,11 @@ import { HOME, SCRIPT_DIR, loadEnvFiles, gitConfig } from "./shared.mjs";
 
 const EVENT = process.argv[2] || "unknown";
 
-// Surface label stamped on every log line. The hook log (~/.rogue/hook.log) is
-// SHARED with the Claude/Codex/Cursor plugins, so this token is what lets you
-// tell whose events a line belongs to when reading the merged file.
-const PROVIDER = "gemini_cli";
+// Agent slug: names this plugin's log file AND is stamped on every line inside
+// it. Deliberately the plugin's common name, NOT the roster's `agent` label
+// ("gemini_cli", which the server keys its version lookup on) — see
+// heartbeat.mjs. Keep the two independent.
+const PROVIDER = "gemini";
 
 // ── Emit + exit ────────────────────────────────────────────────────────────
 // stdout must be ONLY the final JSON object. Always exit 0 — a blocking verdict
@@ -39,14 +40,38 @@ function emit(obj) {
 }
 
 // ── Logging (file only; stdout is reserved for Gemini) ───────────────────────
+// ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a machine running
+// Gemini CLI + Claude Code + Cursor + … used to interleave all of them into a
+// single hook.log with no way to tell whose line was whose. Precedence:
+// explicit file → directory override → per-agent default.
+const LOG_DIR = process.env.ROGUE_LOG_DIR || path.join(HOME, ".rogue", "logs");
 const LOG_FILE =
-  process.env.ROGUE_LOG_FILE || path.join(HOME, ".rogue", "hook.log");
+  process.env.ROGUE_LOG_FILE || path.join(LOG_DIR, `${PROVIDER}.log`);
+// Size cap. Over it, the current log is renamed to <file>.1 (exactly one
+// generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
+// rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
+// UNCONFIGURED install writes a line per event and never runs anything else, so
+// a cap enforced anywhere else would not hold.
+const LOG_MAX_BYTES = /^\d+$/.test(process.env.ROGUE_LOG_MAX_BYTES ?? "")
+  ? Number(process.env.ROGUE_LOG_MAX_BYTES)
+  : 2 * 1024 * 1024;
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
 const sanitize = (s) => String(s ?? "").replace(CONTROL_CHARS, "");
+function rotateLog() {
+  if (LOG_MAX_BYTES <= 0) return;
+  try {
+    if (fs.statSync(LOG_FILE).size >= LOG_MAX_BYTES) {
+      fs.renameSync(LOG_FILE, `${LOG_FILE}.1`);
+    }
+  } catch {
+    /* no file yet, or rotation lost a race — either way just append */
+  }
+}
 function log(msg) {
   try {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    rotateLog();
     const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
     fs.appendFileSync(LOG_FILE, `${ts} provider=${PROVIDER} event=${EVENT} ${msg}\n`);
   } catch {

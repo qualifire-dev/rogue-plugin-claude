@@ -35,13 +35,22 @@ curl -s -H "x-rogue-api-key: $ROGUE_API_KEY" \
 
 Parse the JSON and show: mode (enforce/monitor), fail-open setting, active rulesets.
 
-## Step 4: Show identity
+## Step 4: Show identity + recent hook activity
 
 ```bash
 . "$HOME/.rogue-env" 2>/dev/null
 echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
 echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
+echo "--- recent hook activity ---"
+tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/cursor.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
+
+On Windows, use `Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\cursor.log"`.
+
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`cursor.log` only — a sibling agent's activity lives in `claude.log`,
+`codex.log`, and so on. `<file>.1` is the previous rotation, if any. An empty or
+missing file with a healthy connection just means no events have fired yet.
 
 ## Step 5: Summary
 

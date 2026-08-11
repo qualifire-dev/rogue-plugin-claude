@@ -105,13 +105,17 @@ Parse and display: **Mode** (`settings.mode`), **Fail-open** (`settings.failOpen
 
 ## Step 4: Show the recent hook log
 
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`antigravity.log` only — a sibling agent's activity lives in `claude.log`,
+`cursor.log`, and so on. `<file>.1` is the previous rotation, if any.
+
 - macOS / Linux:
 ```bash
-tail -n 20 "${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}" 2>/dev/null || echo "(no hook log yet)"
+tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/antigravity.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
 - Windows (PowerShell):
 ```powershell
-Get-Content -Tail 20 "$env:USERPROFILE\.rogue\hook.log" -ErrorAction SilentlyContinue
+Get-Content -Tail 20 "$env:USERPROFILE\.rogue\logs\antigravity.log" -ErrorAction SilentlyContinue
 ```
 
 ## Step 5: Summary

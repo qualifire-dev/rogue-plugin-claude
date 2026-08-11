@@ -72,6 +72,17 @@ jobs:
           done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh')
           [ "$fail" = 0 ] || exit 1
 
+      - name: Hook-log contract (sh + mjs dispatchers)
+        # The per-agent log file, line format and rotation policy are duplicated
+        # across six dispatchers (no shared library), so drift in one of them is
+        # otherwise invisible. Runs on the unconfigured path — no mock server, no
+        # network. Run twice: `dash` is what Claude Code actually invokes hooks
+        # with, `bash` is what a developer runs locally.
+        run: |
+          set -euo pipefail
+          SH=dash sh tests/test_hook_logs.sh
+          SH=bash bash tests/test_hook_logs.sh
+
       - name: PowerShell scripts parse
         # The .ps1 dispatchers are the Windows half of every plugin and cannot be
         # run on a dev Mac (no pwsh) — this is the only gate that ever parses
@@ -92,9 +103,10 @@ jobs:
             exit $bad'
 
       - name: PowerShell unit tests
-        # Both load their dispatcher through the ROGUE_PS_LIB_ONLY seam, so the
-        # functions run on Linux even though the main body stands down there.
+        # All of these load their dispatcher through the ROGUE_PS_LIB_ONLY seam, so
+        # the functions run on Linux even though the main body stands down there.
         run: |
           set -euo pipefail
           pwsh -NoProfile -File tests/test_hook_ps1.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1
+          pwsh -NoProfile -File tests/test_hook_logs.ps1

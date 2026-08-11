@@ -24,6 +24,9 @@
 # Set ROGUE_DEBUG=1 (process/user env var) to emit diagnostics to stderr;
 # Cursor shows stderr in its hook log without treating it as the response.
 #
+# Logs every invocation to $env:ROGUE_LOG_FILE (default
+# %USERPROFILE%\.rogue\logs\cursor.log), mirroring hook.sh.
+#
 # Credential resolution (later file wins; process env wins over all), the
 # Windows analogue of hook.sh's search:
 #   1. ${CURSOR_PLUGIN_ROOT}\env        (baked into a compiled customer plugin)
@@ -115,9 +118,66 @@ function Repair-DoubleEncodedUtf8 {
     return $Text
 }
 
+# ── hook log ───────────────────────────────────────────────────────────────
+# `Dbg` above only writes to stderr under ROGUE_DEBUG, which Cursor keeps in its
+# own per-session log — useless for after-the-fact diagnosis and unavailable to
+# /rogue:status. So every invocation also gets one durable line here, in the same
+# format hook.sh writes: "<ts> provider=cursor event=<E> <k=v>".
+#
+# ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a single hook.log
+# would interleave Cursor with Claude Code / Codex / … and lose attribution.
+# Precedence: $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/cursor.log → default.
+# $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
+# through the ROGUE_PS_LIB_ONLY seam below (tests).
+#
+# NOTE the sh/ps asymmetry, shared with every other Rogue plugin: hook.sh
+# resolves these AFTER sourcing the env files, so `~/.rogue-env` can set them
+# there. Here they come from the PROCESS environment only, because logging has to
+# work on the unconfigured path (before credentials are parsed).
+$logFile = $env:ROGUE_LOG_FILE
+if (-not $logFile) {
+    $logDir = $env:ROGUE_LOG_DIR
+    if (-not $logDir) {
+        $userHome = $env:USERPROFILE
+        if (-not $userHome) { $userHome = $HOME }
+        if ($userHome) { $logDir = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+    }
+    if ($logDir) { $logFile = Join-Path $logDir 'cursor.log' }
+}
+# Size cap. Over it the current log is renamed to <file>.1 (exactly one
+# generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
+# rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
+# UNCONFIGURED install writes a line per event and never runs anything else, so
+# a cap enforced anywhere else would not hold.
+$logMaxBytes = 2097152
+if ($env:ROGUE_LOG_MAX_BYTES -match '^[0-9]+$') { $logMaxBytes = [int64]$env:ROGUE_LOG_MAX_BYTES }
+# Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
+# can carry anything), and a raw newline or CR would forge extra log lines.
+function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+function Log {
+    param([string]$Msg)
+    try {
+        if (-not $logFile) { return }
+        $dir = Split-Path $logFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Add-Content -LiteralPath $logFile -Value "$stamp provider=cursor event=$EventName $Msg" -Encoding UTF8
+    } catch {}
+}
+
 # Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
-# (e.g. ConvertFrom-ShellQuoted) without running the dispatcher. Production
-# never sets this, so the hook always runs its main body.
+# (e.g. ConvertFrom-ShellQuoted, Rotate-Log) without running the dispatcher.
+# Production never sets this, so the hook always runs its main body.
 if ($env:ROGUE_PS_LIB_ONLY) { return }
 
 # Windows PowerShell 5.1 may negotiate only TLS 1.0/1.1 by default, which
@@ -169,6 +229,7 @@ foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BAS
 $apiKey = $creds['ROGUE_API_KEY']
 if (-not $apiKey) {
     Dbg "no API key after cred resolution -> fail-open"
+    Log "outcome=unconfigured"
     if ($EventName -eq 'sessionStart') {
         Write-Raw '{"additional_context": "Rogue Security plugin is installed but not configured. Run /rogue:setup to connect your API key."}'
     } else {
@@ -236,6 +297,7 @@ Dbg "POST $url actor=$actorEmail"
 # prompt content and can reintroduce a BOM. GetBytes() never emits a BOM.
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 $resp = ''
+$postError = ''
 try {
     $r = Invoke-WebRequest -Uri $url -Method Post `
         -Headers $headers -ContentType 'application/json' -Body $bodyBytes `
@@ -267,8 +329,17 @@ try {
         Dbg "error status: $([int]$_.Exception.Response.StatusCode)"
     }
     if ($errBody) { Dbg "error response body: $errBody" }
+    $postError = $_.Exception.Message
     $resp = ''
 }
+
+# Exactly one line per invocation, always, so a relay/decision bug is
+# diagnosable from the hook log alone without re-instrumenting the script
+# (mirrors hook.sh's `log "rc=… raw=…"`). An empty `raw=` means fail-open: either
+# the request threw (then `error=` says why) or the server answered non-200.
+$respHead = if ($resp.Length -gt 400) { $resp.Substring(0, 400) } else { $resp }
+if ($postError) { Log "raw=$(Sanitize $respHead) error=`"$(Sanitize $postError)`"" }
+else            { Log "raw=$(Sanitize $respHead)" }
 
 Emit-Json $resp
 
@@ -316,8 +387,10 @@ if ($EventName -eq 'sessionStart') {
             -Headers $hbHeaders -ContentType 'application/json' -Body $hbBytes `
             -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         Dbg "heartbeat HTTP $($r.StatusCode)"
+        Log "heartbeat=$($r.StatusCode) ver=$hbVer"
     } catch {
         Dbg "heartbeat POST failed: $($_.Exception.Message)"
+        Log "heartbeat=fail ver=$hbVer error=`"$(Sanitize $_.Exception.Message)`""
     }
 }
 

@@ -74,7 +74,15 @@ load_env() {
   [ -r /etc/rogue/env ]       && . /etc/rogue/env
   [ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
 
-  ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+  # Log destination — ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so
+  # a machine running Antigravity + Claude Code + Cursor + … used to interleave
+  # all of them into a single hook.log with no way to tell whose line was whose.
+  # Precedence: explicit file → directory override → per-agent default.
+  ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+  ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/antigravity.log}"
+  # Size cap; over it the current log is renamed to <file>.1 (one generation
+  # kept, so worst case on disk is 2x this). 0/non-numeric disables rotation.
+  ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-2097152}"
   # IDE store reads: off entirely with 0, read-but-never-attach with `log`.
   DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
   MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"
@@ -86,8 +94,22 @@ load_env() {
   URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/antigravity}"
 }
 
+# Trim the log before appending. Rotation lives on the WRITE PATH and not in a
+# periodic job on purpose: an UNCONFIGURED install writes a line per event and
+# never runs anything else, so a cap enforced anywhere else would not hold.
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  case "$ROGUE_LOG_MAX_BYTES" in ''|0|*[!0-9]*) return 0 ;; esac
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
+
 log() {
   mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+  rotate_log
   printf '%s provider=antigravity event=%s %s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
 }

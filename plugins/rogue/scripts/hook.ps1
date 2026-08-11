@@ -119,9 +119,60 @@ function Repair-DoubleEncodedUtf8 {
     return $Text
 }
 
+# -- logging ----------------------------------------------------------------
+# ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
+# machine running Claude Code + Codex + Cursor + … used to interleave all of them
+# into a single hook.log with no way to tell whose line was whose. Precedence:
+# $env:ROGUE_LOG_FILE → $env:ROGUE_LOG_DIR/claude.log → default.
+# $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
+# through the ROGUE_PS_LIB_ONLY seam below (tests).
+#
+# NOTE the sh/ps asymmetry, which predates this change: hook.sh resolves these
+# AFTER sourcing the env files, so `~/.rogue-env` can set them there. Here they
+# come from the PROCESS environment only, because logging is initialised before
+# credential parsing (Log has to work on the unconfigured path below).
+$logFile = $env:ROGUE_LOG_FILE
+if (-not $logFile) {
+    $logDir = $env:ROGUE_LOG_DIR
+    if (-not $logDir) {
+        $userHome = $env:USERPROFILE
+        if (-not $userHome) { $userHome = $HOME }
+        if ($userHome) { $logDir = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+    }
+    if ($logDir) { $logFile = Join-Path $logDir 'claude.log' }
+}
+# Size cap. Over it the current log is renamed to <file>.1 (exactly one
+# generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
+# rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
+# UNCONFIGURED install writes a line per event and never runs anything else, so
+# a cap enforced anywhere else would not hold.
+$logMaxBytes = 2097152
+if ($env:ROGUE_LOG_MAX_BYTES -match '^[0-9]+$') { $logMaxBytes = [int64]$env:ROGUE_LOG_MAX_BYTES }
+function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+function Log {
+    param([string]$Msg)
+    try {
+        if (-not $logFile) { return }
+        $dir = Split-Path $logFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Add-Content -LiteralPath $logFile -Value "$stamp provider=claude event=$EventName $Msg" -Encoding UTF8
+    } catch {}
+}
+
 # Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
-# (e.g. ConvertFrom-ShellQuoted) without running the dispatcher. Production never
-# sets this, so the hook always runs its main body.
+# (e.g. ConvertFrom-ShellQuoted, Rotate-Log) without running the dispatcher.
+# Production never sets this, so the hook always runs its main body.
 if ($env:ROGUE_PS_LIB_ONLY) { return }
 
 # Windows PowerShell 5.1 may negotiate only TLS 1.0/1.1 by default, which modern
@@ -144,23 +195,10 @@ if (-not $env:CLAUDE_CODE_ENTRYPOINT) { Write-Raw '{}'; exit 0 }
 if (-not $EventName) { Dbg "no event name -> {}"; Write-Raw '{}'; exit 0 }
 Dbg "event=$EventName"
 
-# -- plugin root + logging --------------------------------------------------
+# -- plugin root ------------------------------------------------------------
 $pluginRoot = $env:CLAUDE_PLUGIN_ROOT
 if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
 Dbg "pluginRoot=$pluginRoot"
-
-$logFile = $env:ROGUE_LOG_FILE
-if (-not $logFile) { $logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log' }
-function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
-function Log {
-    param([string]$Msg)
-    try {
-        $dir = Split-Path $logFile
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp event=$EventName $Msg" -Encoding UTF8
-    } catch {}
-}
 
 # -- credential resolution (later file wins; process env wins over all) -----
 $creds = @{}

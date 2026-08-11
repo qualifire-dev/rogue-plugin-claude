@@ -26,6 +26,8 @@
 # empty body all yield `{}` on stdout, exit 0. Cursor
 # must never block because Rogue infrastructure is unavailable.
 #
+# Logs every invocation to $ROGUE_LOG_FILE (default ~/.rogue/logs/cursor.log).
+#
 # Credential resolution (later file wins; process env wins over all):
 #   1. ${CURSOR_PLUGIN_ROOT}/env   (baked into a compiled customer plugin)
 #   2. /etc/rogue/env              (MDM-provisioned)
@@ -80,9 +82,47 @@ done
 [ -n "$_penv_ROGUE_ACTOR_NAME" ]  && ROGUE_ACTOR_NAME="$_penv_ROGUE_ACTOR_NAME"
 [ -n "$_penv_ROGUE_BASE_URL" ]    && ROGUE_BASE_URL="$_penv_ROGUE_BASE_URL"
 
+# ── hook log ───────────────────────────────────────────────────────────────
+# `dbg` above only writes to stderr under ROGUE_DEBUG, which Cursor keeps in its
+# own per-session log — useless for after-the-fact diagnosis and unavailable to
+# /rogue:status. So every invocation also gets one durable line here, matching the
+# other Rogue plugins' format: "<ts> provider=cursor event=<E> <k=v>".
+#
+# ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a single hook.log
+# would interleave Cursor with Claude Code / Codex / … and lose attribution.
+# Precedence: explicit file → directory override → per-agent default. Resolved
+# AFTER the env files are sourced, so `~/.rogue-env` can set either.
+ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/cursor.log}"
+# Size cap. Over it the current log is renamed to <file>.1 (exactly one
+# generation kept, so worst case on disk is 2x this). 0 or non-numeric disables
+# rotation. Enforced on the WRITE PATH and not by a periodic job on purpose: an
+# UNCONFIGURED install writes a line per event and never runs anything else, so
+# a cap enforced anywhere else would not hold.
+ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-2097152}"
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  case "$ROGUE_LOG_MAX_BYTES" in ''|0|*[!0-9]*) return 0 ;; esac
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
+log() {
+  mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+  rotate_log
+  printf '%s provider=cursor event=%s %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
+}
+# Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
+# can carry anything), and a raw newline or CR would forge extra log lines.
+sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+
 API_KEY="${ROGUE_API_KEY:-}"
 if [ -z "$API_KEY" ]; then
   dbg "no API key after cred resolution -> fail-open"
+  log "outcome=unconfigured"
   if [ "$event" = "sessionStart" ]; then
     printf '%s' '{"additional_context": "Rogue Security plugin is installed but not configured. Run /rogue:setup to connect your API key."}'
   else
@@ -121,7 +161,9 @@ _bom="$(printf '\357\273\277')"
 PAYLOAD="${PAYLOAD#"$_bom"}"
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
-command -v curl >/dev/null 2>&1 || { dbg "curl not found -> {}"; printf '{}'; exit 0; }
+command -v curl >/dev/null 2>&1 || {
+  dbg "curl not found -> {}"; log "outcome=fail-open reason=no-curl"; printf '{}'; exit 0
+}
 
 URL="$BASE_URL/api/v1/hooks/cursor"
 dbg "POST $URL actor=$actor_email"
@@ -136,6 +178,10 @@ RESP="$(printf '%s' "$PAYLOAD" | curl -fsS --max-time 10 -X POST \
   -H 'x-rogue-source: cursor' \
   --data-binary @- "$URL" 2>/dev/null)"; _rc=$?
 dbg "curl rc=$_rc resp_len=${#RESP}"
+# Always log the raw response head so a relay/decision bug is diagnosable from
+# the hook log alone, without re-instrumenting the script. `-f` means a non-zero
+# rc is either a transport failure or an HTTP >= 400, and curl printed nothing.
+log "rc=$_rc raw=$(sanitize "$RESP" | head -c 400)"
 [ "$_rc" -eq 0 ] || RESP=""
 
 # ── presence heartbeat (sessionStart only, fire-and-forget) ────────────────
@@ -161,6 +207,8 @@ if [ "$event" = "sessionStart" ]; then
   HB_BODY=$(printf '{"agent_family":"cursor","agent":"cursor","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
     "$(hb_esc "$HB_VER")" "$(hb_esc "$HB_HOST")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
   dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$HB_VER host=$HB_HOST"
+  # Detached, so its HTTP outcome is unobservable — record only that it fired.
+  log "heartbeat=fired ver=$HB_VER"
   ( curl -fsS --max-time 10 -X POST \
       -H 'Content-Type: application/json' \
       -H "x-rogue-api-key: $API_KEY" \

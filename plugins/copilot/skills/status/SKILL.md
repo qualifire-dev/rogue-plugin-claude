@@ -68,8 +68,12 @@ event set under `tools.github_copilot` (`monitoredEvents`, `blockingEvents`).
 
 ## Step 4: Show the recent hook log
 
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`copilot.log` only — a sibling agent's activity lives in `claude.log`,
+`cursor.log`, and so on. `<file>.1` is the previous rotation, if any.
+
 ```bash
-tail -n 20 "${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}" 2>/dev/null || echo "(no hook log yet)"
+tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/copilot.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
 
 ## Step 5: Confirm hooks are trusted
