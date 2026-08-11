@@ -133,6 +133,36 @@ if [ -d "plugins/gemini" ]; then
   rm -rf "$GMSTAGE"
 fi
 
+# ── Google Antigravity plugin tarball ────────────────────────────────────────
+# Antigravity has no plugin-CLI marketplace; the one-line installer downloads
+# THIS tarball, extracts it, copies it into ~/.gemini/config/plugins/rogue, and
+# (if `agy` is on PATH) also runs `agy plugin install <dir>`. Like Gemini — and
+# unlike the Claude/Codex/Cursor tarballs, which stage the plugin UNDER
+# plugins/<x>/ — the archive's TOP DIR *is* the plugin: plugin.json sits at the
+# archive root. Antigravity's plugin.json has NO `version` field (schema is
+# additionalProperties:false), so the version lives in a bundled VERSION file
+# instead. Versionless tarball name keeps the /releases/latest/download/ URL
+# stable. Cross-platform by content (ships both hook.sh and hook.ps1).
+if [ -d "plugins/antigravity" ]; then
+  AGV_VER="$(head -n1 plugins/antigravity/VERSION 2>/dev/null | tr -d ' \r\n')"
+  [ -n "$AGV_VER" ] || { echo "✗ unable to read plugins/antigravity/VERSION" >&2; exit 1; }
+  echo "→ antigravity plugin version: $AGV_VER"
+  AGVSTAGE=$(mktemp -d)
+  AGVTOP="$AGVSTAGE/rogue-plugin-antigravity"
+  mkdir -p "$AGVTOP"
+  # Copy the plugin CONTENTS to the archive top dir (manifest at root).
+  cp -R plugins/antigravity/. "$AGVTOP/"
+  cp LICENSE "$AGVTOP/" 2>/dev/null || true
+  AGVOUT="$DIST/rogue-plugin-antigravity.tar.gz"
+  tar -czf "$AGVOUT" \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    -C "$AGVSTAGE" "rogue-plugin-antigravity"
+  AGVSIZE=$(wc -c < "$AGVOUT" | awk '{print $1}')
+  echo "✓ $AGVOUT  ($AGVSIZE bytes, version $AGV_VER)"
+  rm -rf "$AGVSTAGE"
+fi
+
 # ── GitHub Copilot CLI plugin tarball ────────────────────────────────────────
 # Primary Copilot install path is `copilot plugin marketplace add <repo>` (git),
 # but we also ship a versionless tarball so /releases/latest/download URLs are

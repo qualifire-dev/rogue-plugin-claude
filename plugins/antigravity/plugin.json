@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "rogue",
+  "description": "Rogue Security AIDR — real-time AI agent detection and response for Google Antigravity"
+}
