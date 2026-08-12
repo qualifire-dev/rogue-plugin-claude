@@ -136,12 +136,12 @@ Write-Host ""
 Write-Host "== cap parsing: default / zero / zero-padded zero / non-numeric"
 foreach ($c in $cases) {
     $h = New-CaseHome "cap-$($c.slug)"; $homes += $h
-    Check "$($c.slug) default cap is 2 MiB" '2097152' (Invoke-Probe -Case $c -CaseHome $h)['CAP']
+    Check "$($c.slug) default cap is 10 MiB" '10485760' (Invoke-Probe -Case $c -CaseHome $h)['CAP']
     Check "$($c.slug) cap 0 disables rotation" '0' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = '0' })['CAP']
     # "00" must read as zero, matching hook.sh's `-gt 0` and Node's Number("00").
     Check "$($c.slug) cap 00 also reads as zero" '0' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = '00' })['CAP']
     # A typo must NOT silently disable the disk cap.
-    Check "$($c.slug) non-numeric cap falls back to the default" '2097152' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = 'abc' })['CAP']
+    Check "$($c.slug) non-numeric cap falls back to the default" '10485760' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = 'abc' })['CAP']
 }
 
 Write-Host ""

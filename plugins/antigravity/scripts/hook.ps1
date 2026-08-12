@@ -92,7 +92,7 @@ function ConvertFrom-ShellQuoted {
 # the `$script:` prefix or the write lands in a function-local copy and silently
 # vanishes. Every write to shared state below is therefore `$script:`-qualified.
 $logFile     = ''       # resolved in Initialize-Logging
-$logMaxBytes = 2097152  # ditto; the default stands until then
+$logMaxBytes = 10485760  # ditto; the default stands until then
 $creds      = @{}  # credential files + process env, by Import-Credentials
 $apiKey     = ''
 $url        = ''
@@ -166,7 +166,7 @@ function Initialize-Logging {
     # zero disables too — matching hook.sh's `-gt 0` test).
     $cap = $Creds['ROGUE_LOG_MAX_BYTES']
     if ($cap -match '^[0-9]+$') { $script:logMaxBytes = [int64]$cap }
-    else { $script:logMaxBytes = 2097152 }
+    else { $script:logMaxBytes = 10485760 }
 }
 
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }

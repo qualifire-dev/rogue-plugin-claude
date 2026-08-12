@@ -73,7 +73,7 @@ const LOG_FILE = ENV.ROGUE_LOG_FILE || path.join(LOG_DIR, `${PROVIDER}.log`);
 // a cap enforced anywhere else would not hold.
 const LOG_MAX_BYTES = /^\d+$/.test(ENV.ROGUE_LOG_MAX_BYTES ?? "")
   ? Number(ENV.ROGUE_LOG_MAX_BYTES)
-  : 2 * 1024 * 1024;
+  : 10 * 1024 * 1024;
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
 const sanitize = (s) => String(s ?? "").replace(CONTROL_CHARS, "");

@@ -66,7 +66,7 @@ Upgrades: re-run the one-line installer.
 
 Run `/status`. You should see HTTP 200 against the ping endpoint, your active
 rulesets, and a tail of recent hook activity (`~/.rogue/logs/antigravity.log` —
-each Rogue plugin logs to its own file, capped at 2 MiB with one `.1` rotation
+each Rogue plugin logs to its own file, capped at 10 MiB with one `.1` rotation
 kept).
 
 ## Uninstall
