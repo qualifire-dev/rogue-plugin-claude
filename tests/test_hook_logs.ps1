@@ -63,17 +63,6 @@ function Invoke-Probe {
         ROGUE_LOG_DIR       = ''
         ROGUE_LOG_MAX_BYTES = ''
     }
-    # HOMEDRIVE/HOMEPATH too, because on WINDOWS the `$HOME` the dispatchers fall back
-    # to is PowerShell's AUTOMATIC variable, and PowerShell builds it at session start
-    # from HOMEDRIVE + HOMEPATH — it does not read $env:HOME there at all. Setting only
-    # $env:HOME steered nothing, so the NoUserProfile case landed the log under the
-    # runner's real profile and reported no path: five failures that looked like a
-    # broken fallback and were a broken fixture. Harmless on Linux/macOS, where
-    # PowerShell derives $HOME from $env:HOME and ignores these two.
-    if ($CaseHome -match '^([A-Za-z]:)(.*)$') {
-        $envOverrides['HOMEDRIVE'] = $Matches[1]
-        $envOverrides['HOMEPATH'] = $Matches[2]
-    }
     $saved = @{}
     foreach ($k in $envOverrides.Keys) {
         $saved[$k] = [Environment]::GetEnvironmentVariable($k)
@@ -124,12 +113,24 @@ foreach ($c in $cases) {
 }
 
 Write-Host ""
-Write-Host "== USERPROFILE unset falls back to `$HOME (dot-sourced on macOS/Linux)"
-foreach ($c in $cases) {
-    $h = New-CaseHome "nouserprofile-$($c.slug)"; $homes += $h
-    $f = Invoke-Probe -Case $c -CaseHome $h -NoUserProfile
-    $expected = Join-Path (Join-Path (Join-Path $h '.rogue') 'logs') "$($c.slug).log"
-    Check "$($c.slug) still resolves a log path" $expected $f['LOGFILE']
+Write-Host "== USERPROFILE unset falls back to `$HOME (non-Windows only)"
+# SKIPPED ON WINDOWS, deliberately. The fallback under test is for pwsh on macOS and
+# Linux, where USERPROFILE does not exist; on Windows USERPROFILE is always set, so the
+# branch is unreachable in practice. It is also not expressible here: the `$HOME` the
+# dispatchers fall back to is PowerShell's AUTOMATIC variable, which Windows builds at
+# session start from HOMEDRIVE + HOMEPATH and never from $env:HOME — so the child cannot
+# be steered into the sandbox by this fixture, and a run with USERPROFILE stripped
+# produced no probe output at all rather than a wrong path. Asserting it there would be
+# testing the fixture, not the product.
+if ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows) {
+    Write-Host '  skip: USERPROFILE is always set on Windows; the fallback is a POSIX path'
+} else {
+    foreach ($c in $cases) {
+        $h = New-CaseHome "nouserprofile-$($c.slug)"; $homes += $h
+        $f = Invoke-Probe -Case $c -CaseHome $h -NoUserProfile
+        $expected = Join-Path (Join-Path (Join-Path $h '.rogue') 'logs') "$($c.slug).log"
+        Check "$($c.slug) still resolves a log path" $expected $f['LOGFILE']
+    }
 }
 
 Write-Host ""
