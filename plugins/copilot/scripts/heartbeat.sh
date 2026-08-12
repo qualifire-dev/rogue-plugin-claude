@@ -44,4 +44,19 @@ curl -sS --max-time 10 -X POST \
   -d "$BODY" \
   >/dev/null 2>&1 || true
 
+# ── ship the hook log ──────────────────────────────────────────────────────
+# See plugins/rogue/scripts/heartbeat.sh for why this runs after the POST (the
+# roster row must exist first), why it needs no extra backgrounding (this script is
+# already detached) and why the actor is passed in rather than re-resolved (a
+# second cascade would key the log's source row differently from the roster row).
+#
+# Slug `copilot` (the log file and the dispatcher's `provider=` token) with family
+# `copilot`; the roster's display label is `github_copilot`, which is this script's
+# business and not the shipper's - it takes the family, never the label.
+if [ -r "${PLUGIN_ROOT}/scripts/ship-logs.sh" ]; then
+  ROGUE_ACTOR_EMAIL="${ROGUE_ACTOR_EMAIL:-}" ROGUE_ACTOR_NAME="${ROGUE_ACTOR_NAME:-}" \
+    sh "${PLUGIN_ROOT}/scripts/ship-logs.sh" \
+      "${PLUGIN_ROOT}" copilot "$VER" copilot >/dev/null 2>&1 || true
+fi
+
 exit 0

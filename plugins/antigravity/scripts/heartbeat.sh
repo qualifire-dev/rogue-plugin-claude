@@ -89,6 +89,29 @@ post_heartbeat() {
     >/dev/null 2>&1 || true
 }
 
+# ── ship the hook log ──────────────────────────────────────────────────────
+# AFTER post_heartbeat, deliberately: the heartbeat is what creates or refreshes
+# the roster row an uploaded log attaches to, so this order means the server has
+# somewhere to put the logs before they arrive. This script is ALREADY detached by
+# the dispatcher, so the upload delays nothing a user sees.
+#
+# This heartbeat fires once per USER TURN, not once per session (`invocationNum`
+# resets to 0 on every new prompt — see plugins/antigravity/CLAUDE.md), so a
+# 10-prompt session calls this ten times. That is fine and needs no gate here: the
+# shipper's own 15-minute throttle is per log file and is stamped before any
+# upload, so the extra calls exit having made no request at all.
+#
+# The actor is PASSED IN, never re-resolved — a second cascade would key the log's
+# source row differently from the roster row this script just posted, and the logs
+# would attach to nothing. `-r` guarded so a partial install is a silent no-op.
+ship_logs() {
+  [ -r "${PLUGIN_ROOT}/scripts/ship-logs.sh" ] || return 0
+  ROGUE_ACTOR_EMAIL="${ROGUE_ACTOR_EMAIL:-}" ROGUE_ACTOR_NAME="${ROGUE_ACTOR_NAME:-}" \
+    sh "${PLUGIN_ROOT}/scripts/ship-logs.sh" \
+      "${PLUGIN_ROOT}" antigravity "$VER" antigravity >/dev/null 2>&1 || true
+  return 0
+}
+
 main() {
   locate_plugin_root
   load_env          # sources the env files, then normalises the base URL
@@ -97,6 +120,7 @@ main() {
   resolve_version
   resolve_surface "${1:-}"
   post_heartbeat
+  ship_logs
   exit 0
 }
 

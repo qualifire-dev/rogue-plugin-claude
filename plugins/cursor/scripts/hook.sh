@@ -363,6 +363,30 @@ if [ "$event" = "sessionStart" ]; then
       -d "$HB_BODY" \
       "$BASE_URL/api/v1/hooks/status" \
       </dev/null >/dev/null 2>&1 & )
+
+  # ── ship the hook log ────────────────────────────────────────────────────
+  # DETACHED, with the same double-fork as the heartbeat above. That is not
+  # optional here the way it is in the other plugins: their shipper call sits in
+  # heartbeat.sh, which is already a detached background process, whereas this
+  # one runs inside the SYNCHRONOUS dispatcher - Cursor is waiting on our stdout
+  # for the session-start decision, so an inline upload would delay session start
+  # by however long the POST takes.
+  #
+  # After the heartbeat, for the same reason as everywhere else: the heartbeat
+  # creates or refreshes the roster row the uploaded log attaches to.
+  #
+  # The actor MUST be passed explicitly. Unlike the other plugins, which get it
+  # from actor.sh (which exports), this dispatcher resolves the actor into plain
+  # shell LOCALS - so without this prefix the child would inherit nothing, find no
+  # identity, and skip. It also must not re-resolve: Cursor's own cascade ends at
+  # "$USER@$(hostname)" where actor.sh ends at `hostname`, so a re-resolve here
+  # would key the log's source row differently from the roster row just posted.
+  if [ -r "$PLUGIN_ROOT/scripts/ship-logs.sh" ]; then
+    ( ROGUE_ACTOR_EMAIL="$actor_email" ROGUE_ACTOR_NAME="$actor_name" \
+        sh "$PLUGIN_ROOT/scripts/ship-logs.sh" \
+          "$PLUGIN_ROOT" cursor "$HB_VER" cursor \
+        </dev/null >/dev/null 2>&1 & )
+  fi
 fi
 
 emit "$RESP"

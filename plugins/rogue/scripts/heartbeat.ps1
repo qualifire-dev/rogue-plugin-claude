@@ -46,8 +46,11 @@ try {
 
 # Stand down on non-Windows (pwsh on macOS/Linux runs heartbeat.sh instead).
 if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
-# Only when Claude Code is invoking.
-if (-not $env:CLAUDE_CODE_ENTRYPOINT) { exit 0 }
+# CLAUDE_CODE_ENTRYPOINT used to `exit 0` right here. It now guards only the beacon
+# POST below, in lockstep with heartbeat.sh: this script also ships the hook log, and
+# the entrypoint decides whether there is a SESSION to report presence for, which is
+# a different question from whether the log on disk is worth uploading. Behaviour of
+# the beacon itself is unchanged - it still fires exactly when it did.
 
 $pluginRoot = $env:CLAUDE_PLUGIN_ROOT
 if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
@@ -111,12 +114,67 @@ $body = @{
     actor_name   = [string]$actorName
 } | ConvertTo-Json -Compress
 
-try {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-    Invoke-WebRequest -Uri "$baseUrl/api/v1/hooks/status" -Method Post `
-        -Headers @{ 'x-rogue-api-key' = $apiKey } -ContentType 'application/json' `
-        -Body $bytes -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop | Out-Null
-    Dbg 'heartbeat sent'
-} catch { Dbg "heartbeat failed: $($_.Exception.Message)" }
+# The beacon, and ONLY the beacon, is gated on there being a session (see the note
+# where that check used to live).
+if ($env:CLAUDE_CODE_ENTRYPOINT) {
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        Invoke-WebRequest -Uri "$baseUrl/api/v1/hooks/status" -Method Post `
+            -Headers @{ 'x-rogue-api-key' = $apiKey } -ContentType 'application/json' `
+            -Body $bytes -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop | Out-Null
+        Dbg 'heartbeat sent'
+    } catch { Dbg "heartbeat failed: $($_.Exception.Message)" }
+}
+
+# ── ship the hook log ──────────────────────────────────────────────────────
+# AFTER the status POST when both run, for the same reason as heartbeat.sh: the
+# beacon creates or refreshes this install's roster row, so this order means it
+# exists before the logs land. An ordering preference, NOT a prerequisite - the
+# backend resolves-or-creates the log source from the identity fields the shipper
+# sends - which is why shipping sits OUTSIDE the gate above.
+#
+# A SEPARATE PROCESS, not an in-process scriptblock, for two concrete reasons:
+#   * a scriptblock created here resolves `$script:` against THIS file's scope, so
+#     ship-logs.ps1's own $script:creds / $script:offset / $script:stateKey writes
+#     would land on this script's variables;
+#   * ship-logs.ps1 ends in `exit 0`, which in-process would terminate the
+#     heartbeat instead of the shipper.
+# The child loads it via [scriptblock]::Create so ExecutionPolicy/GPO never
+# applies - the same trick hooks.json uses for the dispatchers, and the reason
+# -File is not used anywhere in this repo.
+#
+# EVERY VALUE TRAVELS AS AN ENVIRONMENT VARIABLE and the command itself is a
+# constant, so there is no string interpolation to escape: a plugin path or a
+# version containing a quote cannot alter the command. -EncodedCommand for the
+# same reason - Start-Process's -ArgumentList quoting is unreliable on Windows
+# PowerShell 5.1 for anything containing spaces.
+#
+# The actor is PASSED IN, never re-resolved: this script resolved it into ordinary
+# locals through a cascade of its own, and a second cascade inside the shipper
+# would key the log's source row differently from the roster row just posted, so
+# the logs would attach to nothing. Writing $env: here is safe - this process
+# exits immediately below.
+$shipScript = Join-Path $pluginRoot 'scripts\ship-logs.ps1'
+if (Test-Path -LiteralPath $shipScript) {
+    try {
+        $env:ROGUE_ACTOR_EMAIL     = [string]$actorEmail
+        $env:ROGUE_ACTOR_NAME      = [string]$actorName
+        $env:ROGUE_SHIPPER_SCRIPT  = $shipScript
+        $env:ROGUE_SHIPPER_ROOT    = $pluginRoot
+        $env:ROGUE_SHIPPER_SLUG    = 'claude'
+        $env:ROGUE_SHIPPER_VERSION = [string]$ver
+        $env:ROGUE_SHIPPER_FAMILY  = 'claude'
+        $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))' +
+                 ' $env:ROGUE_SHIPPER_ROOT $env:ROGUE_SHIPPER_SLUG' +
+                 ' $env:ROGUE_SHIPPER_VERSION $env:ROGUE_SHIPPER_FAMILY'
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+        $psExe = 'powershell'
+        try { if ((Get-Process -Id $PID).Path) { $psExe = (Get-Process -Id $PID).Path } } catch {}
+        Start-Process -FilePath $psExe `
+            -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded `
+            -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        Dbg 'log shipper started'
+    } catch { Dbg "log shipper not started: $($_.Exception.Message)" }
+}
 
 exit 0
