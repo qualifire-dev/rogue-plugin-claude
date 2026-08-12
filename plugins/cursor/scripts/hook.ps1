@@ -349,8 +349,25 @@ function Add-FilePreImage {
                 }
                 if ($len -gt 0) {
                     $buf = New-Object byte[] ([int]$len)
-                    $read = $fs.Read($buf, 0, [int]$len)
-                    if ($read -le 0) { return $Body }
+                    # LOOP: FileStream.Read is only guaranteed to return at least one
+                    # byte, not the count asked for. A single call that came up short
+                    # used to be base64-encoded and attached as if it were the WHOLE
+                    # file - the truncated pre-image the header above rules out, and a
+                    # divergence from hook.sh, whose `base64 < "$_fp"` always consumes
+                    # everything. A short total sends NO pre-image rather than a
+                    # partial one: not knowing the pre-edit state is safe, while
+                    # misreporting it is not. (Read-Range in ship-logs.ps1 carries the
+                    # same loop, for the same reason.)
+                    $read = 0
+                    while ($read -lt [int]$len) {
+                        $n = $fs.Read($buf, $read, [int]$len - $read)
+                        if ($n -le 0) { break }
+                        $read += $n
+                    }
+                    if ($read -ne [int]$len) {
+                        Dbg "pre-image short read ($read of $len B) -> sending none"
+                        return $Body
+                    }
                     $b64 = [Convert]::ToBase64String($buf, 0, $read)
                 }
             } finally { $fs.Close() }
