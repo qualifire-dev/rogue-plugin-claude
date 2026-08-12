@@ -6,7 +6,7 @@ files, what contract, what each step does and why. Review this before code lands
 Storage decision is settled: hook logs go to a **separate Axiom dataset**, not into
 the endpoint agent's table. Axiom is an append-only event store, so at-least-once
 delivery just means an occasional duplicate event and there is **no client-side
-dedup work** — a query can collapse on `(coding_agent_id, log_file, ts, raw)` if it
+dedup work** — a query can collapse on `(log_source_id, log_file, ts, raw)` if it
 ever matters.
 
 ## Files
@@ -40,16 +40,16 @@ between them.
 `scripts/build-release.sh` needs **no change**: every plugin is staged with
 `cp -R plugins/<x>`, so a new file in `scripts/` ships automatically.
 
-**No heartbeat change and no new client-side identifier** — the backend resolves
-the shipper's identity fields to `coding_agent.id` and stores only that in Axiom.
-See §9.
+**No heartbeat change and no new client-side identifier** — the backend hashes the
+shipper's identity fields into an opaque `log_source_id` and stores only that in
+Axiom. See §9, which also explains why it is *not* a `coding_agent.id`.
 
 ## Argument contract
 
 ```
-sh   ship-logs.sh  <plugin-root> <shipper-slug> <shipper-version>
-ps   ship-logs.ps1 <plugin-root> <shipper-slug> <shipper-version>
-node ship-logs.mjs <plugin-root> <shipper-slug> <shipper-version>
+sh   ship-logs.sh  <plugin-root> <shipper-slug> <shipper-version> <agent-family>
+ps   ship-logs.ps1 <plugin-root> <shipper-slug> <shipper-version> <agent-family>
+node ship-logs.mjs <plugin-root> <shipper-slug> <shipper-version> <agent-family>
 ```
 
 All per-plugin variation lives in the arguments — that is what lets the five copies
@@ -59,9 +59,23 @@ plugin-root var name is the one thing that genuinely differs
 the caller already holds it. `<shipper-version>` is likewise already resolved by
 the heartbeat.
 
-Called with no arguments (a support invocation by hand), it still works: the plugin
-root falls back to empty (skipping only the bundled `env`), the slug to `unknown`,
-the version to `unknown`. That path matters — see **Support use** below.
+**`<agent-family>` is passed in and never derived from the slug.** The two are
+deliberately different vocabularies — Codex's log slug is `codex` but its
+`agent_family` is `openai`, and the roster labels are `gemini_cli` /
+`github_copilot` where the slugs are `gemini` / `copilot` (see **The hook log** in
+`CLAUDE.md`). The heartbeat already hardcodes the family in its `/hooks/status`
+body (`plugins/rogue/scripts/heartbeat.sh:60`), so it is free to pass, and a
+slug→family table inside a byte-identical script would be one more thing to keep in
+lockstep.
+
+**No-argument invocation implies `ROGUE_SHIP_ALL=1`.** A bare
+`sh .../ship-logs.sh` has no slug, so "ship my own log" is not a question it can
+answer — an earlier draft said the slug falls back to `unknown`, which would make
+it look for `unknown.log` and ship nothing. Since the only caller without arguments
+is a human collecting diagnostics, no-args means *collect everything*, with
+`shipper` / `shipper_version` reported as `unknown` in the envelope. The plugin root
+is still derived from `$0`/`$PSCommandPath` so the bundled `env` is not skipped.
+`/rogue:status` passes the arguments explicitly — see **Support use**.
 
 ## Flow
 
@@ -206,18 +220,57 @@ every heartbeat already sends `host` + `actor_email` to our own API, so sending
 them to `/hooks/logs` adds no new exposure. What must stay clean is the Axiom
 dataset, whose retention and access controls are not the main database's.
 
-So the shipper sends the identity fields as-is and the **backend resolves them to
-`coding_agent.id` before ingesting**:
+So the shipper sends the identity fields as-is and the **backend resolves them to an
+opaque id before ingesting**:
 
 ```
-plugin  → POST /hooks/logs   host, actor_email, actor_name, log_file, chunk
-backend → look up coding_agent by (host | actor_email | family)   → id
-Axiom   ← coding_agent_id, log_file, offset, chunk                (no PII)
+plugin  → POST /hooks/logs   host, actor_email, actor_name, agent_family,
+                             log_file, chunk
+backend → log_source_id = hash(org_id | host | actor_email | agent_family)
+Axiom   ← log_source_id, log_file, offset, chunk                  (no PII)
 ```
 
-Correlation is then a lookup in our own DB against a row that already exists:
-`coding_agent` dedups on exactly the triple the plugin sends, and the heartbeat has
-been populating it since day one. Nothing new is invented on the client.
+#### A log file is coarser than a `coding_agent` row
+
+The first draft said "look up `coding_agent` by `(host | actor-email | family)`,
+the triple the roster dedups on". **That is wrong on both halves**, and the second
+half is the interesting one.
+
+The roster's real dedup key is **four** parts, not three —
+`` `${hostname}|${actorEmail ?? "anon"}|${family}|${agent}` ``
+(`apps/rogue-aidr-api/src/routers/hooks.ts:343`, and the `fingerprint` column
+comment in `packages/rogue-database/src/schema.ts` says the same). `agent` is the
+*surface*: `claude_code` | `claude_desktop` | `cowork`, `codex_cli` | `codex_app`,
+`antigravity_ide` | `antigravity_cli`.
+
+But **one log file is written by every surface of its family.** All three Claude
+surfaces share one plugin install, one `$HOME`, and therefore one
+`~/.rogue/logs/claude.log`. So a chunk of that file does not belong to one
+`coding_agent` row — it belongs to *all* the rows for that host, actor and family.
+Sending the shipping session's own surface (which the heartbeat does know, from
+`CLAUDE_CODE_ENTRYPOINT`) would attach a multi-surface chunk to whichever surface
+happened to open a session first. That is not under-specified, it is incorrect.
+
+**So the log's identity is genuinely the triple** — the same granularity as the file
+name — and the fix is to stop pretending it is a `coding_agent.id`:
+
+- The shipper sends `agent_family` (new field, and the reason it is now an
+  argument).
+- The backend derives **`log_source_id = hash(org_id | host | actor_email |
+  agent_family)`**, deterministic and opaque, and stores only that in Axiom. It is
+  recomputable from any `coding_agent` row's own columns, so "show me this roster
+  row's plugin log" is a join with no schema change and no PII crossing over.
+- The UI surfaces plugin logs at machine + family granularity, which is what the
+  file actually is. A roster row for `claude_desktop` shows the same log as
+  `claude_code` on that machine — correct, not a bug.
+
+**If per-surface attribution is ever needed**, the only honest way is to stamp the
+surface into each *line* at hook time (the dispatcher knows it) and let the server
+split. That is phase-1 format scope, deliberately not done here.
+
+**`hash`, not the raw triple, and not a `coding_agent.id`**: the raw triple is the
+PII we are keeping out of Axiom, and a specific row id would be a lie about
+granularity. A server-side hash is neither.
 
 **The plugin carries no identifier of its own.** An earlier draft proposed a
 generated `install_id` in `~/.rogue/install-id`; that was inventing a primary key
@@ -225,10 +278,12 @@ the database already has. Deleted. `machine_id` is likewise **not** sent — its
 job was joining to the endpoint agent's rows for the same device, and that belongs
 on the roster row once (from the heartbeat), not in every log chunk.
 
-**Lookup miss → upsert.** If the shipper reaches the backend before any heartbeat
-did (heartbeat failed, or the very first run raced it), resolve-or-create from the
-same triple rather than dropping the logs. Same dedup rule, so it converges on the
-one row.
+**No lookup miss to handle.** Because `log_source_id` is *derived* rather than
+looked up, a chunk arriving before any heartbeat still lands with a correct,
+stable id — the roster row joins to it later when the heartbeat creates it. This
+also removes the resolve-or-create path the earlier draft needed, and with it the
+risk of the log ingest inventing a `coding_agent` row with a guessed `agent`
+surface (which, given the four-part fingerprint, it would have had to).
 
 `host` is `hostname`; `actor_email` / `actor_name` come from `scripts/actor.sh`
 where present (`env` → `git config --global` → `CLAUDE_CODE_USER_EMAIL` →
@@ -273,6 +328,19 @@ while off < size and run budget remains:
 **The offset advances only on 2xx.** A non-2xx, transport failure or timeout leaves
 the state untouched, so the same range is re-sent next run. Nothing is ever marked
 exported on unconfirmed data.
+
+> **Requirement on the endpoint, not a client concern — but load-bearing for this
+> contract.** A 2xx from `/hooks/logs` is the *only* thing that makes the plugin
+> forget a byte range, so 2xx must mean **durably accepted**. The existing endpoint
+> sink is the counter-example to copy from carefully:
+> `apps/rogue-aispm-api/src/services/endpoint-logs-sink.ts` calls
+> `axiomClient.ingest(...)` **without `await`** inside a `try/catch` — so an async
+> rejection is not even caught — and returns `accepted: events.length`
+> unconditionally, including when `axiomClient` is null or the dataset env var is
+> unset. Built that way, `/hooks/logs` would 200 on a dropped chunk and the shipper
+> would advance its offset past data that never landed: **silent, permanent loss**,
+> which is exactly what the offset design exists to prevent. The ingest must be
+> awaited and its failure must produce a non-2xx.
 
 **Chunks loop until the file is drained**, rather than one chunk per run. With a
 10 MiB rotation cap and a 1 MiB per-request size, one-chunk-per-run would take ten
@@ -405,7 +473,7 @@ Open with `ReadWrite -bor Delete`, keep the open window as short as possible.
 If the backend commits a chunk and the 2xx is lost in transit, the next run re-sends
 that range. Axiom is append-only and hook logs go to their own dataset, so that is
 a duplicate event, not corruption, and a query can collapse on
-`(coding_agent_id, log_file, ts, raw)`. The alternative — advancing the offset
+`(log_source_id, log_file, ts, raw)`. The alternative — advancing the offset
 before confirmation — trades duplicates for silent loss, the wrong trade for
 diagnostics.
 
@@ -435,25 +503,42 @@ portability assumption. PowerShell uses `FileStream.Seek` + `Read`; Node uses
 The chunk is uploaded **verbatim**. The scripts do no rewriting of the log body at
 all — no `sed`, no `$HOME` → `~` substitution, no field stripping.
 
-Two things still need redacting before the body reaches Axiom, and the API does
-both:
+An earlier draft claimed only home paths and `reason=`/`raw=` need redacting and
+that "nothing else in a line is personal". **That was wrong** — the real inventory,
+grepped out of the current dispatchers rather than assumed:
 
-- **paths under the user's home directory**, which carry the username
-  (`/Users/amos/…` → `~/…`);
-- **the `reason=` / `raw=` tail**, up to 400 chars of Rogue's own API response. It
-  is data we already hold, not new collection, but a finding string can quote the
-  prompt fragment that triggered it. Whether that is kept, truncated or dropped is
-  per-tenant policy, so it belongs where policy lives.
+| token | written by | risk |
+|---|---|---|
+| timestamp, `provider=`, `event=`, `outcome=`, `http=`, `rc=` | all | none |
+| `raw=` / `reason=` | all (`hook.sh:692`) | up to 400 chars of Rogue's own API response; a finding can quote the prompt fragment that triggered it |
+| `path=` | antigravity (`hook.sh:239,244,245`) | **absolute transcript paths** — `/Users/<name>/…`, plus project directory names |
+| `name=` | copilot (`hook.sh:318`), antigravity (`hook.sh:576`) | **subagent display name** — arbitrary vendor-or-user-authored text, sanitized of control chars only |
+| `subagent=`, `parent=`, `dbstore=`, `tail=`, `len=`, `mode=` | antigravity, copilot | opaque ids and counters |
 
-Doing it in `sh` and PowerShell would mean the same substitution written three
-times, with a `sed` escaping hazard in one of them (a `$HOME` containing `&`, `|`
-or `\` silently mangles the chunk) and no realistic way to unit-test the policy.
+So the requirement is **not** "redact two fields": server-side redaction must run
+over **every parsed field and the raw line**, the way
+`apps/rogue-aispm-api/src/services/endpoint-logs-redact.ts` already does for the
+endpoint agent — `redactEvent` walks every string value through `redactString`,
+which rewrites `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` to `~`. Reuse
+it rather than growing a second implementation. Two gaps it does not cover today
+and this ingest needs:
+
+- **`name=`** is arbitrary text, not a path, so `redactString` passes it through
+  untouched. Needs its own decision — keep (it is a tool label, usually harmless),
+  or drop under the same policy switch as `raw=`.
+- **`raw=` / `reason=`** likewise. Whether it is kept, truncated or dropped is
+  per-tenant policy.
+
+Doing any of this in `sh` and PowerShell would mean the same substitutions written
+three times, with a `sed` escaping hazard in one of them (a `$HOME` containing `&`,
+`|` or `\` silently mangles the chunk) and no realistic way to unit-test a policy.
 Server-side it is one function, one test file, and it can change without a plugin
 release — which matters because the fleet updates on a 24 h auto-update cycle at
 best.
 
-Nothing else in a line is personal: phase 1's format is a closed set of `k=v`
-tokens (timestamp, `provider=`, `event=`, `outcome=`, `http=`, `rc=`).
+**Tests must cover the real cases**, not a synthetic `$HOME` line: an antigravity
+`tail=none reason=unreadable path=/Users/amos/…/transcript.jsonl` line, and a
+copilot `subagent=… parent=… name=<display name>` line.
 
 ## Wire format
 
@@ -463,10 +548,11 @@ Headers: `x-rogue-api-key`, `Content-Type: application/json`. Nothing else — n
 `x-rogue-event` (not a hook event), no `x-rogue-source`, no `x-rogue-agent`.
 
 ```jsonc
-{ "host":             "…",          // resolved to coding_agent.id server-side,
+{ "host":             "…",          // hashed into log_source_id server-side,
   "actor_email":      "…",          //   NOT forwarded to Axiom — see §9
   "actor_name":       "…",
-  "shipper":          "claude",     // which plugin's copy ran
+  "agent_family":     "claude",     // roster vocabulary: codex's family is `openai`
+  "shipper":          "claude",     // which plugin's copy ran (log-slug vocabulary)
   "shipper_version":  "1.4.2",
   "log_file":         "claude.log", // basename only; the directory is site config
   "offset":           12345,        // byte offset this chunk starts at
@@ -478,6 +564,16 @@ Headers: `x-rogue-api-key`, `Content-Type: application/json`. Nothing else — n
 `shipper` and `log_file` are equal in the default configuration and differ only
 under `ROGUE_SHIP_ALL` or `ROGUE_LOG_FILE`. Both are envelope-level hints; the
 per-line `provider=` token remains authoritative for which agent a line came from.
+`agent_family` is the one identity-bearing field of the three — it is what
+`log_source_id` is derived from. It is sent for the caller's **own** log, where the
+caller passed it in. For a *foreign* log under `ROGUE_SHIP_ALL` it is **omitted**,
+and the server derives the family from `log_file`: the slug→family mapping
+(`codex` → `openai`, `gemini` → `gemini_cli`'s family `gemini`, …) is server
+vocabulary, and putting a copy of it in a byte-identical shell script is exactly
+the lockstep liability this design avoids elsewhere.
+
+**No `agent` (surface) field, deliberately** — see §9: one log file spans every
+surface of its family, so a surface on the envelope would be a false precision.
 
 **Why `content_b64` and not parsed records**, in order of weight:
 
@@ -532,12 +628,20 @@ Run by hand on a machine with no endpoint agent — the single most useful prope
 of this script:
 
 ```sh
-sh ~/.claude/plugins/.../scripts/ship-logs.sh                        # this agent
-ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_SHIP_ALL=1 sh .../ship-logs.sh       # everything, now
+# No arguments → collects every agent's log (ROGUE_SHIP_ALL is implied, since
+# without a slug there is no "own log" to pick). Throttled like any other run.
+sh ~/.claude/plugins/.../scripts/ship-logs.sh
+
+# Same, ignoring the throttle — the actual support one-liner.
+ROGUE_SHIP_MIN_INTERVAL=0 sh ~/.claude/plugins/.../scripts/ship-logs.sh
+
+# This agent only, attributed properly: pass what the heartbeat passes.
+sh .../ship-logs.sh "$CLAUDE_PLUGIN_ROOT" claude 1.4.2 claude
 ```
 
-`/rogue:status` gains a final step offering exactly that, in all six status
-commands (`plugins/{rogue,gemini,antigravity,copilot}/skills/status/SKILL.md`,
+`/rogue:status` gains a final step offering exactly that — **with the arguments
+filled in**, since the status command knows its own plugin root, slug, version and
+family — in all six status commands (`plugins/{rogue,gemini,antigravity,copilot}/skills/status/SKILL.md`,
 `plugins/{codex,cursor}/commands/status.md`), with the bash and PowerShell forms
 each already carries.
 
@@ -598,8 +702,17 @@ Cases:
   through base64 **byte-exact**; a chunk containing a NUL byte is not truncated
   (the temp-file path, not a shell variable);
 - `host` / `actor_email` / `actor_name` in the envelope match what the heartbeat
-  resolves on the same machine — if they drift, the lookup creates a second roster
-  row instead of matching (assert against `actor.sh`'s own output);
+  resolves on the same machine — if they drift, `log_source_id` differs from the one
+  a roster row hashes to and the logs orphan (assert against `actor.sh`'s output);
+- `agent_family` is the value the **caller passed**, never derived from the slug —
+  assert the codex copy sends `openai` while its `shipper` stays `codex`, the one
+  case a naive slug→family assumption breaks;
+- under `ROGUE_SHIP_ALL=1`, the caller's own log carries `agent_family` and a
+  foreign log **omits** it (the server derives that one from `log_file`);
+- **no `agent` / surface field is ever sent** (§9: a log file spans every surface of
+  its family, so a surface on the envelope would be false precision);
+- **no-argument invocation ships every log**, not `unknown.log`, and reports
+  `shipper: "unknown"`;
 - unconfigured (no API key) is a silent no-op.
 
 ## Not doing
