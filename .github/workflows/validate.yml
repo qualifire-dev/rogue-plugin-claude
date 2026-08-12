@@ -141,6 +141,41 @@ jobs:
             }
             exit $bad'
 
+      - name: No dash or quote lookalikes in PowerShell code
+        # These characters inside a STRING are a Windows PowerShell 5.1 parse error,
+        # and the failure mode is total. 5.1 reads a BOM-less file as ANSI, so the
+        # trailing byte of an em dash (U+2014 -> 0x94), an en dash (0x93) or an arrow
+        # (U+2192 -> 0x92) decodes to a SMART QUOTE — which PowerShell honors as a
+        # string delimiter. The string ends early, the braces stop matching, and the
+        # file does not parse at all. In a dispatcher that means hooks.json's
+        # `catch { '{}' }` swallows it and every Windows user silently loses
+        # enforcement. pwsh 7 reads the very same file as UTF-8 and sees nothing
+        # wrong, which is exactly why a parse check cannot catch this and this step
+        # exists. Found by the new windows-latest job, on tests/test_hook_ps1_*.
+        #
+        # Only these characters, not all non-ASCII: `…` (U+2026 -> 0xA6) and `é`
+        # (0xA9) are harmless, and one test asserts non-ASCII passthrough on purpose.
+        # Comments are exempt — they are never parsed as code. `#`-stripping is a
+        # heuristic (a `#` inside a string hides the rest of that line), so this can
+        # miss a violation but never invents one.
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          DANGEROUS = '‐‑‒–—―‘’‚‛“”→←'
+          bad = 0
+          for path in subprocess.run(['git', 'ls-files', '*.ps1'],
+                                     capture_output=True, text=True).stdout.split():
+              for number, line in enumerate(open(path, encoding='utf-8'), 1):
+                  code = re.sub(r'#.*', '', line)
+                  hits = sorted({c for c in code if c in DANGEROUS})
+                  if hits:
+                      print(f"::error file={path},line={number}::"
+                            f"{''.join(hits)} outside a comment - breaks Windows PowerShell 5.1"
+                            f" (BOM-less ANSI decode turns it into a string delimiter)")
+                      bad = 1
+          sys.exit(bad)
+          PY
+
       - name: PowerShell unit tests
         # All of these load their dispatcher through the ROGUE_PS_LIB_ONLY seam, so
         # the functions run on Linux even though the main body stands down there.

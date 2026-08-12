@@ -112,7 +112,7 @@ foreach ($fn in $functions) {
     }
 }
 if ($unscoped) {
-    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: — $_" }
+    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: - $_" }
     $failures += $unscoped.Count
 } else {
     Write-Host "  ok: $(Split-Path $file -Leaf): every shared-state write inside a function is `$script:-qualified"

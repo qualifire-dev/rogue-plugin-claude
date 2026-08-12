@@ -104,22 +104,46 @@ function LastEnvelopeField {
     if ($line -match ('"' + [regex]::Escape($Field) + '":([0-9]+)')) { return $Matches[1] }
     return ''
 }
+# Runs one of the product's .ps1 files in a CHILD powershell and waits for it.
+# Nothing here may be run in-process: ship-logs.ps1 and heartbeat.ps1 both end in
+# `exit 0`, which in-process terminates the CALLER - see the note on Invoke-Shipper.
+# Every value travels as an environment variable and the command itself is a
+# constant, so there is no interpolation to escape; -EncodedCommand because
+# Start-Process's -ArgumentList quoting is unreliable on Windows PowerShell 5.1.
+function Invoke-ProductScript {
+    param([string]$RelativePath, [string]$ArgumentTail = '')
+    $env:ROGUE_E2E_SCRIPT = Join-Path $repo $RelativePath
+    $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_E2E_SCRIPT)))'
+    if ($ArgumentTail) { $inner += ' ' + $ArgumentTail }
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+    return Start-Process -FilePath 'powershell' `
+        -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded `
+        -NoNewWindow -PassThru -Wait
+}
+
 # ROGUE_SHIP_LOGS=1 on every run: shipping is OPT-IN until /api/v1/hooks/logs is
 # deployed, so without it every case here would pass vacuously against a shipper that
 # did nothing. The default itself is asserted once, on its own, below.
+#
+# A CHILD PROCESS, never in-process, for the same reason the heartbeats spawn one:
+# ship-logs.ps1's Invoke-Main ends in `exit 0`, which in-process terminates the
+# CALLER. The first version of this file ran it in-process and silently exited 0
+# half way through, after two passing checks and with no error and no failure count -
+# the run just stopped. That is precisely the hazard the callers document, so
+# reproducing it here would have made the suite lie about its own coverage.
+# Still loaded through [scriptblock]::Create, exactly as hooks.json and the
+# heartbeats load it, so ExecutionPolicy/GPO cannot be what makes this pass or fail.
 function Invoke-Shipper {
     param([hashtable]$Extra = @{})
     $env:ROGUE_BASE_URL = $baseUrl
     $env:ROGUE_SHIP_MIN_INTERVAL = '0'
     $env:ROGUE_SHIP_LOGS = '1'
     foreach ($k in $Extra.Keys) { Set-Item "Env:$k" $Extra[$k] }
-    try {
-        # Loaded exactly as hooks.json and the heartbeats load it - through
-        # [scriptblock]::Create, never -File - so ExecutionPolicy/GPO cannot be what
-        # makes this pass or fail.
-        & ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/ship-logs.ps1')))) `
-            (Join-Path $repo 'plugins/rogue') 'claude' '9.9.9' 'claude' 2>&1 | Out-Null
-    } catch {}
+    # Waited on, unlike the heartbeat's detached spawn: every assertion below is about
+    # what the run produced, so the run has to be over.
+    $env:ROGUE_E2E_ROOT = Join-Path $repo 'plugins/rogue'
+    $child = Invoke-ProductScript 'plugins/rogue/scripts/ship-logs.ps1' '$env:ROGUE_E2E_ROOT claude 9.9.9 claude'
+    if ($child.ExitCode -ne 0) { Fail "the shipper exited $($child.ExitCode) (it must always exit 0)" }
     foreach ($k in $Extra.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
 }
 $logDir = Join-Path (Join-Path $sandboxHome '.rogue') 'logs'
@@ -141,8 +165,7 @@ Write-Host ''
 Write-Host '== setup.ps1 writes credentials the shipper can read'
 # The product's own script, not a hand-rolled file: its quoting is exactly what
 # Import-ShipEnv has to parse back, and that round trip is part of what is under test.
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/setup.ps1')))) `
-    e2e-key amos@rogue.security amos 2>&1 | Out-Null
+Invoke-ProductScript 'plugins/rogue/scripts/setup.ps1' 'e2e-key amos@rogue.security amos' | Out-Null
 Check 'setup.ps1 wrote %USERPROFILE%\.rogue-env' 'True' `
     ([string](Test-Path -LiteralPath (Join-Path $sandboxHome '.rogue-env')))
 
@@ -227,8 +250,8 @@ $optInBefore = Envelopes
 $env:ROGUE_BASE_URL = $baseUrl
 $env:ROGUE_SHIP_MIN_INTERVAL = '0'
 Remove-Item Env:ROGUE_SHIP_LOGS -ErrorAction SilentlyContinue
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/ship-logs.ps1')))) `
-    (Join-Path $repo 'plugins/rogue') 'claude' '9.9.9' 'claude' 2>&1 | Out-Null
+$env:ROGUE_E2E_ROOT = Join-Path $repo 'plugins/rogue'
+Invoke-ProductScript 'plugins/rogue/scripts/ship-logs.ps1' '$env:ROGUE_E2E_ROOT claude 9.9.9 claude' | Out-Null
 Check 'an opt-out install uploads nothing' ([string]$optInBefore) ([string](Envelopes))
 Invoke-Shipper
 Check 'and the same lines upload once opted in' ([string]($optInBefore + 1)) ([string](Envelopes))
@@ -243,8 +266,7 @@ Write-Host '== heartbeat.ps1 actually starts the shipper (a child process, not i
 $callerHome = Join-Path $sandbox 'home2'
 New-Item -ItemType Directory -Path (Join-Path (Join-Path $callerHome '.rogue') 'logs') -Force | Out-Null
 $env:USERPROFILE = $callerHome
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/setup.ps1')))) `
-    e2e-key caller@rogue.security 'Caller Person' 2>&1 | Out-Null
+Invoke-ProductScript 'plugins/rogue/scripts/setup.ps1' "e2e-key caller@rogue.security 'Caller Person'" | Out-Null
 [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $callerHome '.rogue') 'logs') 'claude.log'),
     "2026-08-12T00:00:01Z provider=claude event=PreToolUse outcome=allow n=1`n",
     (New-Object System.Text.UTF8Encoding($false)))
@@ -254,7 +276,7 @@ $env:CLAUDE_CODE_ENTRYPOINT = 'cli'
 $env:ROGUE_BASE_URL = $baseUrl
 $env:ROGUE_SHIP_MIN_INTERVAL = '0'
 $env:ROGUE_SHIP_LOGS = '1'
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/heartbeat.ps1')))) 2>&1 | Out-Null
+Invoke-ProductScript 'plugins/rogue/scripts/heartbeat.ps1' | Out-Null
 # The shipper is DETACHED by design, so poll for its upload instead of assuming it
 # has finished by the time the heartbeat returns.
 for ($i = 0; $i -lt 100; $i++) {

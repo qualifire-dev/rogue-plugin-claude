@@ -172,7 +172,7 @@ foreach ($c in $cases) {
     Check "$($c.slug) rotated the old log to $($c.slug).log.1" 'True' $f['ROTATED']
     Check "$($c.slug) started a fresh log (1 line)" '1' $f['LINES']
     if ($f['PREVIOUS'] -eq 'STALE-PREVIOUS-GENERATION') {
-        Fail "$($c.slug) left the stale .1 in place — rotation silently no-oped"
+        Fail "$($c.slug) left the stale .1 in place - rotation silently no-oped"
     } else { Pass "$($c.slug) replaced the previous .1 generation" }
 }
 
