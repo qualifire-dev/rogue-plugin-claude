@@ -63,6 +63,17 @@ function Invoke-Probe {
         ROGUE_LOG_DIR       = ''
         ROGUE_LOG_MAX_BYTES = ''
     }
+    # HOMEDRIVE/HOMEPATH too, because on WINDOWS the `$HOME` the dispatchers fall back
+    # to is PowerShell's AUTOMATIC variable, and PowerShell builds it at session start
+    # from HOMEDRIVE + HOMEPATH — it does not read $env:HOME there at all. Setting only
+    # $env:HOME steered nothing, so the NoUserProfile case landed the log under the
+    # runner's real profile and reported no path: five failures that looked like a
+    # broken fallback and were a broken fixture. Harmless on Linux/macOS, where
+    # PowerShell derives $HOME from $env:HOME and ignores these two.
+    if ($CaseHome -match '^([A-Za-z]:)(.*)$') {
+        $envOverrides['HOMEDRIVE'] = $Matches[1]
+        $envOverrides['HOMEPATH'] = $Matches[2]
+    }
     $saved = @{}
     foreach ($k in $envOverrides.Keys) {
         $saved[$k] = [Environment]::GetEnvironmentVariable($k)
