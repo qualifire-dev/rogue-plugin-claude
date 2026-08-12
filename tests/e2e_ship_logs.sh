@@ -71,7 +71,13 @@ echo "receiver on $BASE"
 # ── credentials, written by the REAL setup script ──────────────────────────
 # Not a hand-rolled env file: setup.sh's quoting is what hook.sh and ship-logs.sh
 # both have to parse, so writing it any other way would test a format nothing ships.
-sh "$REPO/plugins/rogue/scripts/setup.sh" e2e-key amos@rogue.security amos >/dev/null 2>&1
+#
+# `bash`, matching its shebang, NOT `sh`. setup.sh quotes values with printf '%q',
+# which is a bash builtin extension: under dash it produces nothing and the file is
+# never written. That is invisible on macOS, where /bin/sh IS bash in POSIX mode, and
+# fails on every Linux runner — which is exactly how CI caught it after this suite
+# passed locally.
+bash "$REPO/plugins/rogue/scripts/setup.sh" e2e-key amos@rogue.security amos >/dev/null 2>&1
 check "setup.sh wrote ~/.rogue-env" "yes" "$([ -f "$HOME/.rogue-env" ] && echo yes || echo no)"
 
 LOG="$HOME/.rogue/logs/claude.log"
@@ -231,7 +237,7 @@ echo "== the REAL caller fires the shipper (not just the shipper directly)"
 new_home="$SB/home2"
 mkdir -p "$new_home"
 caller_before="$(envelopes)"
-HOME="$new_home" sh "$REPO/plugins/rogue/scripts/setup.sh" \
+HOME="$new_home" bash "$REPO/plugins/rogue/scripts/setup.sh" \
   e2e-key caller@rogue.security "Caller Person" >/dev/null 2>&1
 caller_log="$new_home/.rogue/logs/claude.log"
 mkdir -p "$new_home/.rogue/logs"
