@@ -195,11 +195,16 @@ $cases = @(
        expected = 'C:/Users/y/.gemini/antigravity-ide/brain/c/t.jsonl' }
     # The conversation id becomes a path component, so anything but an id
     # character is dropped rather than trusted.
+    # The separators are FOLDED in the comparison below, because Join-Path yields
+    # backslashes on Windows and forward slashes elsewhere. What this case is about is
+    # that the id contributed no `..` and no separator of its own - not which slash the
+    # platform builds paths with. Asserting the raw string passed on the Linux runner
+    # and failed the moment these suites also ran on windows-latest.
     @{ what = 'a traversal-shaped conversationId cannot escape the marker dir'
        actual = $marker; expected = '/tmp/rogue-test-markers/etcpasswd.missed-prompt' }
 )
 foreach ($c in $cases) {
-    if ($c.actual -eq $c.expected) { Write-Host "  ok: $($c.what)" }
+    if (($c.actual -replace '\\', '/') -eq ($c.expected -replace '\\', '/')) { Write-Host "  ok: $($c.what)" }
     else { Write-Host "FAIL [$($c.what)]: expected <$($c.expected)> but got <$($c.actual)>"; $failures++ }
 }
 }
