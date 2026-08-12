@@ -84,7 +84,11 @@ is still derived from `$0`/`$PSCommandPath` so the bundled `env` is not skipped.
 
 ```text
  1. Git Bash stand-down: uname = MINGW*/MSYS*/CYGWIN* → exit 0   (ps1 owns Windows)
- 2. load env files, later wins: <plugin-root>/env → /etc/rogue/env → $HOME/.rogue-env
+ 2. load env files, later wins — the SAME platform-aware chain the dispatchers use:
+      <plugin-root>/env
+      /etc/rogue/env            (POSIX)   |  C:\ProgramData\rogue\env  (Windows, MDM)
+      $HOME/.rogue-env          (POSIX)   |  %USERPROFILE%\.rogue-env   (Windows)
+    process env wins over all files
  3. ROGUE_SHIP_LOGS=0 → exit 0
  4. no ROGUE_API_KEY → exit 0
  5. resolve which log file(s) to ship — own slug only by default
@@ -648,8 +652,32 @@ empty → 0, and a chunk with no newline at all → its whole length (which land
 "no newline in the chunk" branch below).
 
 `LC_ALL=C` so `length()` counts bytes and not characters. Trivial in PowerShell and
-Node (scan back for `0x0A`). If a chunk contains **no** newline at all (a single
-line over 1 MiB), ship it whole rather than stalling forever.
+Node (scan back for `0x0A`).
+
+#### A line longer than one request
+
+"If the chunk has no newline, ship it whole" was **incoherent** as written: the chunk
+was already truncated to `ROGUE_SHIP_MAX_BYTES`, so "whole" shipped a *partial* line —
+contradicting the rule it was an exception to. Resolved explicitly, because "never
+send a partial line" is the invariant the server parser depends on:
+
+```text
+if the chunk [off, off+n) contains no \n:
+    extend the read forward to the next \n, up to ROGUE_SHIP_MAX_LINE_BYTES (4 MiB)
+    found      → send ONE oversized request carrying exactly that line
+    not found  → skip it: advance off past the next \n (or to EOF), and log
+                 outcome=skip reason=oversize-line
+```
+
+So `ROGUE_SHIP_MAX_BYTES` is the per-request size **for ordinary chunks**, with one
+bounded, documented exception for a single line that cannot fit. The server must
+accept a body above the normal cap; `ROGUE_SHIP_MAX_LINE_BYTES` is the real ceiling.
+
+Both branches are effectively unreachable in a healthy install — `raw=` is capped at
+400 chars and every other token is bounded, so a line is a few hundred bytes. A
+multi-megabyte line means something already went wrong (a binary blob appended, an
+interleaved write from outside the plugin), which is exactly why the tail case
+**skips forward instead of retrying**: a corrupt line must not park the file forever.
 
 #### The chunk never passes through a shell variable
 
@@ -842,14 +870,28 @@ fleet-wide, and process env still wins:
 |---|---|---|
 | `ROGUE_SHIP_LOGS` | `1` | `0` disables shipping entirely |
 | `ROGUE_SHIP_MIN_INTERVAL` | `900` | seconds between attempts, per log file |
-| `ROGUE_SHIP_MAX_BYTES` | `1048576` | bytes per HTTP request |
+| `ROGUE_SHIP_MAX_BYTES` | `1048576` | bytes per HTTP request (ordinary chunks) |
 | `ROGUE_SHIP_MAX_RUN_BYTES` | `10485760` | bytes per file per run (one generation) |
+| `ROGUE_SHIP_MAX_LINE_BYTES` | `4194304` | hard ceiling for a single oversized line |
 | `ROGUE_SHIP_ALL` | `0` | `1` ships every known agent's log, not just this one |
 | `ROGUE_BASE_URL` | `https://api.rogue.security` | as elsewhere |
 
-Numeric parsing follows phase 1's rule exactly, in all three languages: a
-non-numeric value **falls back to the default** (a typo must not disable shipping
-or blow the size cap), and zero-padding counts as its numeric value.
+Numeric parsing follows phase 1's rule, in all three languages: a non-numeric value
+**falls back to the default** (a typo must not disable shipping or blow the size cap),
+and zero-padding counts as its numeric value. A leading `-` is non-numeric under the
+digits-only test phase 1 uses (`case $v in *[!0-9]*)`), so negatives already fall back
+— but **zero does not**, and that differs per knob:
+
+| knob | zero | why |
+|---|---|---|
+| `ROGUE_SHIP_MAX_BYTES` | **rejected → default** | a 0-byte request ships nothing, so the offset never advances and the file never drains. Silent permanent stall. |
+| `ROGUE_SHIP_MAX_RUN_BYTES` | **rejected → default** | same |
+| `ROGUE_SHIP_MAX_LINE_BYTES` | **rejected → default** | same |
+| `ROGUE_SHIP_MIN_INTERVAL` | **honored — means "no throttle"** | intentional, and the documented support one-liner relies on it |
+
+Note this deliberately diverges from phase 1's *rotation* cap, where numeric zero
+means "disable rotation" — a meaningful setting there. There is no useful reading of
+"a zero-byte upload", so the three byte caps require a positive value.
 
 ## Support use
 
@@ -926,8 +968,14 @@ Cases:
 - **state keyed to the path**: ship `/a/claude.log`, then point `ROGUE_LOG_DIR` at
   `/b` with a different `claude.log`, and assert the second run starts at offset 0
   instead of inheriting `/a`'s offset;
-- a single line longer than `ROGUE_SHIP_MAX_BYTES` is shipped whole rather than
-  stalling the file forever;
+- a single line longer than `ROGUE_SHIP_MAX_BYTES` is shipped as **one oversized
+  request containing that whole line** — assert the body ends with `\n` and is larger
+  than the cap, i.e. that we never emit a partial line to satisfy the cap;
+- a line longer than `ROGUE_SHIP_MAX_LINE_BYTES` is **skipped forward past its
+  newline** with `outcome=skip reason=oversize-line`, and the file keeps draining
+  afterwards (assert the following lines still ship — a stall here is permanent);
+- `ROGUE_SHIP_MAX_BYTES=0`, `=-1` and `=abc` all fall back to the default rather than
+  stalling the file, while `ROGUE_SHIP_MIN_INTERVAL=0` is honored as "no throttle";
 - the chunk loop drains a file larger than `ROGUE_SHIP_MAX_BYTES` **in one run**,
   stopping at `ROGUE_SHIP_MAX_RUN_BYTES`;
 - `head=` written by one language is honored by another — generate state with the
@@ -982,6 +1030,18 @@ Cases:
   definition and skip untrusted command hooks until the user reviews `/hooks`, so a
   new entry would silently disable enforcement for every existing install until
   each user re-trusted it.
+- **No shipper-only ownership/permission check on the env files.** The threat is real
+  — a writable env file redirects `ROGUE_BASE_URL` and exfiltrates the API key — but
+  it is a property of the **shared env-file chain**, not of this script. Eleven
+  dispatchers, six heartbeats and both auto-updaters source the same three paths with
+  the same bare `[ -r … ] && . …` and no validation (`plugins/rogue/scripts/hook.sh:15-17`).
+  Adding a check here alone buys nothing: an attacker who can write `~/.rogue-env`
+  already owns the dispatcher that reads it, and the dispatchers are the *better*
+  target — they POST full prompts and tool calls, where the shipper posts a
+  diagnostics log. So this belongs as one change across the whole chain (a
+  `safe_source` helper in all three languages, plus the world-writable test cases),
+  scoped as its own PR, and it is recorded in `log-shipping.md`'s open questions
+  rather than solved asymmetrically here.
 - **No content rewriting in the scripts.** Redaction is the API's job — see
   **Redaction happens server-side**. The scripts read bytes and upload bytes.
 - **No log truncation or deletion.** Rotation already caps disk at 2× the cap per

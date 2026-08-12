@@ -204,6 +204,16 @@ lose lines.
   `raw=`. `endpoint-logs-redact.ts`'s `redactEvent`/`redactString` already walk
   every string value and rewrite home paths; reuse them. Neither covers `name=` (not
   a path) or the `raw=` policy, so those two need an explicit decision.
+- **The shared env-file chain is sourced without any ownership or permission check**,
+  in all eleven dispatchers, all six heartbeats and both auto-updaters
+  (`[ -r /etc/rogue/env ] && . /etc/rogue/env`, no validation). A writable
+  `/etc/rogue/env` — mode 666 on a misconfigured or MDM-templated box — redirects
+  `ROGUE_BASE_URL` and exfiltrates `ROGUE_API_KEY` plus every hook payload. Raised
+  against the shipper in review; declining to fix it there alone, because the shipper
+  is the *least* valuable of those readers (a diagnostics log versus full prompts and
+  tool calls) and a one-script check is a false sense of coverage. Wants its own PR: a
+  `safe_source` helper in sh, PowerShell and Node, refusing world-writable and
+  non-root-owned system paths, with tests. Not a blocker for either capability here.
 - **`log_source` needs a table, not a hash.** Axiom rows carry a random
   `log_source_id` resolved from `(org_id, hostname, actor_email, agent_family)`. A
   plain hash of those was the first proposal and is not a privacy boundary — work
