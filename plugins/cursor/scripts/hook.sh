@@ -21,6 +21,8 @@
 #
 # Pass-through: read the Cursor event payload from stdin, POST it to the Rogue
 # AIDR backend, relay the server's response bytes verbatim. No client policy.
+# The ONE exception is the file pre-image (see `augment_with_pre_image`), which
+# adds a field the payload cannot express and never removes or rewrites one.
 #
 # Fail-open everywhere: missing API key, missing curl, network error, non-200,
 # empty body all yield `{}` on stdout, exit 0. Cursor
@@ -165,6 +167,145 @@ PAYLOAD="$(cat 2>/dev/null)"
 # invalid JSON and the API rejects it with HTTP 400. No-op when absent.
 _bom="$(printf '\357\273\277')"
 PAYLOAD="${PAYLOAD#"$_bom"}"
+
+# ── File pre-image (preToolUse only) ───────────────────────────────────────
+# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so the
+# payload alone cannot say which part of the file this edit is responsible for.
+# The file on disk still holds the PRE-edit content at this point, so we attach
+# it as `rogueFilePreImageB64` and the API can compare the two.
+#
+# A NON-EXISTENT FILE YIELDS AN EMPTY PRE-IMAGE, AND THAT IS THE CREATE SIGNAL.
+# No Cursor payload field distinguishes a create from an overwrite (`old_string`
+# is "" for both an insertion into an existing file and a create), so this is the
+# only mechanism that gets creates right. Do not add a separate `rogueFileExists`
+# flag: two mechanisms for one fact, at double the lockstep cost.
+#
+# MULTI-HUNK EDITS NEED NO SPECIAL HANDLING, and this is load-bearing: Cursor
+# emits one full preToolUse/afterFileEdit/postToolUse cycle PER HUNK, so by hunk
+# 2 the file on disk already contains hunk 1 and the pre-image IS the correct
+# per-hunk baseline. Never "fix" this into reading the whole turn's pre-state.
+#
+# Fail-open in every branch — a missing path, an unreadable file, a read error or
+# an over-cap file leaves the relayed body byte-identical. Note that an over-cap
+# file sends NO pre-image rather than a truncated one: a partial pre-image is
+# WORSE than none, because it misrepresents the file's pre-edit state instead of
+# admitting we don't know it.
+PRE_IMAGE_MAX_BYTES=262144
+
+# Every file the agent writes gets a pre-image, subject to the size cap above.
+# The extension list below is the one exclusion: base64 of a PNG or a zip is
+# pure payload with no text in it to compare, and binaries are also the files
+# most likely to be large. An UNKNOWN extension is treated as text — the cost of
+# shipping a binary we failed to recognize is bytes, while the cost of skipping
+# a text file is losing the comparison entirely.
+#
+# COST: for a file write this roughly doubles the request body, since the event
+# payload already carries the post-edit content. The size cap bounds the worst
+# case; nothing is sent for a file above it.
+_is_binary_path() {
+  _base=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')
+  case "$_base" in
+    # images
+    *.png|*.jpg|*.jpeg|*.gif|*.bmp|*.tif|*.tiff|*.ico|*.icns|*.webp|*.avif|*.heic|*.psd) return 0 ;;
+    # fonts
+    *.ttf|*.otf|*.woff|*.woff2|*.eot) return 0 ;;
+    # archives and packages
+    *.zip|*.tar|*.gz|*.tgz|*.bz2|*.xz|*.zst|*.7z|*.rar|*.jar|*.war|*.ear) return 0 ;;
+    *.whl|*.egg|*.nupkg|*.dmg|*.iso|*.pkg|*.deb|*.rpm) return 0 ;;
+    # audio and video
+    *.mp3|*.wav|*.flac|*.ogg|*.m4a|*.mp4|*.mov|*.avi|*.mkv|*.webm) return 0 ;;
+    # compiled artifacts
+    *.exe|*.dll|*.so|*.dylib|*.o|*.a|*.lib|*.obj|*.pdb|*.class|*.pyc|*.pyo|*.wasm|*.node|*.bin) return 0 ;;
+    # documents and databases
+    *.pdf|*.doc|*.docx|*.xls|*.xlsx|*.ppt|*.pptx|*.db|*.sqlite|*.sqlite3|*.mdb) return 0 ;;
+  esac
+  return 1
+}
+
+# One JSON string field: jq when it is on PATH, the text scan only when it is
+# not. jq is preferred because it understands nesting and unescaping, both of
+# which the scan gets only by luck — `file_path` sits under `tool_input` on a
+# tool event, and the scan takes whichever copy appears first. The scan stays
+# safe for this narrow use because a `"` inside a JSON string value is always
+# backslash-escaped, so `"file_path":"…"` cannot match text that merely appears
+# inside the file CONTENT the same payload carries.
+#
+# $1 body, $2 jq filter, $3 key for the fallback scan.
+_json_string_field() {
+  _jsf_key="$3"
+  if command -v jq >/dev/null 2>&1; then
+    if _jsf_val=$(printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null); then
+      printf '%s' "$_jsf_val"
+      return
+    fi
+  fi
+  printf '%s' "$1" \
+    | grep -o "\"$_jsf_key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null \
+    | head -1 \
+    | sed -e "s/^\"$_jsf_key\"[[:space:]]*:[[:space:]]*\"//" -e 's/"$//'
+}
+
+augment_with_pre_image() {
+  _body="$1"
+  # Only the file-writing tools have a file to pre-image. A preToolUse for
+  # Shell, Read, Grep or an MCP call carries no relevant path, and reading one
+  # off such a payload would be a wasted stat at best. `Edit` is listed
+  # defensively — Cursor has only ever been observed sending `Write`.
+  _tool="$(_json_string_field "$_body" '.tool_name' tool_name)"
+  case "$_tool" in Write|Edit) : ;; *) printf '%s' "$_body"; return ;; esac
+  _fp="$(_json_string_field "$_body" '.tool_input.file_path // .file_path' file_path)"
+  # Absolute paths only. A relative path would resolve against the hook's cwd,
+  # and a wrongly-"missing" file reads as a CREATE — the one wrong answer that
+  # is worse than no answer, since it claims the whole file is new.
+  case "$_fp" in /*) : ;; *) printf '%s' "$_body"; return ;; esac
+  # A backslash means the JSON value carried an escape the fallback scan did not
+  # unescape. Deliberate divergence from hook.ps1, which DOES unescape `\\` and
+  # `\/`: this script only ever runs on POSIX, where a path needing either is
+  # pathological, while on Windows every path arrives escaped.
+  case "$_fp" in *\\*) printf '%s' "$_body"; return ;; esac
+  if _is_binary_path "$_fp"; then printf '%s' "$_body"; return; fi
+
+  if [ -e "$_fp" ]; then
+    { [ -f "$_fp" ] && [ -r "$_fp" ]; } || { printf '%s' "$_body"; return; }
+    _sz=$(wc -c < "$_fp" 2>/dev/null | tr -d ' ')
+    case "$_sz" in ''|*[!0-9]*) printf '%s' "$_body"; return ;; esac
+    if [ "$_sz" -gt "$PRE_IMAGE_MAX_BYTES" ]; then
+      dbg "pre-image $_sz B over cap -> sending none"
+      printf '%s' "$_body"; return
+    fi
+    if [ "$_sz" -eq 0 ]; then
+      _b64=""
+    else
+      _b64=$(base64 < "$_fp" 2>/dev/null | tr -d '\r\n')
+      [ -n "$_b64" ] || { printf '%s' "$_body"; return; }
+    fi
+  else
+    _b64=""   # create
+  fi
+  dbg "pre-image attached for $_fp (${#_b64} b64 chars)"
+
+  # Same jq-or-string-concat duality as the Copilot dispatcher: jq when it is on
+  # PATH, otherwise strip the trailing `}`, append, re-close. base64 contains no
+  # JSON-special characters, so the concat is safe.
+  if command -v jq >/dev/null 2>&1; then
+    _out=$(printf '%s' "$_body" | jq -c --arg b64 "$_b64" \
+      '. + {rogueFilePreImageB64:$b64}' 2>/dev/null)
+    # Only trust a complete object back; anything else falls through to concat.
+    case "$_out" in '{'*'}') printf '%s' "$_out"; return ;; esac
+  fi
+  # Trim trailing whitespace so the single-'}' strip lands on the real closing
+  # brace (mirrors the Copilot dispatcher and hook.ps1's TrimEnd()).
+  _trimmed="${_body%"${_body##*[![:space:]]}"}"
+  case "$_trimmed" in *'}') : ;; *) printf '%s' "$_body"; return ;; esac
+  _pre="${_trimmed%\}}"
+  # An empty object needs no separator ({} -> {"rogueFilePreImageB64":…}).
+  if [ "$_pre" = "{" ]; then _sep=""; else _sep=","; fi
+  printf '%s%s"rogueFilePreImageB64":"%s"}' "$_pre" "$_sep" "$_b64"
+}
+
+if [ "$event" = "preToolUse" ]; then
+  PAYLOAD="$(augment_with_pre_image "$PAYLOAD")"
+fi
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
 command -v curl >/dev/null 2>&1 || {
