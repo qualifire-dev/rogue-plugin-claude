@@ -151,3 +151,44 @@ jobs:
           pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
           pwsh -NoProfile -File tests/test_hook_logs.ps1
           pwsh -NoProfile -File tests/test_ship_logs.ps1
+
+  windows:
+    # The job the seam CANNOT stand in for. Every PowerShell test in the job above
+    # runs on ubuntu-latest through ROGUE_PS_LIB_ONLY, which loads the helpers and
+    # skips the main body — so Invoke-WebRequest, the %USERPROFILE% state directory,
+    # Windows file sharing/locking and the -EncodedCommand child process the
+    # heartbeats spawn were executed NOWHERE in CI, on the half of the feature that
+    # cannot be run on a dev Mac. A Windows-only runtime failure there is invisible
+    # by construction: hooks.json swallows it into `catch { '{}' }` and every Windows
+    # user silently loses the feature.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The e2e receiver is Node; the shipper itself needs nothing but PowerShell.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Log-shipper end to end (real ship-logs.ps1, real HTTP)
+        run: pwsh -NoProfile -File tests/e2e_ship_logs.ps1
+
+      - name: PowerShell unit tests under Windows PowerShell 5.1
+        # NOT a duplicate of the pwsh run on ubuntu: Copilot and Claude both fall back
+        # to Windows PowerShell 5.1 when pwsh 7 is absent, and 5.1 is a different
+        # engine — `Add-Content -Encoding UTF8` emits a BOM there, `Start-Process
+        # -ArgumentList` quotes differently, and several 7-only APIs simply do not
+        # exist. pwsh 7's parser cannot catch any of that.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell -NoProfile -File tests/test_hook_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_ps1_copilot.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_ps1_antigravity.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_logs.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_ship_logs.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }

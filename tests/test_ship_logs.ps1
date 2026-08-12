@@ -54,7 +54,7 @@ Write-Host ''
 Write-Host '== the seam loads the helpers without running the shipper'
 foreach ($fn in @('Get-TrailingFragmentLength', 'Get-FirstLineFingerprint', 'Find-LineEnd',
                   'Read-Range', 'Get-NormalizedPath', 'Get-NumberOrDefault',
-                  'Test-FlagDisabled', 'Get-StateKeyForPath', 'ConvertFrom-ShellQuoted',
+                  'Test-FlagEnabled', 'Get-StateKeyForPath', 'ConvertFrom-ShellQuoted',
                   'Read-ShipState', 'Write-ShipState')) {
     Check "$fn is defined" 'True' ([string](Test-Path "function:$fn"))
 }
@@ -117,13 +117,15 @@ Check 'negative -> default'             '900' ([string](Get-NumberOrDefault '-5'
 Check 'zero with allowZero -> zero'     '0'   ([string](Get-NumberOrDefault '0' 900 1))
 Check 'zero without allowZero -> default' '1024' ([string](Get-NumberOrDefault '0' 1024 0))
 Check 'a real value is kept'            '42'  ([string](Get-NumberOrDefault '42' 900 1))
-# Zero-padding counts as zero, matching phase 1's rotation cap: '00' read as
-# positive there once and rotated the log on every single write.
-Check 'ROGUE_SHIP_LOGS=0 disables'   'True'  ([string](Test-FlagDisabled '0'))
-Check 'ROGUE_SHIP_LOGS=00 disables'  'True'  ([string](Test-FlagDisabled '00'))
-Check 'unset does NOT disable'       'False' ([string](Test-FlagDisabled ''))
-Check 'a typo does NOT disable'      'False' ([string](Test-FlagDisabled 'yes'))
-Check 'ROGUE_SHIP_LOGS=1 is enabled' 'False' ([string](Test-FlagDisabled '1'))
+# SHIPPING IS OPT-IN until /api/v1/hooks/logs is deployed, so the flag reads the
+# other way round from every knob above: unset is OFF, and only a numeric non-zero
+# value turns it on. Zero-padding counts as zero, matching phase 1's rotation cap,
+# where '00' read as positive once and rotated the log on every single write.
+Check 'ROGUE_SHIP_LOGS=1 opts in'      'True'  ([string](Test-FlagEnabled '1'))
+Check 'unset does NOT ship'            'False' ([string](Test-FlagEnabled ''))
+Check 'a typo is not an opt-in'        'False' ([string](Test-FlagEnabled 'yes'))
+Check 'ROGUE_SHIP_LOGS=0 stays off'    'False' ([string](Test-FlagEnabled '0'))
+Check 'a zero-padded 00 stays off'     'False' ([string](Test-FlagEnabled '00'))
 
 # ── state key ──────────────────────────────────────────────────────────────
 Write-Host ''
@@ -139,7 +141,11 @@ $rangeFile = Join-Path $sandbox 'range.bin'
 Check 'offset 0'            '01234' ([System.Text.Encoding]::UTF8.GetString((Read-Range $rangeFile 0 5)))
 Check 'a mid-file offset'   '56789' ([System.Text.Encoding]::UTF8.GetString((Read-Range $rangeFile 5 5)))
 Check 'past EOF is short, not an error' '789' ([System.Text.Encoding]::UTF8.GetString((Read-Range $rangeFile 7 99)))
-Check 'a zero count is an EMPTY array, not @(@())' '0' ([string](Read-Range $rangeFile 0 0).Length)
+# .Length INSIDE the inner parentheses. Outside them, [string] binds to the
+# Read-Range result first, so the byte array is stringified and .Length is read from
+# the STRING - which is 0 for an empty array AND 0 for the `, @()` one-element array
+# this case exists to reject, so the assertion passed either way.
+Check 'a zero count is an EMPTY array, not @(@())' '0' ([string]((Read-Range $rangeFile 0 0).Length))
 
 # ── the line-end scan, and the stall that used to be an advance ────────────
 Write-Host ''
@@ -195,6 +201,43 @@ $hasBom = ($stateBytes.Length -ge 3 -and $stateBytes[0] -eq 0xEF -and $stateByte
 Check 'the state file has no UTF-8 BOM' 'False' ([string]$hasBom)
 Check 'and uses LF, not CRLF'           'False' `
     ([string]([System.IO.File]::ReadAllText((Join-Path $sandbox 'claude.state')).Contains("`r")))
+
+# ── diagnostics reach the operator with no log file ────────────────────────
+Write-Host ''
+Write-Host '== every logged outcome also reaches the debug stream'
+# The no-argument support invocation has no slug, so $script:selfLogFile stays empty
+# and Write-ShipLog returned before writing anything: `http=<code>` and
+# `reason=no-actor` vanished on exactly the run support is told to make. Asserted
+# structurally (Write-ShipDebug writes to [Console]::Error, which cannot be captured
+# from in-process) and in ORDER — the call has to precede the selfLogFile gate.
+$psSource = Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/ship-logs.ps1')
+Check 'Write-ShipLog debugs before the log-file gate' 'True' ([string](
+    $psSource -match 'function Write-ShipLog[\s\S]{0,600}?Write-ShipDebug \$Message[\s\S]{0,200}?if \(-not \$script:selfLogFile\)'))
+
+# ── the lock ───────────────────────────────────────────────────────────────
+Write-Host ''
+Write-Host '== a marker-less lock is a LIVE lock, not a stale one'
+# Creating the directory and writing `ts` are two operations, so a lock taken
+# milliseconds ago legitimately has no marker yet. Reading that absence as stale let
+# a second run delete a live lock, take it, and upload the same byte range twice.
+# Only the directory's OWN age may reclaim an unmarked lock.
+$script:stateDir = Join-Path $sandbox 'lockstate'
+New-Item -ItemType Directory -Path $script:stateDir -Force | Out-Null
+$lockPath = Join-Path $script:stateDir '.lock-claude'
+New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
+$script:heldLockDir = ''
+Check 'a fresh lock with no ts marker blocks' 'False' ([string](Lock-StateKey 'claude'))
+(Get-Item -LiteralPath $lockPath).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddHours(-2)
+Check '…but an old one with no ts marker is reclaimed' 'True' ([string](Lock-StateKey 'claude'))
+Unlock-StateKey
+Check '…and released again' 'False' ([string](Test-Path -LiteralPath $lockPath))
+# A readable marker still decides on its own, in both directions.
+New-Item -ItemType Directory -Path $lockPath -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $lockPath 'ts'), ((Get-EpochSeconds).ToString() + "`n"))
+Check 'a marked, fresh lock blocks'    'False' ([string](Lock-StateKey 'claude'))
+[System.IO.File]::WriteAllText((Join-Path $lockPath 'ts'), (((Get-EpochSeconds) - 3600).ToString() + "`n"))
+Check 'a marked, expired lock is taken' 'True'  ([string](Lock-StateKey 'claude'))
+Unlock-StateKey
 
 # ── the callers ────────────────────────────────────────────────────────────
 Write-Host ''

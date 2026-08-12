@@ -35,8 +35,15 @@ ROWS=(
   "ship-logs.ps1|rogue codex cursor copilot antigravity"
 )
 
+# An unrecognized argument is an ERROR, not a silent write: the two modes have
+# opposite effects on the working tree, so a typo (`-check`, `--dry-run`) used to
+# skip the comparison and overwrite the plugin copies instead of reporting drift.
 CHECK=0
-[ "${1:-}" = "--check" ] && CHECK=1
+case "${1:-}" in
+  --check) CHECK=1 ;;
+  "")      CHECK=0 ;;
+  *)       echo "usage: $0 [--check]" >&2; exit 2 ;;
+esac
 
 fail=0
 for row in "${ROWS[@]}"; do

@@ -54,6 +54,14 @@ printf '%s' "${FAKE_CODE:-200}"
 STUB
 chmod +x "$T/bin/curl"
 
+# Resolved BEFORE the shim is installed, and not hardcoded to /usr/bin/tail: the
+# shim is on PATH for every case, so a host whose tail lives elsewhere (/bin/tail on
+# Alpine and BusyBox, a store path on NixOS) would fail every case, not just this one.
+# EXPORTED, so the shim reads it from the environment instead of interpolating it:
+# the heredoc below is quoted (every runtime `$` in it must survive verbatim), and
+# `tail` alone inside the shim would re-enter the shim itself through PATH.
+export REAL_TAIL="$(command -v tail)"
+
 # A one-shot `tail` shim used by exactly one case: it rotates the log the first
 # time the shipper reads a byte range, which is the only way to exercise the
 # rotation-during-read guard from outside the script. Inert unless ROTATE_TARGET
@@ -70,7 +78,7 @@ if [ -n "${ROTATE_TARGET:-}" ] && [ ! -e "$ROTATE_TARGET.rotated" ]; then
         esac ;;
   esac
 fi
-exec /usr/bin/tail "$@"
+exec "${REAL_TAIL:-/usr/bin/tail}" "$@"
 STUB
 chmod +x "$T/bin/tail"
 
@@ -85,13 +93,18 @@ new_case() {
 # ROGUE_SHIP_MIN_INTERVAL=0 on every run by default: without it the second run of a
 # case is skipped by the 15-minute throttle, and "nothing was re-sent" would pass
 # for entirely the wrong reason.
+#
+# ROGUE_SHIP_LOGS=1 for the same class of reason: shipping is opt-in until the
+# backend route is deployed, so without it EVERY case here would pass vacuously -
+# a shipper that does nothing sends no mid-line chunk and never advances an offset
+# wrongly. The kill-switch case below overrides it to assert the default itself.
 ship_as() { # <plugin> <slug|-> <version> <family> [VAR=val …]
   _p="$1"; _s="$2"; _v="$3"; _fam="$4"; shift 4
   ( cd "$REPO" || exit 1
     export HOME="$CASE/home" CAP="$CASE/cap" PATH="$T/bin:$PATH"
     export ROGUE_API_KEY=test-key ROGUE_ACTOR_EMAIL=amos@rogue.security ROGUE_ACTOR_NAME=amos
     export ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_BASE_URL=http://127.0.0.1:1
-    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL='' ROGUE_SHIP_LOGS=''
+    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL='' ROGUE_SHIP_LOGS=1
     export ROGUE_SHIP_MAX_BYTES='' ROGUE_SHIP_MAX_RUN_BYTES='' ROGUE_SHIP_MAX_LINE_BYTES=''
     for kv in "$@"; do export "${kv?}"; done
     _root="${SHIP_ROOT:-$REPO/plugins/$_p}"
@@ -109,7 +122,7 @@ ship_mjs() { # <slug> <version> <family> [VAR=val …]
     export HOME="$CASE/home" CAP="$CASE/cap"
     export ROGUE_API_KEY=test-key ROGUE_ACTOR_EMAIL=amos@rogue.security ROGUE_ACTOR_NAME=amos
     export ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_BASE_URL=http://127.0.0.1:1
-    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL='' ROGUE_SHIP_LOGS=''
+    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL='' ROGUE_SHIP_LOGS=1
     export ROGUE_SHIP_MAX_BYTES='' ROGUE_SHIP_MAX_RUN_BYTES='' ROGUE_SHIP_MAX_LINE_BYTES=''
     for kv in "$@"; do export "${kv?}"; done
     node tests/ship_probe.mjs "$REPO/plugins/gemini" "$_s" "$_v" "$_fam" )
@@ -550,6 +563,20 @@ ship
 check "a lock older than 600s is reclaimed" "1" "$(bodies)"
 check "…and released again" "no" \
   "$([ -d "$CASE/home/.rogue/ship/.lock-claude" ] && echo yes || echo no)"
+# A MARKER-LESS LOCK IS A LIVE LOCK, not a stale one. `mkdir` and the `ts` write are
+# two operations, so a lock taken microseconds ago legitimately has no marker yet;
+# reading that as stale let a second run delete a live lock and re-upload the same
+# byte range. A fresh directory with no `ts` must therefore block, and only its own
+# age may reclaim it.
+new_case lock_nomarker
+seed 1 3
+mkdir -p "$CASE/home/.rogue/ship/.lock-claude"
+ship
+check "a fresh lock with no ts marker still blocks" "0" "$(bodies)"
+# Backdated with touch, since the directory's mtime is the only age available here.
+touch -t 200001010000 "$CASE/home/.rogue/ship/.lock-claude"
+ship
+check "…but an old one with no ts marker is reclaimed" "1" "$(bodies)"
 new_case lock_otherkey
 seed 1 3
 mkdir -p "$CASE/home/.rogue/ship/.lock-codex"
@@ -602,6 +629,50 @@ for variant in 'unset' 'empty' 'blank'; do
   check "$variant actor_email canonicalises to anon" "anon" "$(strf 0 actor_email)"
 done
 
+# THE SAME VARIANTS THROUGH THE NODE SHIPPER. Running them only through the sh copy
+# hid a real divergence: the Node one treated an empty or whitespace-only email as
+# "no identity" and shipped nothing, so a Gemini install whose git config carries no
+# user.email was silent while every other plugin on that machine shipped under
+# `anon`. There is no actor.sh here to stage the value in — Gemini's caller passes it
+# in the child's env — so the variants are the env value itself.
+if ! command -v node >/dev/null 2>&1; then
+  echo "NOTE: node not found — skipping the Node identity cases"
+else
+  # Staged in an ENV FILE rather than the process env, and that is not incidental:
+  # loadEnv merges a process-env var only when it is truthy, so an exported EMPTY
+  # string is indistinguishable from unset there. An env file's `KEY=""` is a value
+  # that IS present and empty — the Node analogue of an actor.sh that resolved
+  # nothing, which is what the sh variants above stage.
+  for variant in 'empty' 'blank'; do
+    new_case "anon-mjs-$variant"
+    glog="$CASE/home/.rogue/logs/gemini.log"
+    seed 1 2 gemini "$glog"
+    case "$variant" in
+      empty) printf 'export ROGUE_ACTOR_EMAIL=""\n' > "$CASE/home/.rogue-env" ;;
+      blank) printf 'export ROGUE_ACTOR_EMAIL="   "\n' > "$CASE/home/.rogue-env" ;;
+    esac
+    chmod 600 "$CASE/home/.rogue-env"
+    ship_mjs gemini 9.9.9 gemini "ROGUE_ACTOR_EMAIL=" "ROGUE_ACTOR_NAME="
+    check "$variant actor_email canonicalises to anon (Node)" "anon" "$(strf 0 actor_email)"
+  done
+  # An identity that was NEVER PASSED is a different thing from one resolved as
+  # empty: it means the caller resolved nothing at all, which must still skip. `env
+  # -u` rather than `KEY=`, because an empty export is dropped by loadEnv's truthy
+  # test and would therefore look identical to the case above — and because the
+  # DEVELOPER's own shell may export ROGUE_ACTOR_EMAIL, which would otherwise leak
+  # into this case and make it ship.
+  new_case anon-mjs-absent
+  glog="$CASE/home/.rogue/logs/gemini.log"
+  seed 1 2 gemini "$glog"
+  ( cd "$REPO" || exit 1
+    export HOME="$CASE/home" CAP="$CASE/cap"
+    export ROGUE_API_KEY=test-key ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0
+    export ROGUE_BASE_URL=http://127.0.0.1:1
+    env -u ROGUE_ACTOR_EMAIL -u ROGUE_ACTOR_NAME \
+      node tests/ship_probe.mjs "$REPO/plugins/gemini" gemini 9.9.9 gemini ) >/dev/null 2>&1
+  check "an actor that was never passed still skips (Node)" "0" "$(bodies)"
+fi
+
 echo
 echo "== kill switches and knob clamping"
 new_case off
@@ -613,6 +684,27 @@ ship "ROGUE_SHIP_LOGS=00"
 check "a zero-padded 00 also disables" "0" "$(bodies)"
 ship "ROGUE_API_KEY="
 check "an unconfigured install is silent" "0" "$(bodies)"
+# SHIPPING IS OPT-IN until /api/v1/hooks/logs is deployed, so UNSET must be a
+# no-op — the reverse of every other knob here. Asserted from a clean case rather
+# than by re-running the one above, whose state would make "sent nothing" pass for
+# the wrong reason. `ROGUE_SHIP_LOGS=` (empty) is what the harness's own reset
+# looks like, so both spellings of absent are covered.
+new_case default-off
+seed 1 3
+ship "ROGUE_SHIP_LOGS="
+check "unset does NOT ship (opt-in)" "0" "$(bodies)"
+check "…and leaves no state" "" "$(state offset)"
+ship "ROGUE_SHIP_LOGS=yes"
+check "a non-numeric value is not an opt-in either" "0" "$(bodies)"
+ship "ROGUE_SHIP_LOGS=1"
+check "an explicit 1 opts in" "1" "$(bodies)"
+# The debug stream must carry the reason, because a no-arg support run has no log
+# file of its own to write to (SELF_LOG_FILE is empty when the slug is `unknown`).
+new_case debug-reason
+seed 1 3
+check "a failure reports http= on stderr under ROGUE_DEBUG" "1" \
+  "$(ship_as rogue - 9.9.9 claude "ROGUE_DEBUG=1" "ROGUE_SHIP_ALL=1" "FAKE_CODE=404" 2>&1 \
+     | grep -c 'outcome=fail.*http=404')"
 # A typo must never disable shipping or blow a size cap; a zero byte-cap would
 # ship nothing forever, so it falls back rather than stalling the file.
 for bad in 0 -1 abc 00; do

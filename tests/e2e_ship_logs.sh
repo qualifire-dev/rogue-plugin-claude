@@ -97,8 +97,11 @@ dispatch() { # <n> <extra-payload-text>
   done
 }
 
+# ROGUE_SHIP_LOGS=1 on every run: shipping is OPT-IN until /api/v1/hooks/logs is
+# deployed, so without it every case below would pass vacuously against a shipper
+# that did nothing. The default itself is asserted once, on its own, further down.
 ship() { # [VAR=val …]
-  env ROGUE_BASE_URL="$BASE" ROGUE_SHIP_MIN_INTERVAL=0 "$@" \
+  env ROGUE_BASE_URL="$BASE" ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_SHIP_LOGS=1 "$@" \
     sh "$REPO/plugins/rogue/scripts/ship-logs.sh" "$REPO/plugins/rogue" claude 9.9.9 claude \
     >/dev/null 2>&1
 }
@@ -220,9 +223,24 @@ dispatch 2
 throttled_before="$(envelopes)"
 # No ROGUE_SHIP_MIN_INTERVAL=0 override here, so the default 900s applies and the
 # stamp written moments ago must suppress this run.
-env ROGUE_BASE_URL="$BASE" sh "$REPO/plugins/rogue/scripts/ship-logs.sh" \
+env ROGUE_BASE_URL="$BASE" ROGUE_SHIP_LOGS=1 sh "$REPO/plugins/rogue/scripts/ship-logs.sh" \
   "$REPO/plugins/rogue" claude 9.9.9 claude >/dev/null 2>&1
 check "the 15-minute throttle skipped the run" "$throttled_before" "$(envelopes)"
+
+echo
+echo "== shipping is OPT-IN: no ROGUE_SHIP_LOGS uploads nothing"
+# The whole reason the default is off: /api/v1/hooks/logs is not deployed yet, so a
+# default-on client would POST into a permanent 404 from every configured install.
+# Asserted against the real server with fresh lines waiting, so "nothing uploaded"
+# cannot be a stale-state artefact.
+dispatch 2
+optin_before="$(envelopes)"
+env ROGUE_BASE_URL="$BASE" ROGUE_SHIP_MIN_INTERVAL=0 sh \
+  "$REPO/plugins/rogue/scripts/ship-logs.sh" "$REPO/plugins/rogue" claude 9.9.9 claude \
+  >/dev/null 2>&1
+check "an opt-out install uploads nothing" "$optin_before" "$(envelopes)"
+ship
+check "…and the same lines upload once opted in" "$((optin_before + 1))" "$(envelopes)"
 
 echo
 echo "== the REAL caller fires the shipper (not just the shipper directly)"
@@ -243,7 +261,7 @@ caller_log="$new_home/.rogue/logs/claude.log"
 mkdir -p "$new_home/.rogue/logs"
 printf '2026-08-12T00:00:01Z provider=claude event=PreToolUse outcome=allow n=1\n' > "$caller_log"
 env HOME="$new_home" CLAUDE_PLUGIN_ROOT="$REPO/plugins/rogue" CLAUDE_CODE_ENTRYPOINT=cli \
-  ROGUE_BASE_URL="$BASE" ROGUE_SHIP_MIN_INTERVAL=0 \
+  ROGUE_BASE_URL="$BASE" ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_SHIP_LOGS=1 \
   bash "$REPO/plugins/rogue/scripts/heartbeat.sh" >/dev/null 2>&1
 check "heartbeat.sh uploaded the log" "$((caller_before + 1))" "$(envelopes)"
 check "…under the identity the heartbeat itself reported" "caller@rogue.security" \
