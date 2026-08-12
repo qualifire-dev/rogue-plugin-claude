@@ -84,9 +84,9 @@ load_env() {
   # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
   # rotation; a NON-NUMERIC value falls back to this default, so a typo can
   # never leave the log growing unbounded.
-  ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-2097152}"
+  ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
   # Clamp per the rule above: anything non-numeric becomes the default.
-  case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=2097152 ;; esac
+  case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
   # IDE store reads: off entirely with 0, read-but-never-attach with `log`.
   DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
   MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"

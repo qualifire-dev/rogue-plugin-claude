@@ -56,9 +56,9 @@ ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/copilot.log}"
 # than by a periodic job because an UNCONFIGURED install writes a line per
 # event and never runs anything else - a cap enforced anywhere else would
 # not hold.
-ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-2097152}"
+ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
 # Clamp per the rule above: anything non-numeric becomes the default.
-case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=2097152 ;; esac
+case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
 # NOTE: `_lsz` is not function-local (POSIX sh has no `local`) but is used
 # NOWHERE else in this file — unlike `_p`/`_n`, which are shared (see below).
 rotate_log() {

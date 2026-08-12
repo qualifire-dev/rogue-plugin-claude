@@ -67,7 +67,7 @@ Upgrades: re-run the one-line installer.
 Inside Gemini CLI, run `/status`. You should see HTTP 200 against the ping
 endpoint, your active rulesets, and a tail of recent hook activity
 (`~/.rogue/logs/gemini.log` — each Rogue plugin logs to its own file, capped at
-2 MiB with one `.1` rotation kept).
+10 MiB with one `.1` rotation kept).
 
 ## Uninstall
 

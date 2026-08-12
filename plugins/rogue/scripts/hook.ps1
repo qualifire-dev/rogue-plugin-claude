@@ -133,7 +133,7 @@ function Repair-DoubleEncodedUtf8 {
 # Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
 # dot-source the helpers, and so Log is safe to call before initialisation.
 $logFile = $null
-$logMaxBytes = 2097152
+$logMaxBytes = 10485760
 
 function Initialize-Logging {
     # $Creds is the merged credential map (bundled env → MDM → per-user file, then
@@ -158,7 +158,7 @@ function Initialize-Logging {
     # zero disables too — matching hook.sh's `-gt 0` test).
     $cap = $Creds['ROGUE_LOG_MAX_BYTES']
     if ($cap -match '^[0-9]+$') { $script:logMaxBytes = [int64]$cap }
-    else { $script:logMaxBytes = 2097152 }
+    else { $script:logMaxBytes = 10485760 }
 }
 
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }

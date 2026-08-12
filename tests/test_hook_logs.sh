@@ -193,15 +193,15 @@ done
 
 echo
 echo "== a non-numeric cap falls back to the default, it does NOT disable"
-# A typo must never leave the log growing unbounded. Seed just over the 2 MiB
+# A typo must never leave the log growing unbounded. Seed just over the 10 MiB
 # default so "fell back to the default" is distinguishable from "disabled".
 for slug in $SLUGS; do
   home="$TMPROOT/capbad-$slug"; mkdir -p "$home/.rogue/logs"
   logf="$home/.rogue/logs/$slug.log"
-  head -c 2097153 /dev/zero | tr '\0' 'x' > "$logf"
+  head -c 10485761 /dev/zero | tr '\0' 'x' > "$logf"
   fire "$slug" "$home" "ROGUE_LOG_MAX_BYTES=not-a-number"
   rotated=$([ -e "$logf.1" ] && echo yes || echo no)
-  check "$slug still rotates at the 2 MiB default" "yes" "$rotated"
+  check "$slug still rotates at the 10 MiB default" "yes" "$rotated"
 done
 
 echo
