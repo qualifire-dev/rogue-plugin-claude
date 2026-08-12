@@ -94,9 +94,24 @@ function numberOrDefault(value, fallback, allowZero) {
 
 // Numeric zero (including a zero-padded "00", matching phase 1's rotation cap) means
 // off; a non-numeric value means the default.
-function flagIsDisabled(value) {
+// SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
+// turns it on. That is the reverse of every other knob here, and deliberate - the
+// receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
+// would have every configured install POST into a permanent 404 on each session
+// start: no offset ever advances, and each failure appends an `outcome=fail http=404`
+// line to the very file being shipped, so the backlog only grows. Flipping the
+// default (here, in ship-logs.sh and in ship-logs.ps1, one line each) is the last
+// step of the rollout, once the route answers 2xx *after* a durable write - see
+// docs/log-shipping-backend.md. Until then `ROGUE_SHIP_LOGS=1` in any env file opts
+// a machine in, which is also how the support invocation and the e2e suite run it.
+//
+// A non-numeric value ("yes", "true", a typo) is NOT an opt-in: it falls back to the
+// default, matching every other knob's "a typo must never change behaviour" rule.
+// Numeric zero, including a zero-padded "00" (phase 1's rotation-cap precedent),
+// is an explicit off and stays off after the default flips.
+function flagIsEnabled(value) {
   if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
-  return Number(value) === 0;
+  return Number(value) !== 0;
 }
 
 // ── low-level file reads ───────────────────────────────────────────────────
@@ -229,6 +244,12 @@ class Shipper {
   // rotation-under-us hazard firstLineFingerprint re-checks for. Rotation stays the
   // dispatcher's job.
   log(message) {
+    // ALSO to stderr under ROGUE_DEBUG, and unconditionally - before the selfLogFile
+    // gate below. The no-argument support invocation has no slug, so it has no log
+    // file of its own to write to, and every failure reason (`http=<code>`,
+    // `reason=no-actor`) used to vanish on exactly the run a support engineer is told
+    // to make. The file is where the outcome is durable; stderr is where it is visible.
+    this.debug(message);
     if (!this.selfLogFile) return;
     try {
       fs.mkdirSync(path.dirname(this.selfLogFile), { recursive: true });
@@ -275,10 +296,23 @@ class Shipper {
   //
   // Gemini's heartbeat.mjs resolves the actor into MODULE LOCALS, never process.env,
   // which is why it must pass them explicitly in the child's env - see the caller.
+  //
+  // `anon` is the SAME canonical form the sh and PowerShell copies use, and the
+  // divergence here was a real one: this returned false for an absent, empty or
+  // whitespace-only email, so a Gemini install whose `git config user.email` is unset
+  // shipped nothing while every other plugin on the same machine shipped under `anon`.
+  // The value matters because it is the roster fingerprint's own fallback
+  // (`actorEmail ?? "anon"`), so it joins to the row the heartbeat already created.
+  //
+  // The skip below now covers only the case it was written for: the env var was never
+  // PASSED, i.e. the caller resolved no identity at all (`undefined`, not ""). An
+  // empty string is a resolved-and-missing email, which `anon` names exactly.
   resolveActor() {
-    this.actorEmail = (this.env.ROGUE_ACTOR_EMAIL || "").trim();
+    if (this.env.ROGUE_ACTOR_EMAIL === undefined && this.env.ROGUE_ACTOR_NAME === undefined) {
+      return false;
+    }
+    this.actorEmail = (this.env.ROGUE_ACTOR_EMAIL || "").trim() || "anon";
     this.actorName = (this.env.ROGUE_ACTOR_NAME || "").trim();
-    if (!this.actorEmail) return false;
     this.hostName = os.hostname() || "unknown";
     return true;
   }
@@ -363,14 +397,31 @@ class Shipper {
     // unparseable marker counts as stale: a lock we cannot age out is worse than one
     // reclaimed slightly early.
     let isStale = true;
+    let sawMarker = false;
     try {
       const rawStamp = fs.readFileSync(path.join(lockDir, "ts"), "utf8").split("\n")[0].trim();
       if (/^[0-9]+$/.test(rawStamp)) {
+        sawMarker = true;
         const lockStamp = Number(rawStamp);
         const now = epochSeconds();
         if (lockStamp <= now && now - lockStamp <= LOCK_STALE_SECONDS) isStale = false;
       }
     } catch {}
+    if (!sawMarker) {
+      // NO READABLE MARKER IS NOT PROOF OF A DEAD HOLDER. mkdirSync and the `ts` write
+      // are two operations, so a lock taken milliseconds ago legitimately has no marker
+      // yet - and treating that as stale let a second run delete a live lock, take it,
+      // and upload the same byte range twice. Age the DIRECTORY instead; its own mtime
+      // is free here, unlike the sh copy, which shells out to `find` because `stat`'s
+      // flags differ between BSD and GNU. An unreadable timestamp reads as "not old
+      // enough": one skipped cycle rather than a duplicate upload.
+      isStale = false;
+      try {
+        if (epochSeconds() - Math.floor(fs.statSync(lockDir).mtimeMs / 1000) > LOCK_STALE_SECONDS) {
+          isStale = true;
+        }
+      } catch {}
+    }
     if (!isStale) return false;
     try {
       fs.rmSync(lockDir, { recursive: true, force: true });
@@ -691,8 +742,10 @@ class Shipper {
   async run() {
     this.env = loadEnv(this.pluginRoot);
     this.resolveKnobs();
-    if (flagIsDisabled(this.env.ROGUE_SHIP_LOGS)) {
-      this.debug("ROGUE_SHIP_LOGS=0 -> no-op");
+    if (!flagIsEnabled(this.env.ROGUE_SHIP_LOGS)) {
+      this.debug(
+        `ROGUE_SHIP_LOGS=${this.env.ROGUE_SHIP_LOGS || "<unset>"} -> no-op (shipping is opt-in)`,
+      );
       return;
     }
     if (!this.apiKey) {

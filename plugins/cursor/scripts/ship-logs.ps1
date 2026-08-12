@@ -122,6 +122,12 @@ function Write-ShipDebug {
 # the timestamp. "`n" keeps the line ending identical to the sh dispatchers'.
 function Write-ShipLog {
     param([string]$Message)
+    # ALSO to stderr under ROGUE_DEBUG, and unconditionally - before the selfLogFile
+    # gate below. The no-argument support invocation has no slug, so it has no log
+    # file of its own to write to, and every failure reason (`http=<code>`,
+    # `reason=no-actor`) used to vanish on exactly the run a support engineer is told
+    # to make. The file is where the outcome is durable; stderr is where it is visible.
+    Write-ShipDebug $Message
     try {
         if (-not $script:selfLogFile) { return }
         $logParentDir = Split-Path $script:selfLogFile
@@ -358,10 +364,25 @@ function Get-NumberOrDefault {
 
 # Numeric zero (including a zero-padded '00', matching phase 1's rotation cap)
 # means off; a non-numeric value means the default.
-function Test-FlagDisabled {
+# SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
+# turns it on. That is the reverse of every other knob here, and deliberate - the
+# receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
+# would have every configured install POST into a permanent 404 on each session
+# start: no offset ever advances, and each failure appends an `outcome=fail http=404`
+# line to the very file being shipped, so the backlog only grows. Flipping the
+# default (here, in ship-logs.sh and in ship-logs.mjs, one line each) is the last
+# step of the rollout, once the route answers 2xx *after* a durable write - see
+# docs/log-shipping-backend.md. Until then `ROGUE_SHIP_LOGS=1` in any env file opts
+# a machine in, which is also how the support invocation and the e2e suite run it.
+#
+# A non-numeric value ("yes", "true", a typo) is NOT an opt-in: it falls back to the
+# default, matching every other knob's "a typo must never change behaviour" rule.
+# Numeric zero, including a zero-padded "00" (phase 1's rotation-cap precedent),
+# is an explicit off and stays off after the default flips.
+function Test-FlagEnabled {
     param([string]$Value)
     if ($Value -notmatch '^[0-9]+$') { return $false }
-    return ([int64]$Value -eq 0)
+    return ([int64]$Value -ne 0)
 }
 
 function Resolve-Knobs {
@@ -520,6 +541,21 @@ function Lock-StateKey {
         $lockStamp = [int64]$rawStamp
         $now = Get-EpochSeconds
         if ($lockStamp -le $now -and ($now - $lockStamp) -le $LOCK_STALE_SECONDS) { $isStale = $false }
+    } else {
+        # NO READABLE MARKER IS NOT PROOF OF A DEAD HOLDER. Creating the directory and
+        # writing `ts` are two operations, so a lock taken milliseconds ago legitimately
+        # has no marker yet - and treating that as stale let a second run delete a live
+        # lock, take it, and upload the same byte range twice. Age the DIRECTORY
+        # instead. Its own timestamp is free here, unlike the sh copy, which has to
+        # shell out to `find` because `stat`'s flags differ between BSD and GNU.
+        # An unreadable timestamp reads as "not old enough": one skipped cycle rather
+        # than a duplicate upload.
+        $isStale = $false
+        try {
+            $lockAgeSeconds = ((Get-Date).ToUniversalTime() -
+                (Get-Item -LiteralPath $lockDir -ErrorAction Stop).LastWriteTimeUtc).TotalSeconds
+            if ($lockAgeSeconds -gt $LOCK_STALE_SECONDS) { $isStale = $true }
+        } catch {}
     }
     if (-not $isStale) { return $false }
     try { Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
@@ -851,8 +887,11 @@ function Invoke-Main {
     Initialize-Args
     Import-ShipEnv
     Resolve-Knobs
-    if (Test-FlagDisabled ([string]$script:creds['ROGUE_SHIP_LOGS'])) {
-        Write-ShipDebug 'ROGUE_SHIP_LOGS=0 -> no-op'; exit 0
+    if (-not (Test-FlagEnabled ([string]$script:creds['ROGUE_SHIP_LOGS']))) {
+        $flagValue = [string]$script:creds['ROGUE_SHIP_LOGS']
+        if (-not $flagValue) { $flagValue = '<unset>' }
+        Write-ShipDebug "ROGUE_SHIP_LOGS=$flagValue -> no-op (shipping is opt-in)"
+        exit 0
     }
     if (-not $script:apiKey) { Write-ShipDebug 'not configured -> no-op'; exit 0 }
     if (-not (Resolve-ShipActor)) {

@@ -67,6 +67,10 @@ HEAD_WINDOW_BYTES=4096
 # why an advance that does not land after a newline is unsafe at any price).
 MAX_SCAN_WINDOWS=64
 LOCK_STALE_SECONDS=600
+# The same bound in minutes, because the marker-less case ages the lock DIRECTORY
+# with `find -mmin` and find has no seconds granularity. Integer division, so keep
+# LOCK_STALE_SECONDS a whole number of minutes.
+LOCK_STALE_MINUTES=$((LOCK_STALE_SECONDS / 60))
 # Hard iteration guard on the chunk loop. MAX_RUN_BYTES/MAX_CHUNK_BYTES is 10 at
 # the defaults; this only ever bites if a knob is set to something strange.
 MAX_CHUNKS_PER_DRAIN=64
@@ -115,6 +119,13 @@ debug() { [ -n "${ROGUE_DEBUG:-}" ] && printf '[rogue-ship] %s\n' "$*" >&2; retu
 # rotation-under-us hazard the head re-check exists to catch. Rotation is
 # deferred to the dispatcher's next write, which is where phase 1 enforces it.
 log() {
+  # ALSO to stderr under ROGUE_DEBUG, and unconditionally - before the
+  # SELF_LOG_FILE gate below. The no-argument support invocation has no slug, so it
+  # has no log file of its own to write to, and every failure reason (`http=<code>`,
+  # `reason=no-actor`) used to vanish on exactly the run a support engineer is told
+  # to make. The file is where the outcome is durable; stderr is where it is
+  # visible.
+  debug "$*"
   [ -n "$SELF_LOG_FILE" ] || return 0
   mkdir -p "$(dirname "$SELF_LOG_FILE")" 2>/dev/null
   printf '%s provider=%s event=ShipLogs %s\n' \
@@ -312,12 +323,25 @@ number_or_default() { # <value> <default> <allow-zero:0|1>
   printf '%s' "$1"
 }
 
-# Numeric zero (including a zero-padded "00", matching phase 1's rotation cap)
-# means off; a non-numeric value means the default.
-flag_is_disabled() { # <value>
+# SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
+# turns it on. That is the reverse of every other knob here, and deliberate - the
+# receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
+# would have every configured install POST into a permanent 404 on each session
+# start: no offset ever advances, and each failure appends an `outcome=fail http=404`
+# line to the very file being shipped, so the backlog only grows. Flipping the
+# default (here, in ship-logs.ps1 and in ship-logs.mjs, one line each) is the last
+# step of the rollout, once the route answers 2xx *after* a durable write - see
+# docs/log-shipping-backend.md. Until then `ROGUE_SHIP_LOGS=1` in any env file opts
+# a machine in, which is also how the support invocation and the e2e suite run it.
+#
+# A non-numeric value ("yes", "true", a typo) is NOT an opt-in: it falls back to the
+# default, matching every other knob's "a typo must never change behaviour" rule.
+# Numeric zero, including a zero-padded "00" (phase 1's rotation-cap precedent),
+# is an explicit off and stays off after the default flips.
+flag_is_enabled() { # <value>
   case "${1:-}" in
     ''|*[!0-9]*) return 1 ;;
-    *) [ "$1" -eq 0 ] && return 0; return 1 ;;
+    *) [ "$1" -eq 0 ] && return 1; return 0 ;;
   esac
 }
 
@@ -464,7 +488,20 @@ acquire_lock() { # <key>
   _lock_now=$(now_epoch_seconds)
   _lock_is_stale=1
   case "${_lock_stamp:-}" in
-    ''|*[!0-9]*) _lock_is_stale=1 ;;
+    ''|*[!0-9]*)
+      # NO READABLE MARKER IS NOT PROOF OF A DEAD HOLDER. `mkdir` and the `ts` write
+      # are two operations, so a lock taken microseconds ago legitimately has no
+      # marker yet - and treating that as stale let a second run delete a live lock,
+      # take it, and upload the same byte range twice. Age the DIRECTORY instead, via
+      # `find -mmin` rather than `stat`, whose flags differ between BSD and GNU (the
+      # same portability reason phase 1 reads size with `wc -c`). No output - or a
+      # `find` that does not understand the flags - reads as "not old enough", which
+      # costs one skipped cycle rather than a duplicate upload.
+      if [ -n "$(find "$_lock_dir" -maxdepth 0 -mmin +"$LOCK_STALE_MINUTES" 2>/dev/null)" ]
+      then _lock_is_stale=1
+      else _lock_is_stale=0
+      fi
+      ;;
     *) case "${_lock_now:-}" in
          ''|*[!0-9]*) _lock_is_stale=0 ;;
          *) [ "$_lock_stamp" -le "$_lock_now" ] &&
@@ -836,7 +873,10 @@ main() {
   parse_args "$@"
   load_env
   resolve_knobs
-  if flag_is_disabled "${ROGUE_SHIP_LOGS:-}"; then debug 'ROGUE_SHIP_LOGS=0 -> no-op'; exit 0; fi
+  if ! flag_is_enabled "${ROGUE_SHIP_LOGS:-}"; then
+    debug "ROGUE_SHIP_LOGS=${ROGUE_SHIP_LOGS:-<unset>} -> no-op (shipping is opt-in)"
+    exit 0
+  fi
   [ -n "$API_KEY" ] || { debug 'not configured -> no-op'; exit 0; }
   command -v curl >/dev/null 2>&1 || { log 'outcome=fail reason=no-curl'; exit 0; }
   command -v base64 >/dev/null 2>&1 || { log 'outcome=fail reason=no-base64'; exit 0; }
