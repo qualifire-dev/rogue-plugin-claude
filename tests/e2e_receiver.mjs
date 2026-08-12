@@ -22,6 +22,7 @@
 // not advance on a non-2xx" against a real HTTP failure rather than a stubbed one. A
 // non-2xx records the envelope but NOT the payload - that is the whole point: bytes the
 // server did not accept must not appear in the dataset, and must arrive again later.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -34,6 +35,12 @@ if (!workDir) {
 fs.mkdirSync(workDir, { recursive: true });
 
 const EXPECTED_KEY = process.env.E2E_API_KEY || "e2e-key";
+// E2E_ACCEPT_ANY_KEY=1 accepts whatever key arrives. Needed by
+// tests/manual/live_session.sh, where the request comes from a REAL Claude Code
+// session: the sh dispatchers source ~/.rogue-env after reading the process
+// environment, so that file's ROGUE_API_KEY wins over the sandbox's and the run would
+// 401 on the developer's own credential.
+const ACCEPT_ANY_KEY = process.env.E2E_ACCEPT_ANY_KEY === "1";
 
 function readStatusCode() {
   try {
@@ -59,8 +66,19 @@ const server = http.createServer((req, res) => {
     const url = req.url || "";
     if (url.endsWith("/hooks/logs")) {
       const code = readStatusCode();
-      if (req.headers["x-rogue-api-key"] !== EXPECTED_KEY) {
-        fs.appendFileSync(path.join(workDir, "bad_key.log"), `${req.headers["x-rogue-api-key"]}\n`);
+      if (!ACCEPT_ANY_KEY && req.headers["x-rogue-api-key"] !== EXPECTED_KEY) {
+        // A FINGERPRINT, never the key. This used to append the rejected value
+        // verbatim, and the live-session run put a developer's real ROGUE_API_KEY
+        // into a world-readable file under /tmp: the sh dispatchers let ~/.rogue-env
+        // override the process environment, so the key that arrives here is not
+        // necessarily the sandbox's. Eight hex characters is enough to tell two
+        // wrong keys apart, which is all this file is for.
+        const received = String(req.headers["x-rogue-api-key"] ?? "");
+        const fingerprint = crypto.createHash("sha256").update(received).digest("hex").slice(0, 8);
+        fs.appendFileSync(
+          path.join(workDir, "bad_key.log"),
+          `rejected key sha256:${fingerprint} (${received.length} chars)\n`,
+        );
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end("{}");
         return;
@@ -100,6 +118,17 @@ const server = http.createServer((req, res) => {
     // The dispatcher and the heartbeat: allow, and record that they were seen so the
     // e2e script can prove the log lines came from a REAL dispatcher run.
     fs.appendFileSync(path.join(workDir, "other.log"), `${req.method} ${url}\n`);
+    // The HEARTBEAT's body is also recorded as an envelope, because the identity in it
+    // is what a shipped chunk must match: the shipper INHERITS the actor rather than
+    // resolving one, and a second identity for one machine orphans the logs from the
+    // roster row. It is safe to keep, unlike a /hooks/<agent> body - a heartbeat
+    // carries host, actor, family and version, never prompt or tool content, which is
+    // why only the URL is recorded for those.
+    if (url.endsWith("/hooks/status")) {
+      try {
+        recordEnvelope("status", JSON.parse(raw.toString("utf8")));
+      } catch {}
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end("{}");
   });
