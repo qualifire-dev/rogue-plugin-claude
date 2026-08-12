@@ -27,15 +27,34 @@ Callers (one line each, no `hooks.json` change anywhere):
 | gemini | `scripts/heartbeat.mjs` |
 | cursor | inside the existing `if [ "$event" = "sessionStart" ]` block in `hook.sh` / `hook.ps1` |
 
-**Not the last line — right after the API-key check, before any agent-specific
-gate.** `plugins/rogue/scripts/heartbeat.sh:23` is
-`[ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ] && exit 0`; a call at the tail would inherit
-that and every future guard, so an agent that stopped exporting one env var would
-silently stop shipping logs with no other symptom. The heartbeat's guards decide
-whether to *beacon*, which is a different question from whether to ship.
-Concretely: move that gate below the `ROGUE_API_KEY` check (behaviour-neutral —
-both are bare `exit 0` guards ahead of any side effect) and put the shipper call
-between them.
+**Never behind an agent-specific gate.** `plugins/rogue/scripts/heartbeat.sh` opened
+with `[ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ] && exit 0`; a shipper call anywhere below
+that inherits it and every future guard, so a Claude build that stopped exporting one
+env var would silently stop shipping logs with no other symptom. The heartbeat's
+guards decide whether to *beacon*, which is a different question from whether to
+ship.
+
+As implemented, that gate now wraps **only the beacon POST** (both `.sh` and `.ps1`,
+in lockstep) and the shipper call sits outside it. The beacon fires exactly when it
+did before — the gate moved, its condition did not — and only the Claude plugin needed
+this: Codex deliberately has no entrypoint gate, and the others have none either.
+
+**The call sits after the beacon POST when both run**, so the roster row for this
+install exists before its logs arrive. That is an ordering *preference*, not a
+prerequisite: the backend resolves-or-creates the `log_source` row from the identity
+fields the shipper itself sends (§9), which is precisely why the call can be outside
+the gate rather than sequenced behind the POST.
+
+No extra backgrounding anywhere except Cursor. The four `heartbeat.*` callers are
+already spawned detached, so they invoke the shipper inline; Cursor's call site is
+inside the **synchronous** dispatcher, which is holding Cursor's session-start
+decision on stdout, so there it must be detached with the same double-fork the
+heartbeat uses. The PowerShell callers spawn a child process rather than dot-sourcing
+or `[scriptblock]::Create`-ing in place, because in-process the shipper's `$script:`
+writes resolve against the *caller's* scope and its `exit 0` would end the caller —
+which in `cursor/scripts/hook.ps1` means exiting before the relayed response is
+printed. Gemini's caller imports the module in-process instead, since ESM scope is
+its own and `main()` does not exit.
 
 `scripts/build-release.sh` needs **no change**: every plugin is staged with
 `cp -R plugins/<x>`, so a new file in `scripts/` ships automatically.
@@ -457,12 +476,26 @@ have to be byte-identical across sh, PowerShell and Node, the same constraint th
 rules out a checksum for `head`. Collapse mode still shares one key *and* one path,
 so it keeps sharing one state file, which is correct.
 
+**`path=` must be NORMALIZED, not merely absolute** — corrected during
+implementation, where the first version simply prefixed `$PWD`. PowerShell's
+`GetFullPath` and Node's `path.resolve` both *also* collapse duplicate separators
+and `.`/`..` segments, so a lexical prefix left `/logs//claude.log` (what a
+`ROGUE_LOG_DIR` with a trailing slash produces, and a very plausible MDM-pushed
+value) comparing unequal to `/logs/claude.log` from another implementation. Each
+shipper then read the other's state as a *different file*, reset the offset and
+re-shipped the whole log — duplicate data on any machine with two agents
+installed. The sh copy carries an explicit segment walk to match the other two.
+Symlinks are still **not** resolved anywhere: that would make `/private/tmp` and
+`/tmp` disagree on macOS, which is the same class of bug in the other direction.
+
 ```text
 off, stored_head, stored_size, stored_path = read state
-if stored_path != abspath(file): off = 0; stored_head = none   # different file
+if stored_path != normalize(file): off = 0; stored_head = none  # different file
                                       # off = 0 also if absent or non-numeric
+                                      # normalize: lexical, collapses // . ..,
+                                      # never resolves symlinks
 size = wc -c < file                   # NOT stat — BSD and GNU differ on flags
-head = base64(first line of file)     # bytes up to the first \n, cap 200
+head = base64(first line of file)     # bytes up to the first \n, window 4096
 
 rotated = (size < off) or (head is known and head != stored_head)
 
@@ -532,6 +565,16 @@ append-only, so once a `\n` exists at byte *k*, bytes 0..*k* never change again.
 there is no `\n` yet (a partially written first line), the head is "unknown" and
 the check falls back to `size < off` alone.
 
+**The scan window is 4096 bytes, not the 200 an earlier draft of this document
+specified** — corrected during implementation, where 200 turned out to describe a
+feature that could never fire. A real hook line is a timestamp, `provider=`,
+`event=`, `outcome=` and up to 400 characters of `raw=`, so **500–700 bytes is
+typical**: within a 200-byte window a normal log's first line contains no newline
+at all, the head is therefore permanently "unknown", and the rotation check
+silently degrades to `size < off` forever — exactly the hole `head=` exists to
+close. 4096 covers a long line with room to spare while staying a single small
+read.
+
 #### Why `head` exists at all
 
 `size < off` alone has a **silent data-loss hole**. Rotation resets the file to
@@ -564,7 +607,7 @@ defeating it).
 
 #### The first-line fingerprint is not collision-free — accepted, with a second condition
 
-A 200-byte first-line prefix is not a digest, so two generations whose first lines
+A 4096-byte first-line window is not a digest, so two generations whose first lines
 are byte-identical compare equal, and the shipper could accept the wrong `.1`, send
 it at the old offset and then reset. Stated plainly rather than papered over:
 
@@ -663,27 +706,65 @@ send a partial line" is the invariant the server parser depends on:
 
 ```text
 if the chunk [off, off+n) contains no \n:
-    extend the read forward to the next \n, up to ROGUE_SHIP_MAX_LINE_BYTES (4 MiB)
-    found      → send ONE oversized request carrying exactly that line
-    not found  → skip it: advance off past the next \n (or to EOF), and log
-                 outcome=skip reason=oversize-line
+    search forward for the next \n, in overlapping windows of
+    ROGUE_SHIP_MAX_LINE_BYTES, bounded at 64 windows (256 MiB at the defaults)
+
+    found, line <= MAX_LINE_BYTES  → send ONE oversized request carrying exactly
+                                     that line
+    found, line >  MAX_LINE_BYTES  → skip it: advance off PAST THAT \n, and log
+                                     outcome=skip reason=oversize-line
+    no \n, hit EOF, file is .1     → the generation is frozen, so this really is
+                                     the final line: send it
+    no \n, hit EOF, file is live   → a line still being written. Send nothing and
+                                     do not advance; next run picks it up
+    no \n, scan bound exhausted    → STALL. Do not advance. Log
+                                     outcome=stall reason=unbounded-line
 ```
+
+Three of those five branches were wrong or missing in the first draft, and each was
+found by a test rather than by review:
+
+- **The search must span windows.** The first implementation probed one
+  `MAX_LINE_BYTES` window and, on a miss, advanced the offset by that window and
+  probed again. That lands the offset **mid-line**, and every read after it is a
+  fragment: verified with a 406-byte line against `ROGUE_SHIP_MAX_LINE_BYTES=100`,
+  which shipped the line's last 6 bytes as if it were a short line. The only safe
+  skip target is the next `\n` — never a fixed amount.
+- **An unterminated final line splits by file state.** On the live file it is a
+  partial write and must be left alone; on a rotated `.1` the generation is frozen,
+  so waiting for a newline that will never arrive stalls `.1` forever — and because
+  the live log cannot reset until `.1` drains, that stalls the whole file.
+- **An exhausted scan bound must stall, not advance.** Losing one file's
+  diagnostics until someone looks at it is recoverable; advancing to a mid-line
+  offset corrupts every subsequent chunk. It is logged on every run so a stalled
+  file is visible rather than silent.
 
 So `ROGUE_SHIP_MAX_BYTES` is the per-request size **for ordinary chunks**, with one
 bounded, documented exception for a single line that cannot fit. The server must
 accept a body above the normal cap; `ROGUE_SHIP_MAX_LINE_BYTES` is the real ceiling.
 
-Both branches are effectively unreachable in a healthy install — `raw=` is capped at
+These branches are effectively unreachable in a healthy install — `raw=` is capped at
 400 chars and every other token is bounded, so a line is a few hundred bytes. A
 multi-megabyte line means something already went wrong (a binary blob appended, an
-interleaved write from outside the plugin), which is exactly why the tail case
-**skips forward instead of retrying**: a corrupt line must not park the file forever.
+interleaved write from outside the plugin), which is exactly why the over-ceiling
+case **skips forward instead of retrying**: a corrupt line must not park the file
+forever.
 
 #### The chunk never passes through a shell variable
 
 sh variables cannot hold NUL bytes, and a stray NUL would silently truncate the
 chunk. Extract straight to a temp file under `~/.rogue/ship/`, base64 the file, and
 let only the base64 output (NUL-free by construction) live in a variable.
+
+**And the request body cannot be an argument either** — corrected during
+implementation, where the first version passed `curl -d "$body"`. A 1 MiB chunk is
+~1.4 MiB once base64-encoded, and macOS caps `ARG_MAX` at 1 MiB for arguments *plus*
+environment, so the largest ordinary chunk cannot be passed on a command line at
+all — and an oversized line (up to `ROGUE_SHIP_MAX_LINE_BYTES`) misses by a wide
+margin. The body is therefore assembled into a temp file and sent with
+`--data-binary @file`, which also keeps the base64 out of the process table. The
+PowerShell and Node implementations have no such limit (a byte array and a string
+respectively) and are unaffected.
 
 #### Windows file sharing — both directions
 
@@ -922,13 +1003,30 @@ each already carries.
 `.github/workflows/validate.yml` (sh under **both `dash` and `bash`**, as phase 1's
 log test is).
 
-**No mock server.** The sh test puts a fake `curl` earlier on `PATH` that records
-argv and stdin to a file and exits with a scripted status; the PowerShell test
-defines an `Invoke-WebRequest` function in the dot-sourcing scope, through the
-existing `ROGUE_PS_LIB_ONLY` seam. Deterministic, no network, no new dependency,
-and it lets a test assert the exact body. Node stubs `globalThis.fetch`, which means
-`ship-logs.mjs` must export its entry point and auto-run only when it is
-`process.argv[1]`.
+**No mock server in the contract tests.** The sh test puts a fake `curl` earlier on
+`PATH` that records the request body to a file and exits with a scripted status.
+Deterministic, no network, no new dependency, and it lets a test assert the exact
+bytes that would have gone over the wire. Node stubs `globalThis.fetch`
+(`tests/ship_probe.mjs`), which is why `ship-logs.mjs` must export its entry point
+and auto-run only when it is `process.argv[1]`.
+
+`tests/test_ship_logs.ps1` came out differently from the plan above: rather than
+shadowing `Invoke-WebRequest`, it exercises the **pure helpers** through the
+`ROGUE_PS_LIB_ONLY` seam (fragment maths, head fingerprint, path normalisation, knob
+parsing, ranged reads, the window-spanning line scan, the state round trip) plus a
+**structural layer** asserting each of the five callers starts the shipper, with the
+right slug/family, in a child process. Shadowing the HTTP call would have added a
+mock of the one thing the e2e test below covers for real, and the helpers are where
+the Windows-only defects actually were — it found two on first run (see below).
+
+**A separate END-TO-END test, `tests/e2e_ship_logs.sh`**, added because a stub can
+only prove what the shipper *would* send. It runs the real pipeline: a real
+dispatcher writes the log, `hook.sh`'s own rotation renames it, the real shipper
+POSTs with real `curl`, and a real HTTP server (`tests/e2e_receiver.mjs`) decodes
+`content_b64` and rebuilds the file — then `cmp` compares disk against wire. It also
+drives the real caller (`heartbeat.sh`) rather than the shipper directly, which is
+the only assertion that the feature is wired in at all. Both are in
+`validate.yml`.
 
 Cases:
 
@@ -1003,11 +1101,30 @@ Cases:
   `whoami` or `$USER@$(hostname)`. This is the regression test for the Cursor drift:
   `hook.sh`'s fallback is `$USER@$(hostname)` where `actor.sh`'s is `hostname`, so any
   private cascade produces a second identity for the same machine;
-- **the two inline callers export what they resolved**: assert `cursor/scripts/hook.sh`
-  exports `ROGUE_ACTOR_EMAIL`/`ROGUE_ACTOR_NAME` before invoking the shipper, and that
-  `gemini/scripts/heartbeat.mjs` passes them in the child's `env` — a wiring assertion
-  like phase 1's `Initialize-Logging` ones, because the failure is invisible at
-  runtime (logs upload fine, attached to nothing);
+- **every caller passes down what it resolved**: `cursor/scripts/hook.sh` prefixes the
+  invocation with `ROGUE_ACTOR_EMAIL=`/`ROGUE_ACTOR_NAME=` (its actor lives in plain
+  shell locals, so without that the child inherits nothing and skips),
+  `gemini/scripts/heartbeat.mjs` assigns them into `process.env` before importing the
+  shipper (`loadEnvFiles()` deliberately does not mutate `process.env`), and the five
+  PowerShell callers set them as `$env:` before spawning. A wiring assertion like
+  phase 1's `Initialize-Logging` ones, because the failure is invisible at runtime —
+  logs upload fine, attached to nothing;
+- **`path=` agrees across implementations for the same file**: ship through a
+  directory reached with a redundant `//` in one language and a `/./` in another, and
+  assert the second run does not re-ship. The regression test for the normalisation
+  bug above, and the reason macOS's trailing-slash `$TMPDIR` is left in the harness
+  rather than cleaned up — it is what exposed it;
+- **an unbounded line stalls rather than advancing**: assert `outcome=stall
+  reason=unbounded-line` and that the offset is unchanged, with no chunk sent. The
+  `.ps1` copy shipped the opposite (advance by one window) with no test to catch it;
+- **the state file parses back on Windows**: write state, read it, assert the offset
+  and size round-trip. Trivial-looking, and it caught a real defect — a nested
+  `-match` inside the `if ($line -match '^offset=(.*)$')` branch overwrote the
+  automatic `$Matches`, so both parsed as 0 and every Windows run re-shipped the whole
+  log from byte 0, forever, with a state file that looked correct on disk;
+- **the state file is BOM-less LF**: a UTF-8 BOM would make the sh parser read the
+  first key as `﻿offset` and treat the offset as absent (same failure, other
+  direction);
 - `agent_family` is the value the **caller passed**, never derived from the slug —
   assert the codex copy sends `openai` while its `shipper` stays `codex`, the one
   case a naive slug→family assumption breaks;

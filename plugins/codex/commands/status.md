@@ -97,6 +97,44 @@ Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 A `ROGUE_LOG_DIR` set in `~/.rogue-env` or `C:\ProgramData\rogue\env` also wins over
 the default — check those files if this shows no activity on a healthy connection.
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "${PLUGIN_ROOT}/scripts/ship-logs.sh"
+```
+- Windows (PowerShell):
+```powershell
+$env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path (Get-Item Env:PLUGIN_ROOT).Value 'scripts\ship-logs.ps1'))))
+```
+
+`PLUGIN_ROOT`, never `CLAUDE_PLUGIN_ROOT` — the Codex plugin uses Codex-native
+variables only, even though Codex exposes the Claude names as compat shims.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `codex.log`. Each line is attributed by its own
+`provider=` token, so a mixed upload is still filed per agent.
+
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/rogue:setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file disables uploading entirely, including this manual run.
+
 ## Step 5: Confirm hooks are trusted
 
 Remind the user that Codex skips untrusted command hooks. If no events are showing

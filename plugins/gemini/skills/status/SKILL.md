@@ -81,6 +81,41 @@ Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
 `gemini.log` only — a sibling agent's activity lives in `claude.log`,
 `cursor.log`, and so on. `<file>.1` is the previous rotation, if any.
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+**One command, both platforms** — Gemini CLI guarantees Node 20+ on PATH, so the
+shipper is a single Node script here rather than the sh/PowerShell pair the other
+Rogue plugins ship. There is no `.ps1` variant to run on Windows.
+
+```bash
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 node "$HOME/.gemini/extensions/rogue/scripts/ship-logs.mjs"
+```
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `gemini.log`. Each line is attributed by its
+own `provider=` token, so a mixed upload is still filed per agent — and the state
+directory is shared with the other plugins' shippers, so a log another agent
+already uploaded is not sent twice.
+
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file disables uploading entirely, including this manual run.
+
 ## Step 5: Summary
 
 Present a clean summary: credential sources, connection status, mode + ruleset

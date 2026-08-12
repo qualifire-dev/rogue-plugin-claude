@@ -65,6 +65,49 @@ Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
 `codex.log`, and so on. `<file>.1` is the previous rotation, if any. An empty or
 missing file with a healthy connection just means no events have fired yet.
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "${CURSOR_PLUGIN_ROOT:-$HOME/.cursor/plugins/local/rogue}/scripts/ship-logs.sh"
+```
+- Windows (PowerShell):
+```powershell
+$root = $env:CURSOR_PLUGIN_ROOT
+if (-not $root) { $root = Join-Path $env:USERPROFILE '.cursor\plugins\local\rogue' }
+$env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\ship-logs.ps1'))))
+```
+
+The explicit fallback path matters here: `CURSOR_PLUGIN_ROOT` is set for hook
+subprocesses, but a slash command runs in the agent's own shell, where it may be
+absent. `~/.cursor/plugins/local/rogue` is where the one-line installer puts the
+plugin; a Team Marketplace install lives elsewhere, so check `~/.cursor/plugins/`
+if that path does not exist.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `cursor.log`. Each line is attributed by its
+own `provider=` token, so a mixed upload is still filed per agent.
+
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/rogue:setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file disables uploading entirely, including this manual run.
+
 ## Step 5: Summary
 
 Combine credential sources, connection status, and identity into one clean summary. If everything looks good, confirm the integration is active. Block/allow/ask policy is managed server-side — direct the user to the dashboard to view or change it.

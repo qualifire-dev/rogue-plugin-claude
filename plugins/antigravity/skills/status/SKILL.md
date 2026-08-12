@@ -128,6 +128,49 @@ if (-not $logPath) {
 Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background on the
+first model invocation of a turn, at most once every 15 minutes per file, resuming
+from wherever the last upload finished. Run it by hand only to push the newest
+lines *now*.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
+  sh "$HOME/.gemini/config/plugins/rogue/scripts/ship-logs.sh"
+```
+- Windows (PowerShell):
+```powershell
+$root = Join-Path $env:USERPROFILE '.gemini\config\plugins\rogue'
+$env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\ship-logs.ps1'))))
+```
+
+`~/.gemini/config/plugins/rogue` is the directory **both** surfaces read — the IDE
+and the `agy` CLI — which is where the installer copies the plugin. Antigravity's
+own docs name `~/.gemini/antigravity-cli/plugins/`; if the path above does not
+exist, try that one.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `antigravity.log`. Each line is attributed by
+its own `provider=` token, so a mixed upload is still filed per agent.
+
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file disables uploading entirely, including this manual run.
+
 ## Step 5: Summary
 
 Present a clean summary: credential sources, connection status, mode + ruleset count, the Antigravity event sets (IDE and CLI surfaces), and actor identity (`${ROGUE_ACTOR_EMAIL}` / `${ROGUE_ACTOR_NAME}`).

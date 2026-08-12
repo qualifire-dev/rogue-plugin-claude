@@ -76,6 +76,53 @@ Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
 tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/copilot.log}" 2>/dev/null || echo "(no hook log yet)"
 ```
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
+  sh "$HOME/.copilot/installed-plugins/rogue-copilot/rogue/scripts/ship-logs.sh"
+```
+- Windows (PowerShell):
+```powershell
+$root = Join-Path $env:USERPROFILE '.copilot\installed-plugins\rogue-copilot\rogue'
+$env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\ship-logs.ps1'))))
+```
+
+An absolute path, not a plugin-root variable: Copilot sets no root variable for a
+slash command's shell. If that path does not exist, list
+`~/.copilot/installed-plugins/` — the marketplace name is `rogue-copilot`, so the
+plugin lands one level deeper than the other agents'.
+
+**This is unavailable in the JetBrains IDE's Local agent**, which does not load
+`~/.copilot/installed-plugins` at all — the same reason `/rogue:status` itself is
+unreachable there. Ask the user to run it from the terminal CLI instead; both
+write the same `copilot.log`.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `copilot.log`. Each line is attributed by its
+own `provider=` token, so a mixed upload is still filed per agent.
+
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/rogue:setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file disables uploading entirely, including this manual run.
+
 ## Step 5: Confirm hooks are trusted
 
 Remind the user that Copilot CLI skips untrusted command hooks. If no events are
