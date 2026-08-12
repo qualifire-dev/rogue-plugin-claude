@@ -139,15 +139,20 @@ first model invocation of a turn, at most once every 15 minutes per file, resumi
 from wherever the last upload finished. Run it by hand only to push the newest
 lines *now*.
 
+**Uploading is off by default right now.** The receiving route is not deployed yet,
+so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
+is why every command below sets it explicitly. Once the route is live the default
+flips and the paragraph above applies unchanged.
+
 - macOS / Linux:
 ```bash
-ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
+ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
   sh "$HOME/.gemini/config/plugins/rogue/scripts/ship-logs.sh"
 ```
 - Windows (PowerShell):
 ```powershell
 $root = Join-Path $env:USERPROFILE '.gemini\config\plugins\rogue'
-$env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+$env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
 & ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\ship-logs.ps1'))))
 ```
 
@@ -160,6 +165,7 @@ Run with **no arguments**, which is the support form: it uploads *every* agent's
 log in the log directory, not just `antigravity.log`. Each line is attributed by
 its own `provider=` token, so a mixed upload is still filed per agent.
 
+`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
 `ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
 `ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
 output at all** when everything already shipped — that is success. Nothing is
@@ -169,7 +175,8 @@ on a confirmed 2xx.
 Report failures as-is rather than retrying: `http=401` is a bad API key
 (`/setup`), `http=000` is a network or proxy problem, and
 `outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
-in any env file disables uploading entirely, including this manual run.
+in any env file keeps uploading off even with the flag above,
+and stays off after the default flips.
 
 ## Step 5: Summary
 

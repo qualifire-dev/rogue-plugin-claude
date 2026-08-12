@@ -108,7 +108,7 @@ is still derived from `$0`/`$PSCommandPath` so the bundled `env` is not skipped.
       /etc/rogue/env            (POSIX)   |  C:\ProgramData\rogue\env  (Windows, MDM)
       $HOME/.rogue-env          (POSIX)   |  %USERPROFILE%\.rogue-env   (Windows)
     process env wins over all files
- 3. ROGUE_SHIP_LOGS=0 → exit 0
+ 3. ROGUE_SHIP_LOGS not a numeric non-zero → exit 0   (shipping is OPT-IN, see below)
  4. no ROGUE_API_KEY → exit 0
  5. resolve which log file(s) to ship — own slug only by default
  6. mkdir -p ~/.rogue/ship
@@ -949,7 +949,7 @@ fleet-wide, and process env still wins:
 
 | var | default | meaning |
 |---|---|---|
-| `ROGUE_SHIP_LOGS` | `1` | `0` disables shipping entirely |
+| `ROGUE_SHIP_LOGS` | **`0` (opt-in)** | must be a numeric non-zero to ship at all — see **Rollout** |
 | `ROGUE_SHIP_MIN_INTERVAL` | `900` | seconds between attempts, per log file |
 | `ROGUE_SHIP_MAX_BYTES` | `1048576` | bytes per HTTP request (ordinary chunks) |
 | `ROGUE_SHIP_MAX_RUN_BYTES` | `10485760` | bytes per file per run (one generation) |
@@ -982,20 +982,68 @@ of this script:
 ```sh
 # No arguments → collects every agent's log (ROGUE_SHIP_ALL is implied, since
 # without a slug there is no "own log" to pick). Throttled like any other run.
-sh ~/.claude/plugins/.../scripts/ship-logs.sh
+ROGUE_SHIP_LOGS=1 sh ~/.claude/plugins/.../scripts/ship-logs.sh
 
-# Same, ignoring the throttle — the actual support one-liner.
-ROGUE_SHIP_MIN_INTERVAL=0 sh ~/.claude/plugins/.../scripts/ship-logs.sh
+# The actual support one-liner: ignore the throttle, and report the outcome even
+# though a no-argument run has no log file of its own to write it to.
+ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
+  sh ~/.claude/plugins/.../scripts/ship-logs.sh
 
 # This agent only, attributed properly: pass what the heartbeat passes.
-sh .../ship-logs.sh "$CLAUDE_PLUGIN_ROOT" claude 1.4.2 claude
+ROGUE_SHIP_LOGS=1 sh .../ship-logs.sh "$CLAUDE_PLUGIN_ROOT" claude 1.4.2 claude
 ```
 
-`/rogue:status` gains a final step offering exactly that — **with the arguments
-filled in**, since the status command knows its own plugin root, slug, version and
-family — in all six status commands (`plugins/{rogue,gemini,antigravity,copilot}/skills/status/SKILL.md`,
-`plugins/{codex,cursor}/commands/status.md`), with the bash and PowerShell forms
-each already carries.
+`ROGUE_SHIP_LOGS=1` is on every one of those lines because shipping is opt-in until
+the route ships (**Rollout**, below). `ROGUE_DEBUG=1` is on the support line for a
+subtler reason: the shipper's own diagnostics go into the SHIPPING plugin's log file,
+which a no-argument run does not have (its slug is `unknown`), so without the debug
+stream `outcome=fail … http=<code>` and `outcome=skip reason=no-actor` would have
+nowhere to land on exactly the run support is asked to make. `log()` therefore always
+mirrors to stderr under `ROGUE_DEBUG`, before it checks whether it has a file.
+
+`/rogue:status` gains a final step offering exactly that, in all six status commands
+(`plugins/{rogue,gemini,antigravity,copilot}/skills/status/SKILL.md`,
+`plugins/{codex,cursor}/commands/status.md`), with the bash and PowerShell forms each
+already carries. It documents the **no-argument** form: the support case is "collect
+everything on this box", and a status command that filled in its own slug would ship
+only its own agent's log — which is the one thing the operator running a support
+collection does not want.
+
+## Rollout
+
+**The client is complete and shipping is off by default.** `ROGUE_SHIP_LOGS` must be
+a numeric non-zero for a run to make any request — the reverse of every other knob
+here, where unset means "use the default behaviour".
+
+The reason is the receiving route: `/api/v1/hooks/logs` **does not exist yet**. The
+AIDR hooks router registers `/ping`, `/status`, `/config`, `/claude`, `/cursor`,
+`/gemini`, `/antigravity`, `/copilot` and `/openai`, and production answers an
+unknown hooks path with `404 NOT_FOUND` *before* auth. A default-on client would
+therefore have every configured install POST into a permanent 404 on each session
+start. Nothing would be lost — the offset advances only on 2xx — but nothing would
+recover either, and each failure appends an `outcome=fail … http=404` line to the very
+file being shipped, so the backlog it is trying to drain only grows.
+
+Flipping the default is **three one-line edits**, one per implementation
+(`flag_is_enabled` in `scripts/shared/ship-logs.sh`, `Test-FlagEnabled` in
+`scripts/shared/ship-logs.ps1`, `flagIsEnabled` in
+`plugins/gemini/scripts/ship-logs.mjs`), plus `scripts/sync-shared-scripts.sh`. The
+preconditions, in order:
+
+1. `POST /api/v1/hooks/logs` deployed, authenticating `x-rogue-api-key`, and
+   answering **2xx only after a durable write**. This is a correctness requirement,
+   not a preference: the client forgets bytes the moment it sees a 2xx, so an
+   accepted-then-dropped chunk is unrecoverable data loss with no error anywhere.
+   `forwardEndpointLogs`'s un-awaited `axiomClient.ingest(...)` is exactly the shape
+   this must not have.
+2. The `log_source` mapping in place, so a chunk's `host` / `actor_email` /
+   `agent_family` resolve to a row rather than being stored raw.
+3. Server-side redaction over every parsed field **and** the raw line.
+
+Until then the feature is exercised by CI (a real receiver, real HTTP, on both
+platforms) and reachable by hand for support with an explicit `ROGUE_SHIP_LOGS=1`.
+Endpoint contract, storage model and the task-worker side:
+[log-shipping-backend.md](log-shipping-backend.md).
 
 ## Tests
 
@@ -1085,7 +1133,18 @@ Cases:
   is reclaimed; **two different keys do not block each other**;
 - throttle honored per key, honored **from `~/.rogue-env`** (phase 1's actual bug),
   and a `.last-<key>` timestamped in the future is treated as stale;
-- `ROGUE_SHIP_LOGS=0` is a no-op that leaves the offset untouched;
+- `ROGUE_SHIP_LOGS=0` is a no-op that leaves the offset untouched, **and so is an
+  unset one** — shipping is opt-in (see **Rollout**), so the whole suite would pass
+  vacuously without an explicit `=1`; a non-numeric value ("yes") is not an opt-in;
+- a lock directory with **no readable `ts` marker** still blocks: creating the
+  directory and writing the marker are two operations, so a lock taken microseconds
+  ago legitimately has no marker, and reading that absence as stale let a second run
+  delete a live lock and re-upload the same range. Only the lock directory's own age
+  may reclaim an unmarked lock (`find -mmin` in sh — `stat`'s flags differ between
+  BSD and GNU; the directory's own timestamp in PowerShell and Node);
+- every outcome `log()` records also reaches **stderr under `ROGUE_DEBUG`**, so the
+  no-argument support run — which has no log file of its own — still reports
+  `http=<code>` and `reason=no-actor`;
 - a chunk containing `"`, `\`, a newline and a UTF-8 multibyte character round-trips
   through base64 **byte-exact**; a chunk containing a NUL byte is not truncated
   (the temp-file path, not a shell variable);

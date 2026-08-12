@@ -68,6 +68,12 @@ on the same host. That join is capability B's contribution; if we want it for
 plugin-only machines too, the place for it is one field on the heartbeat's roster
 row — **not** in every shipped log chunk.
 
+**The backend and agent work is now specced separately** in
+[log-shipping-backend.md](log-shipping-backend.md) — the `/hooks/logs` route, the
+`log_source` mapping, the durability requirement, the redaction boundary and the
+`CodingAgentLogUpload` checklist, in one place that can be handed to whoever picks it
+up. The open questions at the end of this file are the ones it does not settle.
+
 ## Phase 2 — the plugin shipper (this repo)
 
 **Superseded by [plugin-log-shipper.md](plugin-log-shipper.md)**, which is the
@@ -187,6 +193,7 @@ installed. Only an unreadable-but-present file or a failed POST is `AgentFailed`
 > [plugin-log-shipper.md](plugin-log-shipper.md) §10), or stop having the task
 > status claim upload success and report "submitted" instead. Do not leave it
 > claiming `Succeeded` on the current behaviour.
+
 Never touch the live log: read-only, no truncation, **and no offset file** — the
 plugin shipper owns `~/.rogue/ship/`, and a second writer there would make both
 lose lines.
