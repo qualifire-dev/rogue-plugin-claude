@@ -129,13 +129,41 @@ worth the costs:
 Path resolution matches the dispatchers exactly, or the shipper reads a path
 nothing writes:
 
-- `ROGUE_LOG_FILE` set → that file (all agents share it in this mode; see the
-  concurrency note below).
+- `ROGUE_LOG_FILE` set → that file. **All six agents write to it in this mode**, and
+  its basename is arbitrary (`/var/log/rogue-all.log`), so neither the envelope nor
+  the filename can attribute the chunk — see **Attribution is per line** below.
 - else `ROGUE_LOG_DIR`, else `$HOME/.rogue/logs`, file `<slug>.log`.
 
 **`ROGUE_SHIP_ALL=1` restores the ship-everything behaviour** for the support case
 — on a call with a customer, one invocation collects the whole machine. Manual and
 opt-in, never the default.
+
+#### Attribution is per line, not per file
+
+`ROGUE_LOG_FILE` collapse mode breaks any file-level identity scheme, and the break
+is silent in the worst way: one chunk holds interleaved `provider=claude`,
+`provider=codex`, `provider=cursor` lines, so tagging it with the shipping plugin's
+`agent_family` would file **Claude lines under `openai`**, and the server cannot
+recover the family from a basename that is not a known slug.
+
+So the server attributes **each line**, keyed on its `provider=` token, and the
+envelope's `agent_family` is a **hint used only as a fallback** for a line that has
+no `provider=` (a torn line, or a future format change). In the normal per-file
+configuration every line in `claude.log` says `provider=claude`, so per-line and
+per-file agree and nothing changes; collapse mode simply works.
+
+This costs nothing on the server — the ingest already emits one Axiom event per
+line, so deriving that line's `log_source` alongside its other fields is the same
+loop. It costs nothing on the client either: no slug table, no per-line work, no
+new field.
+
+> **This reverses my earlier recommendation to delete `provider=`.** That
+> recommendation rested on one finding — nothing consumed the token, so it was
+> write-only overhead. Per-line attribution gives it a consumer, and a load-bearing
+> one: it is the *only* thing that can attribute a line in collapse mode. Keep it.
+> The alternative is coherent but worse — declare `ROGUE_LOG_FILE` unsupported for
+> shipping, so any fleet that set it (it exists purely for pre-split back-compat,
+> and MDM configs are exactly where it would live) silently ships nothing.
 
 ### 7–8. Throttle and lock
 
@@ -226,7 +254,8 @@ opaque id before ingesting**:
 ```
 plugin  → POST /hooks/logs   host, actor_email, actor_name, agent_family,
                              log_file, chunk
-backend → log_source_id = hash(org_id | host | actor_email | agent_family)
+backend → resolve-or-create log_source row for
+          (org_id, host, actor_email, family-of-this-line)  → random uuid
 Axiom   ← log_source_id, log_file, offset, chunk                  (no PII)
 ```
 
@@ -255,11 +284,13 @@ happened to open a session first. That is not under-specified, it is incorrect.
 name — and the fix is to stop pretending it is a `coding_agent.id`:
 
 - The shipper sends `agent_family` (new field, and the reason it is now an
-  argument).
-- The backend derives **`log_source_id = hash(org_id | host | actor_email |
-  agent_family)`**, deterministic and opaque, and stores only that in Axiom. It is
-  recomputable from any `coding_agent` row's own columns, so "show me this roster
-  row's plugin log" is a join with no schema change and no PII crossing over.
+  argument) as a fallback hint; per-line `provider=` drives the real attribution.
+- The backend keeps a **`log_source` table** — `id` (random uuid), `org_id`,
+  `hostname`, `actor_email`, `agent_family`, unique on the four — and resolves or
+  creates a row per `(org, host, actor, family)`. Only `log_source_id` reaches
+  Axiom.
+- "Show me this roster row's plugin log" is a lookup of that row's own columns in
+  `log_source`. No schema change to `coding_agent`, no PII crossing over.
 - The UI surfaces plugin logs at machine + family granularity, which is what the
   file actually is. A roster row for `claude_desktop` shows the same log as
   `claude_code` on that machine — correct, not a bug.
@@ -268,9 +299,40 @@ name — and the fix is to stop pretending it is a `coding_agent.id`:
 surface into each *line* at hook time (the dispatcher knows it) and let the server
 split. That is phase-1 format scope, deliberately not done here.
 
-**`hash`, not the raw triple, and not a `coding_agent.id`**: the raw triple is the
-PII we are keeping out of Axiom, and a specific row id would be a lie about
-granularity. A server-side hash is neither.
+#### A plain hash would not have been a privacy boundary
+
+An earlier version of this section specified
+`log_source_id = hash(org_id | host | actor_email | agent_family)` and called it
+opaque. **It is not.** Hostnames and work emails are extremely low-entropy,
+especially within one organisation: `firstname@rogue.security` over a known
+employee list, `<firstname>-mbp` / `<firstname>-macbook` over the same list, six
+known families. That is a few thousand candidates — a dictionary attack completes
+in milliseconds, so anyone with Axiom-only access recovers every hostname and email
+exactly. It would have been pseudonymisation dressed up as removal, which is worse
+than an honest plaintext field because it invites reliance it cannot support.
+
+Three ways to fix it, in increasing strength:
+
+1. **Salted hash** — no better. The salt must be stored, and whoever can query
+   Axiom is inside the same system.
+2. **HMAC under a server-held key** — genuinely resistant, and it keeps the
+   derive-from-any-row property.
+3. **A random id in a `log_source` table** — what this spec now requires.
+
+(3) beats (2) on two counts beyond the crypto. **Erasure**: Axiom is append-only, so
+an HMAC scheme cannot honour a delete request without rewriting immutable data,
+whereas deleting the `log_source` row leaves the events permanently unlinkable —
+which is precisely what "erase this person" requires. And **rotation**: there is no
+key to rotate, leak, or fail to rotate.
+
+Cost is one indexed lookup per distinct `(host, actor, family)` per request,
+in-process cacheable, and at most six per chunk even in collapse mode.
+
+**Note this reintroduces resolve-or-create**, which §9 removed a revision ago for a
+different reason. That removal was about not inventing a `coding_agent` row with a
+guessed `agent` surface. `log_source` has no surface column and no guessing: the
+four fields all arrive in the request, and creating the row *is* the correct
+behaviour when a machine ships before it beacons.
 
 **The plugin carries no identifier of its own.** An earlier draft proposed a
 generated `install_id` in `~/.rogue/install-id`; that was inventing a primary key
@@ -278,12 +340,12 @@ the database already has. Deleted. `machine_id` is likewise **not** sent — its
 job was joining to the endpoint agent's rows for the same device, and that belongs
 on the roster row once (from the heartbeat), not in every log chunk.
 
-**No lookup miss to handle.** Because `log_source_id` is *derived* rather than
-looked up, a chunk arriving before any heartbeat still lands with a correct,
-stable id — the roster row joins to it later when the heartbeat creates it. This
-also removes the resolve-or-create path the earlier draft needed, and with it the
-risk of the log ingest inventing a `coding_agent` row with a guessed `agent`
-surface (which, given the four-part fingerprint, it would have had to).
+**A chunk arriving before any heartbeat is fine.** It creates its own `log_source`
+row from fields that are all present in the request, and the `coding_agent` row
+joins to it whenever the heartbeat lands. The log ingest never touches
+`coding_agent`, so it can never invent a roster row with a guessed `agent` surface
+— which, given the four-part fingerprint, a `coding_agent` lookup would have had
+to.
 
 `host` is `hostname`; `actor_email` / `actor_name` come from `scripts/actor.sh`
 where present (`env` → `git config --global` → `CLAUDE_CODE_USER_EMAIL` →
@@ -564,13 +626,13 @@ Headers: `x-rogue-api-key`, `Content-Type: application/json`. Nothing else — n
 `shipper` and `log_file` are equal in the default configuration and differ only
 under `ROGUE_SHIP_ALL` or `ROGUE_LOG_FILE`. Both are envelope-level hints; the
 per-line `provider=` token remains authoritative for which agent a line came from.
-`agent_family` is the one identity-bearing field of the three — it is what
-`log_source_id` is derived from. It is sent for the caller's **own** log, where the
-caller passed it in. For a *foreign* log under `ROGUE_SHIP_ALL` it is **omitted**,
-and the server derives the family from `log_file`: the slug→family mapping
-(`codex` → `openai`, `gemini` → `gemini_cli`'s family `gemini`, …) is server
-vocabulary, and putting a copy of it in a byte-identical shell script is exactly
-the lockstep liability this design avoids elsewhere.
+`agent_family` is a **fallback hint, not the key**: attribution runs per line off
+`provider=` (see **Attribution is per line**). It is sent when the caller passed one
+— its own log — and omitted for a foreign log under `ROGUE_SHIP_ALL` and for a
+custom `ROGUE_LOG_FILE`, because in both of those the shipping plugin's family is
+not the chunk's family. The slug→family mapping (`codex` → `openai`, …) is server
+vocabulary; a copy of it inside a byte-identical shell script is exactly the
+lockstep liability this design avoids elsewhere.
 
 **No `agent` (surface) field, deliberately** — see §9: one log file spans every
 surface of its family, so a surface on the envelope would be a false precision.
@@ -590,7 +652,10 @@ surface of its family, so a surface on the envelope would be a false precision.
 Server side, per line: leading RFC3339 timestamp, `provider=`, `event=`, then
 best-effort `k=v`, always keeping the original line as `raw`. **Never drop a line**
 — `raw=` is a space- and `=`-bearing free-text tail (Codex puts it mid-line), so a
-strict k=v parse loses data.
+strict k=v parse loses data. **`provider=` selects the line's `log_source`**; a line
+without one falls back to the envelope's `agent_family`, and a line with an
+unrecognised `provider=` is still stored, attributed to a family of `unknown` rather
+than discarded.
 
 PowerShell builds the body with `ConvertTo-Json -Compress`. That is allowed here
 and is *not* the thing `CLAUDE.md` forbids: the prohibition is on re-serialising a
@@ -708,7 +773,12 @@ Cases:
   assert the codex copy sends `openai` while its `shipper` stays `codex`, the one
   case a naive slug→family assumption breaks;
 - under `ROGUE_SHIP_ALL=1`, the caller's own log carries `agent_family` and a
-  foreign log **omits** it (the server derives that one from `log_file`);
+  foreign log **omits** it; a custom `ROGUE_LOG_FILE` omits it too (its lines are
+  mixed-provider, so the shipping plugin's family would mislabel them);
+- a collapse-mode file round-trips: write interleaved `provider=claude` and
+  `provider=codex` lines to one custom `ROGUE_LOG_FILE`, ship it, and assert the
+  body carries no `agent_family` and every line survives byte-exact (the server-side
+  half — one `log_source` per distinct provider — is asserted in the backend repo);
 - **no `agent` / surface field is ever sent** (§9: a log file spans every surface of
   its family, so a surface on the envelope would be false precision);
 - **no-argument invocation ships every log**, not `unknown.log`, and reports

@@ -189,6 +189,13 @@ lose lines.
   `raw=`. `endpoint-logs-redact.ts`'s `redactEvent`/`redactString` already walk
   every string value and rewrite home paths; reuse them. Neither covers `name=` (not
   a path) or the `raw=` policy, so those two need an explicit decision.
+- **`log_source` needs a table, not a hash.** Axiom rows carry a random
+  `log_source_id` resolved from `(org_id, hostname, actor_email, agent_family)`. A
+  plain hash of those was the first proposal and is not a privacy boundary — work
+  emails and hostnames are low-entropy enough inside one org to dictionary in
+  milliseconds. A random id also makes erasure work on an append-only store:
+  deleting the mapping row leaves the events unlinkable. See
+  [plugin-log-shipper.md](plugin-log-shipper.md) §9.
 - **Does a 2xx from the log routes mean durably ingested?** Today it does not (see
   the `forwardEndpointLogs` note in phase 3). The plugin shipper advances its offset
   on 2xx and forgets those bytes forever, so `/hooks/logs` must await its ingest and
