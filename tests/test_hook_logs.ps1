@@ -69,12 +69,18 @@ function Invoke-Probe {
         [Environment]::SetEnvironmentVariable($k, $envOverrides[$k])
     }
     try {
+        # -SeedPrevious is appended ONLY when it has a value. Windows PowerShell 5.1
+        # DROPS an empty string when it builds a native command's argument list, so
+        # `-SeedPrevious ''` reached the probe as a bare `-SeedPrevious` and failed
+        # with "Missing an argument for parameter 'SeedPrevious'". pwsh 7 passes it as
+        # `""`, which is why this only surfaced once these suites ran under 5.1 too.
+        # The probe's default for it is '' anyway, so omitting it is exact.
         $argv = @('-NoProfile', '-File', $probe,
                   '-Dispatcher', (Join-Path $repo $Case.path),
                   '-EventName', $Case.event,
                   '-CredsJson', ($Creds | ConvertTo-Json -Compress),
-                  '-SeedBytes', $SeedBytes,
-                  '-SeedPrevious', $SeedPrevious)
+                  '-SeedBytes', $SeedBytes)
+        if ($SeedPrevious) { $argv += @('-SeedPrevious', $SeedPrevious) }
         $out = & (Get-Process -Id $PID).Path @argv 2>$null
     } finally {
         foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
