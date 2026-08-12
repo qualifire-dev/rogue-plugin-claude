@@ -78,7 +78,8 @@ function Invoke-Probe {
         $argv = @('-NoProfile', '-File', $probe,
                   '-Dispatcher', (Join-Path $repo $Case.path),
                   '-EventName', $Case.event,
-                  '-CredsJson', ($Creds | ConvertTo-Json -Compress),
+                  '-CredsB64', [Convert]::ToBase64String(
+                      [System.Text.Encoding]::UTF8.GetBytes(($Creds | ConvertTo-Json -Compress))),
                   '-SeedBytes', $SeedBytes)
         if ($SeedPrevious) { $argv += @('-SeedPrevious', $SeedPrevious) }
         $out = & (Get-Process -Id $PID).Path @argv 2>$null
