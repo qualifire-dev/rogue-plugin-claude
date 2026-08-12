@@ -43,8 +43,9 @@ between them.
 **No heartbeat payload or identity change, and no new client-side identifier.** The
 heartbeat DOES need the one call-site edit described above — without it nothing
 invokes the shipper. What does not change is its `/hooks/status` body: the backend
-resolves the shipper's identity fields to a random `log_source_id` (§9), so no new
-field is needed anywhere in the beacon.
+does a resolve-or-create of a `log_source` row from the shipper's identity fields
+and forwards only that row's random id (§9), so no new field is needed anywhere in
+the beacon.
 
 ## Argument contract
 
@@ -90,7 +91,7 @@ is still derived from `$0`/`$PSCommandPath` so the bundled `env` is not skipped.
  6. mkdir -p ~/.rogue/ship
  7. per-file: throttle check on .last-<key>; too recent → skip this file
  8. per-file: acquire .lock-<key> (mkdir); stamp .last-<key> immediately
- 9. resolve host, actor_email, actor_name (same cascade as the heartbeat)
+ 9. host from hostname; actor_email/actor_name INHERITED, never re-resolved (§9)
 10. ship chunks until drained or the run budget is spent
 11. release the lock; exit 0
 ```
@@ -349,6 +350,62 @@ joins to it whenever the heartbeat lands. The log ingest never touches
 — which, given the four-part fingerprint, a `coding_agent` lookup would have had
 to.
 
+#### The actor is passed IN. The shipper never re-resolves it.
+
+**Hard rule, and the most fragile thing in this document.** "The shipper resolves the
+same cascade as the heartbeat, so the two cannot disagree" was hand-waving. Nothing
+enforces it, and two of the six plugins already break it:
+
+- **Cursor** resolves `actor_email` / `actor_name` as **shell locals** in
+  `plugins/cursor/scripts/hook.sh:147-158` — never exported, so a child process
+  inherits nothing.
+- **Gemini** resolves them as **module locals** in `heartbeat.mjs:36-37` (a duplicate
+  of `hook.mjs`'s `resolveActor`), never placed in `process.env`.
+
+And the cascades are **not** the same, so an independent re-resolve does not merely
+risk drift, it produces it. On a machine with no `git config --global user.email`:
+
+| | fallback | value |
+|---|---|---|
+| `scripts/actor.sh` (claude, codex, copilot, antigravity) | `hostname` | `amos-mbp` |
+| Cursor `hook.sh:151-158` | `$USER@$(hostname)` | `amos@amos-mbp` |
+
+Two identities for one machine, so the heartbeat's roster row and the shipper's
+`log_source` row would never meet. Nothing errors; the logs just attach to nothing.
+
+So the resolution order is:
+
+1. **Inherited `ROGUE_ACTOR_EMAIL` / `ROGUE_ACTOR_NAME` from the environment.** For
+   the four `actor.sh` plugins this is automatic — `actor.sh` already ends with
+   `export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME`, so a child of the heartbeat inherits
+   the exact values the beacon sent.
+2. **Otherwise, source `<plugin-root>/scripts/actor.sh` if it exists** — the manual
+   support invocation, where no heartbeat ran to export anything.
+3. **Otherwise skip the file** and log `outcome=skip reason=no-actor`. **Do not
+   invent an identity and do not carry a private cascade.** A wrong identity creates
+   an orphaned `log_source` row, which is strictly worse than not shipping: the
+   logs are uploaded, billed and stored, and joined to nothing.
+
+**Two caller changes fall out of this**, and they are the whole cost:
+
+- `plugins/cursor/scripts/hook.sh` — `export actor_email`/`actor_name` as
+  `ROGUE_ACTOR_EMAIL`/`ROGUE_ACTOR_NAME` before invoking the shipper (`hook.ps1`
+  likewise).
+- `plugins/gemini/scripts/heartbeat.mjs` — pass them in the child's env:
+  `spawn(…, { env: { ...process.env, ROGUE_ACTOR_EMAIL: email, ROGUE_ACTOR_NAME: name } })`.
+
+I chose passing over the alternative (give Cursor and Gemini a shared actor helper
+that heartbeat and shipper both call). Passing is correct **by construction** — the
+shipper uses the identical bytes the beacon used, because they *are* those bytes —
+whereas a shared helper leaves two implementations, in two languages, free to drift
+again. It also needs no new files.
+
+*Out of scope, noted so nobody "tidies" it casually:* Cursor's `$USER@$(hostname)`
+fallback differing from `actor.sh`'s `hostname` is pre-existing. It is not a roster
+bug (the fingerprint includes the family, so those rows were always distinct) and
+changing it would re-key existing Cursor installs. It is, however, exactly why the
+shipper must not have a cascade of its own.
+
 #### One canonical `actor_email`, or the join silently fails
 
 The roster fingerprint uses `` `${actorEmail ?? "anon"}` `` (`hooks.ts:343`). If the
@@ -368,12 +425,11 @@ folding it is a migration of `coding_agent.fingerprint`, not a line in this spec
 and until then `log_source` must match the roster's behaviour rather than improve on
 it, or the two disagree for anyone whose git email has a capital letter.
 
-`host` is `hostname`; `actor_email` / `actor_name` come from `scripts/actor.sh`
-where present (`env` → `git config --global` → `CLAUDE_CODE_USER_EMAIL` →
-`hostname`/`whoami`). Cursor and Gemini have no `actor.sh` and resolve the same
-cascade inline today; the shipper reuses whatever the caller already exported. Same
-resolution as the heartbeat by construction — if the two disagreed, the lookup
-would create a second roster row instead of matching the existing one.
+`host` is `hostname` — resolved locally, since every plugin's heartbeat uses exactly
+that call with no cascade. `actor_email` / `actor_name` are **inherited, never
+re-resolved** — see **The actor is passed IN** above for the order, the two caller
+changes it requires, and why an independent cascade in the shipper would silently
+orphan Cursor's logs.
 
 ### 10. Not re-reading what was already exported
 
@@ -714,8 +770,8 @@ Headers: `x-rogue-api-key`, `Content-Type: application/json`. Nothing else — n
 `x-rogue-event` (not a hook event), no `x-rogue-source`, no `x-rogue-agent`.
 
 ```jsonc
-{ "host":             "…",          // resolved to a random log_source_id,
-  "actor_email":      "…",          //   NOT forwarded to Axiom — see §9
+{ "host":             "…",          // resolve-or-create a log_source row; only
+  "actor_email":      "…",          //   its random id reaches Axiom — see §9
   "actor_name":       "…",
   "agent_family":     "claude",     // roster vocabulary: codex's family is `openai`
   "shipper":          "claude",     // which plugin's copy ran (log-slug vocabulary)
@@ -893,6 +949,17 @@ Cases:
 - an **absent, empty and whitespace-only** `actor_email` all produce the same
   envelope value, so `log_source` and the roster fingerprint's `?? "anon"` cannot
   diverge (the failure is silent: logs attach to nothing);
+- **the shipper has no actor cascade of its own**: with `ROGUE_ACTOR_EMAIL` unset and
+  no `scripts/actor.sh` reachable, it **skips the file** and logs
+  `outcome=skip reason=no-actor` — assert it does *not* fall back to `hostname`,
+  `whoami` or `$USER@$(hostname)`. This is the regression test for the Cursor drift:
+  `hook.sh`'s fallback is `$USER@$(hostname)` where `actor.sh`'s is `hostname`, so any
+  private cascade produces a second identity for the same machine;
+- **the two inline callers export what they resolved**: assert `cursor/scripts/hook.sh`
+  exports `ROGUE_ACTOR_EMAIL`/`ROGUE_ACTOR_NAME` before invoking the shipper, and that
+  `gemini/scripts/heartbeat.mjs` passes them in the child's `env` — a wiring assertion
+  like phase 1's `Initialize-Logging` ones, because the failure is invisible at
+  runtime (logs upload fine, attached to nothing);
 - `agent_family` is the value the **caller passed**, never derived from the slug —
   assert the codex copy sends `openai` while its `shipper` stays `codex`, the one
   case a naive slug→family assumption breaks;
