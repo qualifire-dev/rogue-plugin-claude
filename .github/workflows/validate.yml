@@ -75,8 +75,18 @@ jobs:
           while IFS= read -r f; do
             if head -1 "$f" | grep -q bash; then chk="bash -n"; else chk="dash -n"; fi
             if ! $chk "$f"; then echo "::error file=$f::$chk parse error"; fail=1; fi
-          done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh')
+          done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh' 'scripts/shared/*.sh')
           [ "$fail" = 0 ] || exit 1
+
+      - name: Shared plugin scripts are in sync
+        # scripts/shared/ holds the ONLY editable copy of ship-logs.sh / ship-logs.ps1;
+        # each plugin carries a committed byte-identical copy, because three plugins
+        # install straight from a git clone of this repo with no build step, so a
+        # generated-at-release file would simply be missing for them. Without this
+        # gate an edit to scripts/shared/ that was never propagated ships five stale
+        # copies, and an edit made directly to a plugin's copy is silently reverted by
+        # the next sync — neither is visible in review.
+        run: bash scripts/sync-shared-scripts.sh --check
 
       - name: Hook-log contract (sh + mjs dispatchers)
         # The per-agent log file, line format and rotation policy are duplicated
@@ -88,6 +98,29 @@ jobs:
           set -euo pipefail
           SH=dash sh tests/test_hook_logs.sh
           SH=bash bash tests/test_hook_logs.sh
+
+      - name: Log-shipper contract (sh)
+        # The shipper is a byte-offset state machine over a file another process is
+        # appending to and rotating underneath it, so its failure modes are silent by
+        # construction: a one-byte error in the chunk-boundary arithmetic leaves the
+        # offset lagging one byte per run forever, and a skip that lands mid-line
+        # ships fragments that the server parser cannot reject. Both shells, for the
+        # same reason as the hook-log suite: `dash` is what Claude Code actually
+        # invokes hooks with, and the trailing-fragment maths goes through awk.
+        run: |
+          set -euo pipefail
+          SH=dash sh tests/test_ship_logs.sh
+          SH=bash bash tests/test_ship_logs.sh
+
+      - name: Log-shipper end to end (real HTTP)
+        # The contract suite above stubs `curl`, so it can only assert what the
+        # shipper WOULD send. This one runs the real pipeline - real dispatcher, real
+        # rotation in hook.sh, real curl, real server (tests/e2e_receiver.mjs) - and
+        # `cmp`s the file on disk against the file the server rebuilt from the wire.
+        # It covers the class of bug a stub cannot: a body curl refuses, an envelope
+        # that stops being valid JSON once a log line contains a quote, a base64
+        # wrap that survives `tr -d` in one shell but not another.
+        run: sh tests/e2e_ship_logs.sh
 
       - name: PowerShell scripts parse
         # The .ps1 dispatchers are the Windows half of every plugin and cannot be
@@ -117,3 +150,4 @@ jobs:
           pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
           pwsh -NoProfile -File tests/test_hook_logs.ps1
+          pwsh -NoProfile -File tests/test_ship_logs.ps1
