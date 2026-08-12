@@ -115,6 +115,176 @@ function Repair-DoubleEncodedUtf8 {
     return $Text
 }
 
+# ── File pre-image (preToolUse only) — lockstep with hook.sh ───────────────
+# Cursor's preToolUse carries the FULL post-edit file and NO baseline, so the
+# payload alone cannot say which part of the file this edit is responsible for.
+# The file on disk still holds the PRE-edit content at this point, so we attach
+# it as `rogueFilePreImageB64` and the API can compare the two.
+#
+# A NON-EXISTENT FILE YIELDS AN EMPTY PRE-IMAGE, AND THAT IS THE CREATE SIGNAL —
+# no Cursor payload field distinguishes a create from an overwrite.
+#
+# MULTI-HUNK EDITS NEED NO SPECIAL HANDLING: Cursor emits one full cycle PER
+# HUNK, so by hunk 2 the file on disk already contains hunk 1 and the pre-image
+# IS the correct per-hunk baseline. Never "fix" this into reading the whole
+# turn's pre-state.
+#
+# Fail-open in every branch. An OVER-CAP file sends NO pre-image rather than a
+# truncated one: a partial pre-image is worse than none, because it
+# misrepresents the file's pre-edit state instead of admitting we don't know it.
+$RogueFilePreImageMaxBytes = 262144
+
+# Every file the agent writes gets a pre-image, subject to the size cap above.
+# The extension list below is the one exclusion: base64 of a PNG or a zip is
+# pure payload with no text in it to compare, and binaries are also the files
+# most likely to be large. An UNKNOWN extension is treated as text — the cost of
+# shipping a binary we failed to recognize is bytes, while the cost of skipping
+# a text file is losing the comparison entirely.
+#
+# COST: for a file write this roughly doubles the request body, since the event
+# payload already carries the post-edit content. The size cap bounds the worst
+# case; nothing is sent for a file above it.
+#
+# Mirrors hook.sh's _is_binary_path. GetExtension returns the LAST extension, so
+# `.tar.gz` matches on `.gz` exactly as the shell glob does.
+function Test-RogueBinaryPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $ext = ''
+    try { $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant() } catch { return $false }
+    if (-not $ext) { return $false }
+    $binary = @(
+        # images
+        '.png','.jpg','.jpeg','.gif','.bmp','.tif','.tiff','.ico','.icns','.webp','.avif','.heic','.psd',
+        # fonts
+        '.ttf','.otf','.woff','.woff2','.eot',
+        # archives and packages
+        '.zip','.tar','.gz','.tgz','.bz2','.xz','.zst','.7z','.rar','.jar','.war','.ear',
+        '.whl','.egg','.nupkg','.dmg','.iso','.pkg','.deb','.rpm',
+        # audio and video
+        '.mp3','.wav','.flac','.ogg','.m4a','.mp4','.mov','.avi','.mkv','.webm',
+        # compiled artifacts
+        '.exe','.dll','.so','.dylib','.o','.a','.lib','.obj','.pdb','.class','.pyc','.pyo','.wasm','.node','.bin',
+        # documents and databases
+        '.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.db','.sqlite','.sqlite3','.mdb'
+    )
+    return $binary -contains $ext
+}
+
+# Run jq with UTF-8 on the wire in both directions. PS 5.1 defaults native
+# command encoding to the OEM code page, which silently mangles non-ASCII text
+# on the round trip. Returns $null when jq is absent or exits non-zero, which is
+# the caller's signal to use its own fallback.
+function Invoke-RogueJq {
+    param([string]$Body, [string[]]$JqArgs)
+    if (-not (Get-Command jq -ErrorAction SilentlyContinue)) { return $null }
+    $prevOut = $OutputEncoding
+    $prevConsole = $null
+    try { $prevConsole = [Console]::OutputEncoding } catch {}
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $OutputEncoding = $utf8
+        try { [Console]::OutputEncoding = $utf8 } catch {}
+        $out = ($Body | & jq @JqArgs 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return $out
+    } catch {
+        return $null
+    } finally {
+        $OutputEncoding = $prevOut
+        if ($prevConsole) { try { [Console]::OutputEncoding = $prevConsole } catch {} }
+    }
+}
+
+# One JSON string field: jq when it is on PATH, the regex only when it is not.
+# jq is preferred because it understands nesting and unescaping, both of which
+# the regex gets only by luck — `file_path` sits under `tool_input` on a tool
+# event, and the regex takes whichever copy appears first. The regex stays safe
+# for this narrow use because a `"` inside a JSON string value is always
+# backslash-escaped, so `"file_path":"…"` cannot match text that merely appears
+# inside the file CONTENT the same payload carries. Lockstep with hook.sh's
+# _json_string_field.
+function Get-RogueJsonStringField {
+    param([string]$Body, [string]$JqFilter, [string]$Key)
+    $viaJq = Invoke-RogueJq $Body @('-r', ($JqFilter + ' // empty'))
+    if ($null -ne $viaJq) { return $viaJq.Trim() }
+    $m = [regex]::Match($Body, '"' + [regex]::Escape($Key) + '"\s*:\s*"([^"]*)"')
+    if (-not $m.Success) { return '' }
+    # JSON-escaped backslashes in a Windows path are the norm, so unescape the
+    # two sequences a path can legitimately contain (jq has already done this on
+    # the other branch). hook.sh instead BAILS on a backslash: it only ever runs
+    # on POSIX, where such a path is pathological. The divergence is deliberate,
+    # not a lockstep slip.
+    return $m.Groups[1].Value.Replace('\\', '\').Replace('\/', '/')
+}
+
+function Add-FilePreImage {
+    # Deliberately NOT ConvertTo-Json on the whole payload: a full parse +
+    # reserialize could alter the vendor's JSON in ways we don't control (and
+    # truncates below its default -Depth 2). Every failure path returns the body
+    # unchanged — we lose the pre-image, never the relay.
+    param([string]$Body)
+    try {
+        # Only the file-writing tools have a file to pre-image. A preToolUse for
+        # Shell, Read, Grep or an MCP call carries no relevant path. `Edit` is
+        # listed defensively — Cursor has only ever been observed sending
+        # `Write`.
+        $tool = Get-RogueJsonStringField $Body '.tool_name' 'tool_name'
+        if ($tool -ne 'Write' -and $tool -ne 'Edit') { return $Body }
+        $path = Get-RogueJsonStringField $Body '.tool_input.file_path // .file_path' 'file_path'
+        if (-not $path) { return $Body }
+        # Rooted paths only: a relative path would resolve against the hook's
+        # cwd, and a wrongly-"missing" file reads as a CREATE — the one wrong
+        # answer that is worse than no answer, since it claims the whole file
+        # is new.
+        if ($path -notmatch '^([A-Za-z]:[\\/]|\\\\)') { return $Body }
+        if (Test-RogueBinaryPath $path) { return $Body }
+
+        $b64 = ''
+        if (Test-Path -LiteralPath $path) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $Body }
+            # FileShare ReadWrite: the editor may still hold the file open.
+            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+            try {
+                $len = $fs.Length
+                if ($len -gt $RogueFilePreImageMaxBytes) {
+                    Dbg "pre-image $len B over cap -> sending none"
+                    return $Body
+                }
+                if ($len -gt 0) {
+                    $buf = New-Object byte[] ([int]$len)
+                    $read = $fs.Read($buf, 0, [int]$len)
+                    if ($read -le 0) { return $Body }
+                    $b64 = [Convert]::ToBase64String($buf, 0, $read)
+                }
+            } finally { $fs.Close() }
+        }
+        Dbg "pre-image attached for $path ($($b64.Length) b64 chars)"
+
+        # Same jq-or-string-concat duality as hook.sh: jq when it is on PATH,
+        # otherwise strip the trailing '}', append, re-close. `$b64` is passed
+        # as its own argument (base64 carries '+', '/' and '='); the jq filter
+        # is single-quoted so PS leaves its own $b64 reference alone.
+        $out = Invoke-RogueJq $Body @('-c', '--arg', 'b64', $b64, '. + {rogueFilePreImageB64:$b64}')
+        # Only trust a complete object back; anything else falls through.
+        if ($out -and $out.StartsWith('{') -and $out.EndsWith('}')) { return $out }
+
+        # Trim trailing whitespace so the single-'}' strip lands on the real
+        # closing brace, then strip exactly ONE '}' (TrimEnd('}') would strip ALL
+        # of them and corrupt a body ending in "}}") — mirrors hook.sh.
+        $p = $Body.TrimEnd()
+        if (-not $p.EndsWith('}')) { return $Body }
+        $p = $p.Substring(0, $p.Length - 1)
+        # An empty object needs no separator ({} -> {"rogueFilePreImageB64":…}).
+        $sep = ','
+        if ($p -eq '{') { $sep = '' }
+        return $p + $sep + '"rogueFilePreImageB64":"' + $b64 + '"}'
+    } catch {
+        Dbg "pre-image failed: $($_.Exception.Message)"
+        return $Body
+    }
+}
+
 # Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
 # (e.g. ConvertFrom-ShellQuoted) without running the dispatcher. Production
 # never sets this, so the hook always runs its main body.
@@ -219,6 +389,11 @@ $payload = $payload.TrimStart([char]0xFEFF)
 # Repair Cursor's UTF-8 -> CP1252 -> UTF-8 double-encoding of assistant text,
 # which happens on clients with a non-UTF-8 Windows locale (out of our control).
 $payload = Repair-DoubleEncodedUtf8 $payload
+
+# File pre-image (see Add-FilePreImage) — the one place this dispatcher adds to
+# the vendor payload. It only ever appends a field; a failure leaves the body
+# byte-identical.
+if ($EventName -eq 'preToolUse') { $payload = Add-FilePreImage $payload }
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
 $headers = @{
