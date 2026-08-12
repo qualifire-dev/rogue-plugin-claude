@@ -99,9 +99,17 @@ Write-Host '== path= is NORMALIZED, so all three implementations name a file ide
 # unequal to `/logs/claude.log`, so the sh and Node shippers read each other's
 # state as a DIFFERENT FILE, reset the offset and re-shipped the whole log.
 # GetFullPath collapses the same things path.resolve does; these pin that.
-if ($IsWindows) {
+#
+# NOT `if ($IsWindows)`: that automatic variable only exists in PowerShell 6+, so
+# under Windows PowerShell 5.1 it is $null and this took the POSIX branch -- which
+# then resolved `/logs//claude.log` against the current DRIVE and reported
+# `D:\logs\claude.log`. Three failures that were purely the harness picking the wrong
+# platform. Version first, then the variable.
+$onWindows = ($PSVersionTable.PSVersion.Major -lt 6) -or $IsWindows
+if ($onWindows) {
     Check 'a doubled separator collapses' 'C:\logs\claude.log' (Get-NormalizedPath 'C:\logs\\claude.log')
     Check 'a dot segment collapses'       'C:\logs\claude.log' (Get-NormalizedPath 'C:\logs\.\claude.log')
+    Check 'a parent segment resolves'     'C:\claude.log'       (Get-NormalizedPath 'C:\logs\..\claude.log')
 } else {
     Check 'a doubled separator collapses' '/logs/claude.log' (Get-NormalizedPath '/logs//claude.log')
     Check 'a dot segment collapses'       '/logs/claude.log' (Get-NormalizedPath '/logs/./claude.log')
