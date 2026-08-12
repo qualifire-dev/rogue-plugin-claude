@@ -11,7 +11,7 @@ ever matters.
 
 ## Files
 
-```
+```text
 plugins/{rogue,codex,cursor,copilot,antigravity}/scripts/ship-logs.sh    byte-identical ×5
 plugins/{rogue,codex,cursor,copilot,antigravity}/scripts/ship-logs.ps1   byte-identical ×5
 plugins/gemini/scripts/ship-logs.mjs                                     Node-only, per repo rule
@@ -40,13 +40,15 @@ between them.
 `scripts/build-release.sh` needs **no change**: every plugin is staged with
 `cp -R plugins/<x>`, so a new file in `scripts/` ships automatically.
 
-**No heartbeat change and no new client-side identifier** — the backend hashes the
-shipper's identity fields into an opaque `log_source_id` and stores only that in
-Axiom. See §9, which also explains why it is *not* a `coding_agent.id`.
+**No heartbeat payload or identity change, and no new client-side identifier.** The
+heartbeat DOES need the one call-site edit described above — without it nothing
+invokes the shipper. What does not change is its `/hooks/status` body: the backend
+resolves the shipper's identity fields to a random `log_source_id` (§9), so no new
+field is needed anywhere in the beacon.
 
 ## Argument contract
 
-```
+```sh
 sh   ship-logs.sh  <plugin-root> <shipper-slug> <shipper-version> <agent-family>
 ps   ship-logs.ps1 <plugin-root> <shipper-slug> <shipper-version> <agent-family>
 node ship-logs.mjs <plugin-root> <shipper-slug> <shipper-version> <agent-family>
@@ -79,7 +81,7 @@ is still derived from `$0`/`$PSCommandPath` so the bundled `env` is not skipped.
 
 ## Flow
 
-```
+```text
  1. Git Bash stand-down: uname = MINGW*/MSYS*/CYGWIN* → exit 0   (ps1 owns Windows)
  2. load env files, later wins: <plugin-root>/env → /etc/rogue/env → $HOME/.rogue-env
  3. ROGUE_SHIP_LOGS=0 → exit 0
@@ -171,7 +173,7 @@ new field.
 minus `.log`, so `ROGUE_LOG_FILE` collapse mode shares one key across agents,
 which is correct — it is one file):
 
-```
+```text
 <key>.state      offset= and head= for that log file (see §10)
 .last-<key>      unix seconds of the last attempt
 .lock-<key>/     directory used as a mutex
@@ -186,7 +188,7 @@ agent for the whole interval.
 `ROGUE_SHIP_MIN_INTERVAL`, **default 900 s**. `.last-<key>` is a one-line Unix
 timestamp:
 
-```
+```text
 $ cat ~/.rogue/ship/.last-claude
 1786512847
 ```
@@ -251,7 +253,7 @@ dataset, whose retention and access controls are not the main database's.
 So the shipper sends the identity fields as-is and the **backend resolves them to an
 opaque id before ingesting**:
 
-```
+```text
 plugin  → POST /hooks/logs   host, actor_email, actor_name, agent_family,
                              log_file, chunk
 backend → resolve-or-create log_source row for
@@ -347,6 +349,25 @@ joins to it whenever the heartbeat lands. The log ingest never touches
 — which, given the four-part fingerprint, a `coding_agent` lookup would have had
 to.
 
+#### One canonical `actor_email`, or the join silently fails
+
+The roster fingerprint uses `` `${actorEmail ?? "anon"}` `` (`hooks.ts:343`). If the
+`log_source` lookup keys on the raw value instead, a machine whose email is absent
+in one path and `""` in the other produces two different identities and the log
+never joins its roster row. Nothing errors; the logs simply attach to nothing.
+
+**So one function normalises the value, used by both paths**: trim whitespace, and
+map empty to the literal `anon` — exactly `?? "anon"` extended to cover `""` and
+`"   "`, which is what a shell `git config user.email` miss actually yields (the
+heartbeat sends an empty string, not JSON null).
+
+**Deliberately not lower-casing.** It would be more correct, and it is a *breaking*
+change: the roster's existing fingerprints were computed on the raw case, so folding
+it re-keys every install and every machine gets a duplicate row. If we want case
+folding it is a migration of `coding_agent.fingerprint`, not a line in this spec —
+and until then `log_source` must match the roster's behaviour rather than improve on
+it, or the two disagree for anyone whose git email has a capital letter.
+
 `host` is `hostname`; `actor_email` / `actor_name` come from `scripts/actor.sh`
 where present (`env` → `git config --global` → `CLAUDE_CODE_USER_EMAIL` →
 `hostname`/`whoami`). Cursor and Gemini have no `actor.sh` and resolve the same
@@ -358,33 +379,56 @@ would create a second roster row instead of matching the existing one.
 
 State is one file per log, `~/.rogue/ship/<key>.state`, two `k=v` lines:
 
-```
-offset=12345      bytes the backend has ACCEPTED for this file
-head=MjAyNi0w…    base64 of the file's FIRST LINE, as of that offset
+```text
+offset=12345          bytes the backend has ACCEPTED for this file
+head=MjAyNi0w…        base64 of the file's FIRST LINE, as of that offset
+size=98304            the file's size when that offset was persisted
+path=/Users/…/claude.log   absolute path the offset belongs to
 ```
 
-```
-off, stored_head = read state         # off = 0 if absent or non-numeric
+**`path=` exists because the key is a basename.** `/a/claude.log` and
+`/b/claude.log` both key to `claude`, so changing `ROGUE_LOG_DIR` (an MDM policy
+edit, a relocated home) would point the shipper at a different file holding the
+previous file's offset. The `head` check turns that into a re-ship rather than
+silent loss, but it is cheaper and clearer to detect it directly: **if `path` does
+not match the file being shipped, treat the state as absent** (offset 0). Recording
+the path rather than hashing it into the filename is deliberate — a digest would
+have to be byte-identical across sh, PowerShell and Node, the same constraint that
+rules out a checksum for `head`. Collapse mode still shares one key *and* one path,
+so it keeps sharing one state file, which is correct.
+
+```text
+off, stored_head, stored_size, stored_path = read state
+if stored_path != abspath(file): off = 0; stored_head = none   # different file
+                                      # off = 0 also if absent or non-numeric
 size = wc -c < file                   # NOT stat — BSD and GNU differ on flags
 head = base64(first line of file)     # bytes up to the first \n, cap 200
 
 rotated = (size < off) or (head is known and head != stored_head)
 
 if rotated:
+    # .1 is a whole generation (up to ROGUE_LOG_MAX_BYTES), so it needs the same
+    # bounded chunk loop as the live file — one request cannot carry 10 MiB.
     if file.1 exists and base64(first line of file.1) == stored_head
-       and size(file.1) > off:
-        send(file.1, off, …, rotated=true)
-        on failure: return            # leave state untouched; next run retries
-    off = 0; persist offset=0 head=<head>   # BEFORE shipping the live file, so a
-                                            # later failure cannot re-ship .1
+       and size(file.1) >= stored_size:
+        while off < size(file.1) and run budget remains:
+            ship_one_chunk(file.1, off, rotated=true)
+            on failure: return        # state untouched; next run resumes .1
+            off += n; persist offset=off head=stored_head size=stored_size
+        if off < size(file.1): return # budget spent — finish .1 next run, do NOT
+                                      # reset, or the rest of it is lost
+    off = 0; persist offset=0 head=<head> size=<size>   # only once .1 is drained
 while off < size and run budget remains:
-    n     = min(size - off, ROGUE_SHIP_MAX_BYTES)
+    ship_one_chunk(file, off, rotated=false)
+    on failure: return
+    off += n; persist offset=off head=<head> size=<size>
+
+ship_one_chunk(f, off, rotated):
+    n     = min(size(f) - off, ROGUE_SHIP_MAX_BYTES)
     chunk = bytes [off, off+n)  →  temp file
-    n     = trim_to_last_newline(chunk)      # whole lines only
-    if base64(first line of file) != head: return   # rotated under us — discard
-    send(chunk, off, n, rotated=false)
-    on non-2xx / transport failure / timeout: return
-    off += n; persist offset=off head=<head>
+    n     = n - trailing_fragment(chunk)         # whole lines only
+    if base64(first line of f) != head_of(f): fail   # rotated under us — discard
+    send(chunk, off, n, rotated)
 ```
 
 **The offset advances only on 2xx.** A non-2xx, transport failure or timeout leaves
@@ -415,7 +459,7 @@ generation) plus a hard iteration guard.
 The obvious version — fingerprint the first 200 bytes — **misfires on a young
 file**:
 
-```
+```text
 run 1:  file is one 60-byte line     → head = b64(60 bytes)
 run 2:  file now has 4 lines         → head = b64(bytes 0..200) spans lines 1–3
         head != stored_head          → "rotated!" → offset reset to 0
@@ -434,7 +478,7 @@ the check falls back to `size < off` alone.
 zero length, but if the new file grows *past* the old offset before the next run,
 `size > off` and no rotation is detected:
 
-```
+```text
 off = 10 MiB, everything shipped
 dispatcher rotates at the cap → old file becomes .1, new file starts at 0
 new file passes 10 MiB before the next run
@@ -458,13 +502,43 @@ P/Invoke) and **Windows creation time** (NTFS file-system tunneling makes a file
 recreated under the same name within 15 s inherit the old creation time, silently
 defeating it).
 
+#### The first-line fingerprint is not collision-free — accepted, with a second condition
+
+A 200-byte first-line prefix is not a digest, so two generations whose first lines
+are byte-identical compare equal, and the shipper could accept the wrong `.1`, send
+it at the old offset and then reset. Stated plainly rather than papered over:
+
+- **What a collision requires.** A rotated log's first line begins with a
+  second-resolution timestamp, then `provider=`, `event=`, `outcome=`. Two
+  *consecutive* generations must match on all of it — same second, same event, same
+  outcome. Between rotations the dispatcher writes a whole `ROGUE_LOG_MAX_BYTES`
+  generation (10 MiB, ~130k lines), so this needs two 10 MiB bursts inside one
+  second from a process that writes one line per hook event. Not reachable at the
+  default; reachable only with an absurdly small cap.
+- **What it costs when it happens.** Wrong bytes attributed to one offset, then a
+  reset — garbled or duplicated lines in a diagnostics dataset. Not silent loss of
+  the live log.
+- **Second condition added:** `.1` is accepted only if `size(file.1) >=` the `size`
+  recorded in state at the last accepted chunk. A different generation almost
+  certainly has a different size, so the two conditions are independent.
+
+**A collision-resistant digest was considered and rejected on portability**, not on
+merit. It would have to be byte-identical across sh, PowerShell and Node, which
+share `~/.rogue/ship/` — and sh has no guaranteed hasher (`sha256sum` on Linux,
+`shasum` on macOS, `openssl` sometimes, none of them universal), while
+`Get-FileHash` returns UPPERCASE hex and `shasum` lowercase. Making that safe needs
+the state file to tag which algorithm produced the value and a fallback path when a
+machine has no hasher — machinery whose failure modes are more likely than the
+collision it prevents. If this ever needs revisiting, tag the kind (`head=sha256:…`
+vs `head=b64:…`) rather than silently changing the encoding.
+
 **Validating `.1`'s head against the stored head** is what stops a double rotation
 from re-shipping a generation we already sent: if `.1` is not the file the offset
 belongs to, skip it and reset.
 
 #### Rotation *during* a read (the TOCTOU)
 
-```
+```text
 t0   size = 5400, head = H
 t1   dispatcher hits the cap → renames to .1, starts a new empty file
 t2   we extract bytes [5000, 5400)  ←  from the NEW file
@@ -492,9 +566,34 @@ trimmed length. Byte length of the trailing fragment, without `jq` or `python3`:
 LC_ALL=C awk 'BEGIN{RS="\n"} END{print length($0)}' "$chunk"
 ```
 
-POSIX awk; `LC_ALL=C` so `length()` counts bytes and not characters. Trivial in
-PowerShell and Node (scan back for `0x0A`). If a chunk contains **no** newline at
-all (a single line over 1 MiB), ship it whole rather than stalling forever.
+**That one-liner alone is wrong** and would have shipped a 1-byte-short chunk on
+every run. With `RS="\n"`, `END{$0}` is the *last record*, not the text after the
+final separator — verified under both `awk` and `dash`'s `awk`:
+
+```text
+printf 'a\nb\n' → prints 1   (must be 0: the chunk already ends on a boundary)
+printf 'a\nb'   → prints 1   (correct)
+```
+
+So a newline-terminated chunk would lose its final byte, the offset would advance
+one short, and the next chunk would re-send a stray `\n` — forever. Test the final
+byte first:
+
+```sh
+if [ "$(tail -c 1 "$chunk" | od -An -tu1 | tr -d ' \n')" = "10" ]; then
+  frag=0                                    # already ends on a line boundary
+else
+  frag=$(LC_ALL=C awk 'BEGIN{RS="\n"} END{print length($0)}' "$chunk")
+fi
+```
+
+Verified against all four cases under `sh` and `dash`: `a\nb\n` → 0, `a\nb` → 1,
+empty → 0, and a chunk with no newline at all → its whole length (which lands in the
+"no newline in the chunk" branch below).
+
+`LC_ALL=C` so `length()` counts bytes and not characters. Trivial in PowerShell and
+Node (scan back for `0x0A`). If a chunk contains **no** newline at all (a single
+line over 1 MiB), ship it whole rather than stalling forever.
 
 #### The chunk never passes through a shell variable
 
@@ -598,9 +697,14 @@ Server-side it is one function, one test file, and it can change without a plugi
 release — which matters because the fleet updates on a 24 h auto-update cycle at
 best.
 
+**`raw` is stored redacted.** The parsed fields and the `raw` line are two
+representations of the same bytes, so redacting one and keeping the other verbatim
+redacts nothing. Redact the line first, then parse the redacted line.
+
 **Tests must cover the real cases**, not a synthetic `$HOME` line: an antigravity
 `tail=none reason=unreadable path=/Users/amos/…/transcript.jsonl` line, and a
-copilot `subagent=… parent=… name=<display name>` line.
+copilot `subagent=… parent=… name=<display name>` line — asserting the home path is
+gone from **both** `fields.path` and `raw`.
 
 ## Wire format
 
@@ -610,7 +714,7 @@ Headers: `x-rogue-api-key`, `Content-Type: application/json`. Nothing else — n
 `x-rogue-event` (not a hook event), no `x-rogue-source`, no `x-rogue-agent`.
 
 ```jsonc
-{ "host":             "…",          // hashed into log_source_id server-side,
+{ "host":             "…",          // resolved to a random log_source_id,
   "actor_email":      "…",          //   NOT forwarded to Axiom — see §9
   "actor_name":       "…",
   "agent_family":     "claude",     // roster vocabulary: codex's family is `openai`
@@ -650,7 +754,11 @@ surface of its family, so a surface on the envelope would be a false precision.
    stable; the field set is not — phase 1 alone added three tokens.
 
 Server side, per line: leading RFC3339 timestamp, `provider=`, `event=`, then
-best-effort `k=v`, always keeping the original line as `raw`. **Never drop a line**
+best-effort `k=v`, always keeping the whole line as `raw`. **`raw` is the redacted
+line, never the original** — storing the untouched line beside redacted fields would
+route every `path=`, `name=` and prompt fragment straight past the policy, making the
+field-level redaction decorative. Redact first, parse second, and persist only
+redacted values in both places. **Never drop a line**
 — `raw=` is a space- and `=`-bearing free-text tail (Codex puts it mid-line), so a
 strict k=v parse loses data. **`provider=` selects the line's `log_source`**; a line
 without one falls back to the envelope's `agent_family`, and a line with an
@@ -749,6 +857,19 @@ Cases:
   chunk is *not* sent and the offset does not move;
 - **every chunk ends with `\n`** — cap set mid-line, assert no partial line is ever
   sent and that concatenating the chunks reproduces the file byte-exactly;
+- **the trailing-fragment calculation is exact**, the case the first `awk` draft got
+  wrong: a chunk of `a\nb\n` is trimmed by **0** bytes (not 1), `a\nb` by 1, an empty
+  chunk by 0, and a chunk with no newline reports its whole length. Assert under
+  **both `dash` and `bash`** — a 1-byte-short trim would leave the offset lagging one
+  byte per run forever, and the symptom is a stray leading `\n` on the next chunk,
+  not an error;
+- **`.1` larger than one request is drained across several chunks in one run**, and a
+  run that spends its budget mid-`.1` **does not reset** — assert the next run
+  resumes `.1` at the stored offset rather than jumping to the live file (skipping the
+  rest of a rotated generation is silent loss);
+- **state keyed to the path**: ship `/a/claude.log`, then point `ROGUE_LOG_DIR` at
+  `/b` with a different `claude.log`, and assert the second run starts at offset 0
+  instead of inheriting `/a`'s offset;
 - a single line longer than `ROGUE_SHIP_MAX_BYTES` is shipped whole rather than
   stalling the file forever;
 - the chunk loop drains a file larger than `ROGUE_SHIP_MAX_BYTES` **in one run**,
@@ -767,8 +888,11 @@ Cases:
   through base64 **byte-exact**; a chunk containing a NUL byte is not truncated
   (the temp-file path, not a shell variable);
 - `host` / `actor_email` / `actor_name` in the envelope match what the heartbeat
-  resolves on the same machine — if they drift, `log_source_id` differs from the one
-  a roster row hashes to and the logs orphan (assert against `actor.sh`'s output);
+  resolves on the same machine — if they drift, `log_source` resolves to a different row
+  than the roster row does and the logs orphan (assert against `actor.sh`'s output);
+- an **absent, empty and whitespace-only** `actor_email` all produce the same
+  envelope value, so `log_source` and the roster fingerprint's `?? "anon"` cannot
+  diverge (the failure is silent: logs attach to nothing);
 - `agent_family` is the value the **caller passed**, never derived from the slug —
   assert the codex copy sends `openai` while its `shipper` stays `codex`, the one
   case a naive slug→family assumption breaks;

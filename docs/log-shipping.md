@@ -23,7 +23,7 @@ Neither blocks the other; either alone is useful.
 The backend already receives every hook event. The delta in `<agent>.log` is
 exactly the set of events that **never reached the API**:
 
-```
+```text
 outcome=unconfigured          no API key on this machine
 http=<code> rc=<rc>           non-2xx, or curl/Invoke-WebRequest transport failure
 outcome=fail-open             timeout, unreachable, malformed body
@@ -57,7 +57,7 @@ is four parts, `` `${hostname}|${actorEmail ?? "anon"}|${family}|${agent}` ``
 because every surface of a family shares one log file, a chunk cannot resolve to a
 single row at all — it is coarser than the roster. See **A log file is coarser than
 a `coding_agent` row** in [plugin-log-shipper.md](plugin-log-shipper.md) for the
-`log_source_id` scheme that replaces the row lookup.
+`log_source` table that replaces the row lookup.
 
 `machine_id` remains the only way to join a plugin row to an `endpoint_agent` row
 on the same host. That join is capability B's contribution; if we want it for
@@ -77,8 +77,8 @@ What changed, so a reader of the old version is not surprised:
 | was | now | why |
 |---|---|---|
 | one agent-agnostic shipper uploads **all six** logs | each plugin ships **only its own** log; `ROGUE_SHIP_ALL=1` for support | the coverage argument rested on an agent's own shipper being unreachable, which the call-site fix removed. Cross-vendor file reads are a bad line in a security review |
-| `machine_id` in every chunk (phase 2b) | **not sent at all** | a derived `log_source_id` identifies the source; `machine_id`'s only job is the endpoint-agent device join, which belongs on the roster row once |
-| `host`/`actor_email` stored alongside the chunk | sent to the API, hashed into `log_source_id`, **never forwarded to Axiom** | the privacy boundary is Rogue→Axiom, not plugin→Rogue |
+| `machine_id` in every chunk (phase 2b) | **not sent at all** | a random `log_source_id` identifies the source; `machine_id`'s only job is the endpoint-agent device join, which belongs on the roster row once |
+| `host`/`actor_email` stored alongside the chunk | sent to the API, mapped to a random `log_source_id`, **never forwarded to Axiom** | the privacy boundary is Rogue→Axiom, not plugin→Rogue |
 | `$HOME` → `~` rewritten in the scripts | **redaction is server-side** | policy belongs where it is readable and testable, and can change without a plugin release |
 | `<slug>.offset`, rotation detected by `size < offset` | `<key>.state` with `offset=` **and** `head=` (first line) | `size < offset` alone silently skips the new file's first `offset` bytes when a rotated log grows past the old offset before the next run |
 | one chunk per run, 3600 s throttle | chunks loop until drained, 900 s throttle | a 10 MiB generation at 1 MiB/run would take ten runs to catch up |
@@ -102,8 +102,11 @@ New file `src-tauri/src/tasks/coding_agent_log_upload_worker.rs`, registered in
 reports `unsupported` instead of breaking). From
 `src-tauri/src/tasks/task_worker.rs`: tasks are backend-dispatched — the agent
 polls, receives a `PendingTask` (`id`, `type`, `task_key`, `payload`), runs a
-`TaskWorker`, and reports `Running → Succeeded | AgentFailed | AgentTimeout |
-Unsupported`. An install is per-machine and the backend addresses one at a time,
+`TaskWorker`, and reports `Running → Uploaded → Succeeded | AgentFailed |
+AgentTimeout | Unsupported`. (`Uploaded` **is** a real variant of `TaskStatus`
+alongside the other five — `src-tauri/src/tasks/task_worker.rs:25-34`, used by
+`adhoc_scan_upload_worker.rs:172`. An earlier version of this list omitted it and
+then used it in the flow below.) An install is per-machine and the backend addresses one at a time,
 which is literally "a task that runs on a single computer in a fleet".
 
 **Which files.** Resolve the log directory the same way the dispatchers do, or the
@@ -115,7 +118,15 @@ agent reads a path nothing writes to:
    dispatchers honor them.
 2. Otherwise `~/.rogue/logs/` (`%USERPROFILE%\.rogue\logs\`).
 
-Then glob `<dir>/{claude,codex,cursor,gemini,copilot,antigravity}.log` plus each
+**`ROGUE_LOG_FILE` is an exact path and takes precedence over the glob** — when it
+is set, collect that one file (plus its `.1`) and do **not** glob the six default
+names, because in that configuration those files do not exist: every agent writes to
+the one path. This is the same precedence the eleven dispatchers implement and
+`tests/test_hook_logs.sh` asserts ("ROGUE_LOG_FILE (exact path) beats
+ROGUE_LOG_DIR"), and its basename is arbitrary — so, exactly as for the plugin
+shipper, that file's lines are attributed per line off `provider=`, never per file.
+
+Otherwise glob `<dir>/{claude,codex,cursor,gemini,copilot,antigravity}.log` plus each
 `.1`. Ship `.1` **before** its live file so the batch stays chronological.
 
 **Payload.** Let the task narrow the request, all optional:
