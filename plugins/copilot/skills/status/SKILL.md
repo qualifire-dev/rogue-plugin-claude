@@ -42,12 +42,21 @@ Remove the line from `~/.rogue-env` to get the reason back.
 [ -r /etc/rogue/env ]     && . /etc/rogue/env
 [ -r "$HOME/.rogue-env" ] && . "$HOME/.rogue-env"
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+PJ="$HOME/.copilot/installed-plugins/rogue-copilot/rogue/plugin.json"
+VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 curl -s -w "\n%{http_code}" -X POST \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"agent_family\":\"copilot\",\"agent\":\"github_copilot\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
+  -d "{\"agent_family\":\"copilot\",\"agent\":\"github_copilot\",\"version\":\"${VER:-unknown}\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
 ```
+
+`version` is read from `plugin.json` the same way `heartbeat.sh` reads it —
+grep/sed, never `python3`, because the `/usr/bin/python3` stub fails silently on
+a fresh macOS. Send it: without it the roster row has no running version, so the
+server has nothing to compare against the latest release and `update_available`
+is meaningless. If the file is missing, `unknown` is sent rather than the field
+being dropped.
 
 Report from the JSON response (HTTP 200 = connected): organization name, running
 vs latest version, and whether `update_available` is `true`. On HTTP 401 the key
@@ -100,8 +109,19 @@ ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
 ```powershell
 $root = Join-Path $env:USERPROFILE '.copilot\installed-plugins\rogue-copilot\rogue'
 $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\ship-logs.ps1'))))
+$env:ROGUE_SHIPPER_SCRIPT = Join-Path $root 'scripts\ship-logs.ps1'
+$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+  '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
+Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+  -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
 ```
+
+**A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
+loading it into the current session would terminate *that* session rather than
+the shipper. The script path travels as an environment variable and the command
+itself is a constant, so a path containing a quote cannot alter it;
+`-EncodedCommand` because `-ArgumentList` quoting is unreliable on Windows
+PowerShell 5.1. Same shape `heartbeat.ps1` uses.
 
 An absolute path, not a plugin-root variable: Copilot sets no root variable for a
 slash command's shell. If that path does not exist, list

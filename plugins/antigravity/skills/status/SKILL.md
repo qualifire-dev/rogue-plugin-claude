@@ -153,8 +153,19 @@ ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
 ```powershell
 $root = Join-Path $env:USERPROFILE '.gemini\config\plugins\rogue'
 $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\ship-logs.ps1'))))
+$env:ROGUE_SHIPPER_SCRIPT = Join-Path $root 'scripts\ship-logs.ps1'
+$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+  '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
+Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+  -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
 ```
+
+**A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
+loading it into the current session would terminate *that* session rather than
+the shipper. The script path travels as an environment variable and the command
+itself is a constant, so a path containing a quote cannot alter it;
+`-EncodedCommand` because `-ArgumentList` quoting is unreliable on Windows
+PowerShell 5.1. Same shape `heartbeat.ps1` uses.
 
 `~/.gemini/config/plugins/rogue` is the directory **both** surfaces read — the IDE
 and the `agy` CLI — which is where the installer copies the plugin. Antigravity's

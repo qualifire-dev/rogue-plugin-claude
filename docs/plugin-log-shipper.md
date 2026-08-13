@@ -198,7 +198,7 @@ minus `.log`, so `ROGUE_LOG_FILE` collapse mode shares one key across agents,
 which is correct — it is one file):
 
 ```text
-<key>.state      offset= and head= for that log file (see §10)
+<key>.state      offset= head= size= path= for that log file (see §10)
 .last-<key>      unix seconds of the last attempt
 .lock-<key>/     directory used as a mutex
 ```
@@ -1001,6 +1001,15 @@ stream `outcome=fail … http=<code>` and `outcome=skip reason=no-actor` would h
 nowhere to land on exactly the run support is asked to make. `log()` therefore always
 mirrors to stderr under `ROGUE_DEBUG`, before it checks whether it has a file.
 
+**`http=000` means the request never got an HTTP response** — DNS failure, a refused
+connection, a TLS error, a proxy swallowing it, or the client's own timeout. It is
+`curl`'s own `%{http_code}` value when no status line was received, and the PowerShell
+and Node implementations format their transport failures the same way (three digits,
+`$httpCode.ToString('000')`) so one line format covers all three and an operator does
+not have to learn a second vocabulary per platform. Distinguishing it from `http=404`
+matters for support: `404` is a route that answered, `000` is a network path that did
+not, and the fixes have nothing in common.
+
 `/rogue:status` gains a final step offering exactly that, in all six status commands
 (`plugins/{rogue,gemini,antigravity,copilot}/skills/status/SKILL.md`,
 `plugins/{codex,cursor}/commands/status.md`), with the bash and PowerShell forms each
@@ -1014,6 +1023,27 @@ collection does not want.
 **The client is complete and shipping is off by default.** `ROGUE_SHIP_LOGS` must be
 a numeric non-zero for a run to make any request — the reverse of every other knob
 here, where unset means "use the default behaviour".
+
+**OFF WINS: a numeric zero in any env file is a kill switch that process env cannot
+defeat.** `ROGUE_SHIP_LOGS=0` in `/etc/rogue/env`, a bundled `env`, or `~/.rogue-env`
+disables uploading for that machine even when the caller exports
+`ROGUE_SHIP_LOGS=1`, and it keeps disabling it after the default above flips. This is
+the one place the documented "process env wins over files" precedence is deliberately
+inverted, because the two directions are not symmetric: an admin who turns log
+upload off is exercising a privacy control, and a control that any inline variable can
+override is not a control. Turning it *on* still follows normal precedence — process
+env, or a `1` in a later file, both work.
+
+Mechanically, each implementation records the fact **while reading the files**, before
+the process-env pass overwrites the value: `SHIP_DISABLED_BY_FILE` in
+`ship-logs.sh` (set inside `load_env`), `$script:shipDisabledByFile` in
+`ship-logs.ps1` (inside `Import-ShipEnv`'s file loop), and a non-enumerable
+`SHIP_DISABLED_BY_FILE` symbol on the merged map in `ship-logs.mjs` — non-enumerable
+so it can never be read back as a knob. Only a numeric zero counts
+(`value_is_zero` / `Test-ValueIsZero` / `valueIsZero`): `0` and `00` are kill
+switches, `no`, `off` and `false` are not, matching the numeric-only parsing used
+everywhere else. The check runs before the opt-in test in `main` /
+`Invoke-Main` / `run`, so a disabled machine does no work at all.
 
 The reason is the receiving route: `/api/v1/hooks/logs` **does not exist yet**. The
 AIDR hooks router registers `/ping`, `/status`, `/config`, `/claude`, `/cursor`,

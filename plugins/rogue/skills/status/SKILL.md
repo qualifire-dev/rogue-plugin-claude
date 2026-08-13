@@ -63,16 +63,20 @@ case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')"
   *desktop*) AGENT="Claude Code - Desktop" ;;
   *)         AGENT="Claude Code - CLI" ;;
 esac
-curl -s -w "\n%{http_code}" \
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+curl -s -w "\n%{http_code}" -X POST \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
-  -H "x-rogue-agent-family: claude" \
-  -H "x-rogue-agent: $AGENT" \
-  -H "x-rogue-agent-version: ${VER:-unknown}" \
-  -H "x-rogue-host: $(hostname)" \
-  -H "x-rogue-actor-email: ${ROGUE_ACTOR_EMAIL:-}" \
-  -H "x-rogue-actor-name: ${ROGUE_ACTOR_NAME:-}"
+  -H "Content-Type: application/json" \
+  -d "{\"agent_family\":\"claude\",\"agent\":\"$(esc "$AGENT")\",\"version\":\"${VER:-unknown}\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
 ```
+
+**A POST with a JSON body, not a GET with `x-rogue-agent-*` headers.** The route is
+`POST /hooks/status` and it validates `agent_family` from the body; the header form
+this command used to send was the pre-`/hooks/status` contract, so it reported a
+failure on a perfectly valid key. `heartbeat.sh` has always sent the body form — this
+is now the same shape, values escaped the same way, so a `/rogue:status` result and
+the background heartbeat can no longer disagree.
 
 Report from the JSON response (HTTP 200 = connected):
 
@@ -86,7 +90,10 @@ On failure suggest:
 - HTTP 401 → key invalid. Compare the resolved key tail (Step 1) against the
   [API keys dashboard](https://app.rogue.security/settings/api-keys); the
   precedence chain may be picking up a stale source — check Step 1's list.
-- HTTP 400 → unexpected (the `x-rogue-agent-family` header above should prevent it).
+- HTTP 400 → the JSON body was malformed or `agent_family` was missing; print the
+  body the command sent and compare it with `scripts/heartbeat.sh`.
+- HTTP 404 → the URL is wrong (a stale `ROGUE_BASE_URL`, or a path other than
+  `/api/v1/hooks/status`), not a credential problem.
 - No response → confirm network reachability to `api.rogue.security` (or `${ROGUE_BASE_URL}`).
 
 ## Step 3: Fetch configuration
@@ -151,8 +158,20 @@ ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "${CLAUDE_PLUGIN_RO
 - Windows (PowerShell):
 ```powershell
 $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
-& ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path (Get-Item Env:CLAUDE_PLUGIN_ROOT).Value 'scripts\ship-logs.ps1'))))
+$env:ROGUE_SHIPPER_SCRIPT = Join-Path (Get-Item Env:CLAUDE_PLUGIN_ROOT).Value 'scripts\ship-logs.ps1'
+$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+  '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
+Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+  -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
 ```
+
+**A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
+loading it into the current session would terminate *that* session — the one
+running this command — rather than the shipper. The script path travels as an
+environment variable and the command itself is a constant, so a plugin path
+containing a quote cannot alter it; `-EncodedCommand` because `-ArgumentList`
+quoting is unreliable on Windows PowerShell 5.1. This is the same shape
+`heartbeat.ps1` uses to start the shipper in the background.
 
 Run with **no arguments**, which is the support form: it uploads *every* agent's
 log found in the log directory, not just this one, which is usually what a
