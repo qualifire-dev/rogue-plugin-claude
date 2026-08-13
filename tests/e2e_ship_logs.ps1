@@ -45,10 +45,24 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 # PROCESS ENV WINS over the env file by design - so without this the sandbox would
 # authenticate to the local receiver with real credentials. The sh suite learned this
 # the hard way; same reasoning, same fix.
-foreach ($knob in @('ROGUE_API_KEY', 'ROGUE_BASE_URL', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME',
-                    'ROGUE_LOG_FILE', 'ROGUE_LOG_DIR', 'ROGUE_LOG_MAX_BYTES', 'ROGUE_SHIP_LOGS',
-                    'ROGUE_SHIP_MIN_INTERVAL', 'ROGUE_SHIP_MAX_BYTES', 'ROGUE_SHIP_MAX_RUN_BYTES',
-                    'ROGUE_SHIP_MAX_LINE_BYTES', 'ROGUE_SHIP_ALL', 'ROGUE_DEBUG')) {
+$shipperKnobs = @('ROGUE_API_KEY', 'ROGUE_BASE_URL', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME',
+                  'ROGUE_LOG_FILE', 'ROGUE_LOG_DIR', 'ROGUE_LOG_MAX_BYTES', 'ROGUE_SHIP_LOGS',
+                  'ROGUE_SHIP_MIN_INTERVAL', 'ROGUE_SHIP_MAX_BYTES', 'ROGUE_SHIP_MAX_RUN_BYTES',
+                  'ROGUE_SHIP_MAX_LINE_BYTES', 'ROGUE_SHIP_ALL', 'ROGUE_DEBUG')
+# Everything this file writes into the CALLER's session, snapshotted BEFORE the scrub
+# and put back in `finally`. Under CI the process exits and nothing leaks, but run
+# interactively this used to leave ROGUE_BASE_URL pointing at a dead localhost port,
+# so the developer's own dispatchers and heartbeats then talked to nothing for the
+# rest of that session. tests/e2e_ship_logs.sh has no such problem because it passes
+# every value through `env` in a subshell; PowerShell has no equivalent form, so the
+# save/restore is explicit.
+$touchedVars = $shipperKnobs + @('CLAUDE_PLUGIN_ROOT', 'CLAUDE_CODE_ENTRYPOINT',
+                                 'E2E_API_KEY', 'ROGUE_E2E_ROOT', 'ROGUE_E2E_SCRIPT')
+$originalEnv = @{}
+foreach ($name in $touchedVars) {
+    $originalEnv[$name] = [System.Environment]::GetEnvironmentVariable($name)
+}
+foreach ($knob in $shipperKnobs) {
     Remove-Item "Env:$knob" -ErrorAction SilentlyContinue
 }
 
@@ -305,6 +319,13 @@ Check 'no API key -> no upload' ([string]$unconfiguredBefore) ([string](Envelope
 
 } finally {
     $env:USERPROFILE = $realUserProfile
+    # Put the caller's session back exactly as it was: absent stays absent, set goes
+    # back to its old value. SetEnvironmentVariable rather than Set-Item, because
+    # Set-Item with an empty string is an error while SetEnvironmentVariable treats it
+    # as "remove", which is what an originally-absent variable needs.
+    foreach ($name in $touchedVars) {
+        [System.Environment]::SetEnvironmentVariable($name, $originalEnv[$name])
+    }
     if ($receiver -and -not $receiver.HasExited) {
         try { $receiver.Kill() } catch {}
     }

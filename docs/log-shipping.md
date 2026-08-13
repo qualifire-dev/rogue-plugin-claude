@@ -20,8 +20,10 @@ Neither blocks the other; either alone is useful.
 
 ## What the log is actually worth
 
-The backend already receives every hook event. The delta in `<agent>.log` is
-exactly the set of events that **never reached the API**:
+The backend already receives every hook event. What `<agent>.log` adds is
+**transport failures and local diagnostics** — the events that never reached the
+API, plus outcomes the API never sees even when the request succeeded (a local
+alert, a failed enrichment, an unresolved subagent):
 
 ```text
 outcome=unconfigured          no API key on this machine

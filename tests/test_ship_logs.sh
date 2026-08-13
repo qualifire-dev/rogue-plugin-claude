@@ -606,10 +606,7 @@ ship "SHIP_ROOT=$CASE/root" "ROGUE_ACTOR_EMAIL=" "ROGUE_ACTOR_NAME="
 check "no identity means no upload" "0" "$(bodies)"
 if grep -q 'outcome=skip reason=no-actor' "$LOG"; then pass "the skip is recorded"
 else fail "no outcome=skip reason=no-actor line was written"; fi
-for forbidden in "$(hostname 2>/dev/null)" "$(whoami 2>/dev/null)"; do
-  [ -n "$forbidden" ] || continue
-  if [ "$(bodies)" != "0" ]; then fail "shipped despite having no actor"; fi
-done
+check "no offset was persisted either" "" "$(state offset)"
 
 # Absent, empty and whitespace-only must all produce ONE canonical value, matching
 # the roster fingerprint's `actorEmail ?? "anon"` extended to cover "" and "   ".
@@ -627,6 +624,24 @@ for variant in 'unset' 'empty' 'blank'; do
   esac
   ship "SHIP_ROOT=$CASE/root" "ROGUE_ACTOR_EMAIL=" "ROGUE_ACTOR_NAME="
   check "$variant actor_email canonicalises to anon" "anon" "$(strf 0 actor_email)"
+  # The identity-leak assertion belongs HERE, not in the noactor case above: this is
+  # the only place a body is actually sent while no identity was resolved, so it is
+  # the only place a private cascade could put `hostname` or `whoami` on the wire.
+  # (The noactor case asserted the same thing against zero bodies, which passed
+  # whatever the shipper did - `bodies` was already asserted to be 0 one line up.)
+  #
+  # Scoped to the ACTOR fields, not the whole body: `host` carries the hostname by
+  # design (asserted above), so scanning the envelope would fail on the field that is
+  # supposed to be there and say nothing about identity.
+  for field in actor_email actor_name; do
+    for forbidden in "$(hostname 2>/dev/null)" "$(whoami 2>/dev/null)"; do
+      [ -n "$forbidden" ] || continue
+      case "$(strf 0 "$field")" in
+        *"$forbidden"*) fail "$variant $field names this machine ($forbidden) instead of anon" ;;
+        *) pass "$variant $field does not name this machine ($forbidden)" ;;
+      esac
+    done
+  done
 done
 
 # THE SAME VARIANTS THROUGH THE NODE SHIPPER. Running them only through the sh copy

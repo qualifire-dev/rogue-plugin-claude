@@ -129,9 +129,23 @@ Rows in Axiom carry a random `log_source_id`, resolved (create-or-get) from
 - **`actor_email` may be the literal `"anon"`.** All three clients canonicalize absent,
   empty and whitespace-only to that exact value, matching the roster's own
   `actorEmail ?? "anon"` fallback, so the two key alike. Do not treat it as an address.
+- **Trim before keying, then apply the `anon` rule.** The clients trim, but the key must
+  not depend on that: `" amos@rogue.security "` keyed verbatim resolves to a *different*
+  `log_source_id` than the heartbeat's identity for the same person, and the logs then
+  attach to a source row nothing else uses. Trim first, map an empty result to `anon`,
+  and only then key.
 - Case is **not** folded, in the client or in the key: the roster's existing
   fingerprints were computed on the raw case, and folding here would re-key every
   install.
+- **Resolve `log_source_id` per LINE, not per request.** The envelope's `agent_family`
+  is the *shipping* plugin, and the support form deliberately uploads every agent's log
+  from one machine in one request — so a single request routinely carries `provider=`
+  values from several families. Map each line's `provider=` slug to its family
+  (`codex` → `openai`, `gemini` → `gemini`, `copilot` → `copilot`, …) and resolve the
+  source for that record; fall back to the envelope's `agent_family` only for a line
+  with no parseable `provider=`. One source per request misfiles exactly the uploads
+  support depends on, and a `ROGUE_LOG_FILE` collapse-mode install (all agents in one
+  file) the same way.
 
 `machine_id` is deliberately **not** in the envelope. It was in an earlier draft and
 was removed: its only job is joining a plugin row to an `endpoint_agent` row on the
@@ -170,6 +184,11 @@ Concretely:
 The clients upload **verbatim** — deliberately, so policy lives where it is readable,
 testable and changeable without a plugin release.
 
+- **Order is fixed: redact the raw line FIRST, then parse the redacted line.** Parsing
+  first and redacting the pieces afterwards leaves two ways to leak — free text that no
+  parsed field claims stays in `raw`, and any field the redactor rewrites no longer
+  matches the `raw` it came from. Redacting first makes `raw` and every parsed field
+  consistent by construction.
 - Reuse `endpoint-logs-redact.ts`'s `redactEvent` / `redactString`, which already walk
   every string value and rewrite home paths.
 - **Persist the redacted line as `raw`, never the original.** There is no
@@ -184,8 +203,9 @@ testable and changeable without a plugin release.
 ## Storage and volume
 
 - **Its own Axiom dataset** (settled). Hook logs are client-side diagnostics, not the
-  security signal — the delta over what `/hooks/<agent>` already receives is exactly
-  the events that *never reached the API*.
+  security signal — what they add over `/hooks/<agent>` is transport failures plus
+  outcomes the API never sees (a local alert, a failed enrichment, an unresolved
+  subagent), not a second copy of the event stream.
 - Volume is tiny: a busy machine is single-digit KB a day. Do not build streaming.
 - **Duplicates are acceptable** (settled). Neither client dedups; a crash between
   "chunk accepted" and "state written" re-sends that range by design, because

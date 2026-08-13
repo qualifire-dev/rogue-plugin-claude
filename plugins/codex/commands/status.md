@@ -147,6 +147,10 @@ else {
     '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
   Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
     -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+  # One run only. The bash form scopes these to a single command; setting them as
+  # session variables would leave later runs from this session with the 15-minute
+  # throttle waived and debug output on.
+  Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT -ErrorAction SilentlyContinue
 }
 ```
 

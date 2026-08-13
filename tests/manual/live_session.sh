@@ -70,7 +70,12 @@ API_KEY=livetest-key
 ACTOR_EMAIL=livetest@rogue.security
 ACTOR_NAME='Live Test'
 
-for tool in claude node curl; do
+# `shasum` is here because the byte-integrity check below pipes into it: absent, both
+# sides of that comparison are the empty string and the one assertion proving the
+# uploaded bytes equal the bytes on disk would report `ok` while verifying nothing.
+# `curl` is NOT here - it was, but nothing in this script calls it (the receiver is
+# node, the requests come from the real dispatchers).
+for tool in claude node shasum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "need $tool on PATH"; exit 1; }
 done
 
@@ -81,6 +86,11 @@ mkdir -p "$RECV" "$PROJECT" "$MARKET" "$LOGS"
 RECEIVER_PID=""
 INSTALLED=0
 cleanup() {
+  # Idempotent: a Ctrl-C runs this from the signal handler, and the EXIT trap then
+  # runs it a second time. Without the guard the second pass re-reports every step
+  # and tries to uninstall a plugin that is already gone.
+  [ "${CLEANED:-0}" = 1 ] && return 0
+  CLEANED=1
   echo
   echo "── cleanup ─────────────────────────────────────────────────────────────"
   if [ "$INSTALLED" = 1 ]; then
@@ -111,7 +121,13 @@ cleanup() {
   echo "  removed the sandbox's shipper state"
   if [ "$KEEP" = 1 ]; then echo "  sandbox kept at $SB"; else rm -rf "$SB"; echo "  sandbox removed"; fi
 }
-trap 'cleanup' EXIT INT TERM
+# INT/TERM must EXIT, not just clean up: a bare `trap 'cleanup' INT` returns to the
+# next statement, so a Ctrl-C during session 1 went on to run session 2 against an
+# uninstalled plugin and a killed receiver. Exiting re-enters cleanup through the EXIT
+# trap, which the CLEANED guard above makes harmless.
+trap 'cleanup' EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 echo "── the receiver ────────────────────────────────────────────────────────"
 # E2E_ACCEPT_ANY_KEY=1 because the request comes from a REAL session, and the sh
@@ -248,9 +264,17 @@ check "the log was uploaded"              "yes" "$(yn "$(count logs)")"
 # prefix means a corrupt, truncated or reordered chunk.
 if [ -f "$RECV/reassembled-claude.log" ] && [ -s "$LOGS/claude.log" ]; then
   n="$(wc -c < "$RECV/reassembled-claude.log" | tr -d ' ')"
-  check "the uploaded bytes match the file on disk exactly" \
-    "$(head -c "$n" "$LOGS/claude.log" | shasum | cut -d' ' -f1)" \
-    "$(shasum < "$RECV/reassembled-claude.log" | cut -d' ' -f1)"
+  disk_hash="$(head -c "$n" "$LOGS/claude.log" | shasum | cut -d' ' -f1)"
+  wire_hash="$(shasum < "$RECV/reassembled-claude.log" | cut -d' ' -f1)"
+  # Two empty strings compare equal, so an unusable hasher would turn the one
+  # assertion that proves the bytes match into a silent pass. The preflight above
+  # requires shasum; this covers it failing at runtime.
+  if [ -z "$disk_hash" ] || [ -z "$wire_hash" ]; then
+    echo "  FAIL: shasum produced no digest - cannot verify the uploaded bytes"
+    fails=$((fails + 1))
+  else
+    check "the uploaded bytes match the file on disk exactly" "$disk_hash" "$wire_hash"
+  fi
 else
   echo "  FAIL: nothing to compare"; fails=$((fails + 1))
 fi
