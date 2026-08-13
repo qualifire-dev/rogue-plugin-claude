@@ -117,8 +117,10 @@ flips and the paragraph above applies unchanged.
 # PLUGIN_ROOT is exported to HOOK processes, not to this shell, so the script is
 # located on disk the same way Step 1 locates the bundled env file.
 SHIP="${PLUGIN_ROOT:+$PLUGIN_ROOT/scripts/ship-logs.sh}"
+[ -r "$SHIP" ] || SHIP=$(find "$HOME/.codex/plugins" -type f -name ship-logs.sh -path '*rogue*' 2>/dev/null | head -1)
 [ -r "$SHIP" ] || SHIP=$(find "$HOME/.codex" -type f -name ship-logs.sh -path '*rogue*' 2>/dev/null | head -1)
 if [ -r "$SHIP" ]; then
+  echo "using $SHIP"
   ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$SHIP"
 else
   echo "ship-logs.sh not found - list ~/.codex/plugins/ and report what is there"
@@ -132,12 +134,13 @@ if ($env:PLUGIN_ROOT) {
   if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
 }
 if (-not $ship) {
-  $ship = Get-ChildItem (Join-Path $env:USERPROFILE '.codex') -Recurse -Filter ship-logs.ps1 -File -ErrorAction SilentlyContinue |
+  $ship = Get-ChildItem (Join-Path $env:USERPROFILE '.codex\plugins') -Recurse -Filter ship-logs.ps1 -File -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -like '*rogue*' } | Sort-Object LastWriteTime -Descending |
     Select-Object -First 1 -ExpandProperty FullName
 }
 if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.codex\plugins and report what is there' }
 else {
+  "using $ship"
   $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
   $env:ROGUE_SHIPPER_SCRIPT = $ship
   $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
@@ -150,11 +153,22 @@ else {
 **Resolve the script, never assume `PLUGIN_ROOT`.** That variable is exported to
 hook processes only — in the shell a slash command runs in it is empty, and
 `sh "/scripts/ship-logs.sh"` fails silently at exactly the moment support is
-trying to collect logs. The fallback is the same `find` under `~/.codex` that
-Step 1 uses for the bundled env file. **Which copy runs does not matter**: the
-support form takes no arguments, so no plugin root is passed and no per-agent
-value is read, and `ship-logs.sh` is byte-identical across all five sh plugins
-(enforced by `scripts/sync-shared-scripts.sh --check`).
+trying to collect logs. The fallback is the same `find` Step 1 uses for the
+bundled env file, narrowed to `~/.codex/plugins` first and widening to `~/.codex`
+only if that finds nothing.
+
+**Which copy runs matters, so report the path it prints.** On a no-argument run
+the shipper self-locates its plugin root from its own script path and reads
+`<plugin-root>/env` as the *first* file in the credential chain. A leftover tree
+from a previous install therefore supplies credentials: a later `~/.rogue-env`
+overrides the API key, but `setup.sh` writes no `ROGUE_BASE_URL`, so a stale base
+URL in that tree's bundled `env` would win and the upload would go to the wrong
+host. Codex has no equivalent of Claude Code's install registry to disambiguate
+with, so the command echoes the path it chose — check it names the plugin
+directory `/rogue:status` reported in Step 1, and if several copies exist, remove
+the stale ones or pass the right root explicitly. The *script* is interchangeable
+(`ship-logs.sh` is byte-identical across all five sh plugins, enforced by
+`scripts/sync-shared-scripts.sh --check`); the *tree it sits in* is not.
 
 `PLUGIN_ROOT`, never `CLAUDE_PLUGIN_ROOT` — the Codex plugin uses Codex-native
 variables only, even though Codex exposes the Claude names as compat shims.

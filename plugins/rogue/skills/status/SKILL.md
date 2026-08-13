@@ -161,8 +161,16 @@ if [ ! -r "$SHIP" ]; then
            | sed 's/.*"\(\/[^"]*\)"$/\1/' | grep '/rogue/' | tail -1)
   SHIP="${ROOT:+$ROOT/scripts/ship-logs.sh}"
 fi
-[ -r "$SHIP" ] || SHIP=$(ls -t "$HOME"/.claude/plugins/cache/*/rogue*/*/scripts/ship-logs.sh 2>/dev/null | head -1)
+if [ ! -r "$SHIP" ]; then
+  # Last resort: newest under the plugin cache, skipping trees Claude Code has
+  # marked orphaned (an uninstalled marketplace leaves its extracted copy behind).
+  SHIP=$(ls -td "$HOME"/.claude/plugins/cache/*/rogue*/*/ 2>/dev/null | while IFS= read -r d; do
+    [ -e "$d/.orphaned_at" ] && continue
+    [ -r "$d/scripts/ship-logs.sh" ] && { printf '%s\n' "$d/scripts/ship-logs.sh"; break; }
+  done)
+fi
 if [ -r "$SHIP" ]; then
+  echo "using $SHIP"
   ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$SHIP"
 else
   echo "ship-logs.sh not found - list ~/.claude/plugins/cache/*/rogue*/ and report what is there"
@@ -176,12 +184,37 @@ if ($env:CLAUDE_PLUGIN_ROOT) {
   if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
 }
 if (-not $ship) {
+  # The same authoritative layer the bash form uses: the installPath Claude Code
+  # recorded for the plugin it actually installed. Test-Path first, -ErrorAction
+  # Stop inside, and a guard on every field - a missing file or a null property
+  # is a NON-terminating error, which try/catch does not suppress, so without
+  # these a red error prints in the operator's console before the fallback runs.
+  $registry = Join-Path $env:USERPROFILE '.claude\plugins\installed_plugins.json'
+  if (Test-Path -LiteralPath $registry) {
+    try {
+      $registryData = Get-Content -Raw -LiteralPath $registry -ErrorAction Stop |
+        ConvertFrom-Json -ErrorAction Stop
+      if ($registryData.plugins) {
+        $registryData.plugins.PSObject.Properties |
+          Where-Object { $_.Name -like 'rogue@*' } | ForEach-Object { $_.Value } | ForEach-Object {
+            if ($_.installPath) {
+              $candidate = Join-Path $_.installPath 'scripts\ship-logs.ps1'
+              if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
+            }
+          }
+      }
+    } catch { }
+  }
+}
+if (-not $ship) {
   $ship = Get-ChildItem (Join-Path $env:USERPROFILE '.claude\plugins') -Recurse -Filter ship-logs.ps1 -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -like '*rogue*' } | Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1 -ExpandProperty FullName
+    Where-Object { $_.FullName -like '*rogue*' -and
+                   -not (Test-Path -LiteralPath (Join-Path $_.Directory.Parent.FullName '.orphaned_at')) } |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 }
 if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.claude\plugins and report what is there' }
 else {
+  "using $ship"
   $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
   $env:ROGUE_SHIPPER_SCRIPT = $ship
   $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
@@ -194,15 +227,23 @@ else {
 **Resolve the script, never assume `CLAUDE_PLUGIN_ROOT`.** That variable is
 exported to hook processes only — in the shell this command runs in it is empty,
 and `sh "/scripts/ship-logs.sh"` fails silently at exactly the moment support is
-trying to collect logs. Three layers, in order: the variable if something did set
-it, then the `installPath` recorded in `installed_plugins.json` (authoritative —
-it names the version actually installed, and ignores stale cache directories left
-by an uninstalled marketplace), then the newest copy under
-`~/.claude/plugins/cache/`. **Which copy runs does not matter much**: the support
-form takes no arguments, so no plugin root is passed and no per-agent value is
-read, and `ship-logs.sh` is byte-identical across all five sh plugins (enforced by
-`scripts/sync-shared-scripts.sh --check`). The last layer therefore exists to
-survive a change in Claude Code's own bookkeeping file, not to pick a "right" copy.
+trying to collect logs. Both forms use the same three layers, in order: the
+variable if something did set it, then the `installPath` recorded in
+`installed_plugins.json` (authoritative — it names the version actually
+installed), then the newest **non-orphaned** copy under
+`~/.claude/plugins/cache/`.
+
+**Which copy runs matters, so report the path it prints.** On a no-argument run
+the shipper self-locates its plugin root from its own script path and reads
+`<plugin-root>/env` as the *first* file in the credential chain, so a stale tree
+supplies credentials — and while a later `~/.rogue-env` overrides the API key,
+`setup.sh` writes no `ROGUE_BASE_URL`, so a stale base URL in an orphaned tree's
+bundled `env` would win and the upload would go to the wrong host. Hence all
+three layers prefer the installed tree and skip anything carrying Claude Code's
+`.orphaned_at` marker, and the command echoes the path it chose. This is also why
+"any copy will do" is wrong even though `ship-logs.sh` is byte-identical across
+the five sh plugins (`scripts/sync-shared-scripts.sh --check` enforces that): the
+*script* is interchangeable, the *tree it sits in* is not.
 
 **A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
 loading it into the current session would terminate *that* session — the one

@@ -124,11 +124,20 @@ jobs:
               result = subprocess.run(['pwsh', '-NoProfile', '-File',
                                        '/tmp/parse_ps_blocks.ps1'],
                                       capture_output=True, text=True)
-              for report in result.stdout.splitlines():
+              reports = [r for r in result.stdout.splitlines() if 'ps_block_' in r]
+              for report in reports:
                   index = int(re.search(r'ps_block_(\d+)', report).group(1))
                   path, line, _ = ps_blocks[index]
                   print(f"::error file={path},line={line}::PowerShell parse error: "
                         f"{report.split(' :: ', 1)[-1]}")
+                  bad = 1
+              # A non-zero exit with no structured report means pwsh itself failed
+              # (missing binary, a runtime error writing only to stderr). Silence is
+              # not a pass: without this the whole PowerShell half would go green
+              # while checking nothing.
+              if result.returncode and not reports:
+                  print(f"::error::pwsh exited {result.returncode} without reporting "
+                        f"any block: {result.stderr.strip() or '(no stderr)'}")
                   bad = 1
           print(f"checked {len(files)} documents, {len(ps_blocks)} PowerShell blocks")
           sys.exit(bad)
