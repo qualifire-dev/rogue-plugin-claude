@@ -87,6 +87,7 @@ $script:maxChunkBytes = 1048576
 $script:maxRunBytes = 10485760
 $script:maxLineBytes = 4194304
 $script:creds = @{}
+$script:shipDisabledByFile = $false   # an env file said ROGUE_SHIP_LOGS=0 - see Import-ShipEnv
 $script:targetBaseName = ''
 $script:targetFamily = ''
 $script:stateKey = ''
@@ -341,6 +342,16 @@ function Import-ShipEnv {
                 $resolved[$Matches[1]] = ConvertFrom-ShellQuoted ($Matches[2].Trim())
             }
         }
+        # OFF WINS. Every other knob here follows "process env beats the files", but an
+        # explicit ROGUE_SHIP_LOGS=0 in a CONFIG FILE is a kill switch, and a kill
+        # switch a process variable can defeat is not one: the documented support
+        # one-liner sets ROGUE_SHIP_LOGS=1 inline, so under plain precedence it would
+        # silently re-enable uploading on a machine whose MDM profile or whose user had
+        # turned it off. Recorded per file, because the process-env pass below is about
+        # to overwrite the value.
+        if (Test-ValueIsZero ([string]$resolved['ROGUE_SHIP_LOGS'])) {
+            $script:shipDisabledByFile = $true
+        }
     }
     foreach ($varName in $SHIP_ENV_VARS) {
         $processValue = [Environment]::GetEnvironmentVariable($varName)
@@ -383,6 +394,14 @@ function Test-FlagEnabled {
     param([string]$Value)
     if ($Value -notmatch '^[0-9]+$') { return $false }
     return ([int64]$Value -ne 0)
+}
+
+# An EXPLICIT numeric zero, including a zero-padded one. Absent and non-numeric are
+# both "said nothing", which is what separates a kill switch from a default.
+function Test-ValueIsZero {
+    param([string]$Value)
+    if ($Value -notmatch '^[0-9]+$') { return $false }
+    return ([int64]$Value -eq 0)
 }
 
 function Resolve-Knobs {
@@ -428,10 +447,24 @@ function Resolve-Knobs {
 # There is no PowerShell actor.sh to fall back to (it is a POSIX shell script), so
 # on this platform an absent inherited value is simply a skip. That is the correct
 # failure: a wrong identity uploads, bills and stores logs that join to nothing.
+# `anon` is the SAME canonical form ship-logs.sh and ship-logs.mjs use, and the
+# divergence here was real: this returned $false for an absent, empty or
+# whitespace-only email, so a WINDOWS machine whose `git config user.email` is unset
+# shipped nothing while the identical POSIX machine shipped under `anon`. The value
+# matters because it is the roster fingerprint's own fallback (`actorEmail ?? "anon"`),
+# so it joins to the row the heartbeat already created.
+#
+# The skip below now covers only the case it was written for: no identity was PASSED at
+# all, i.e. neither key is present in the resolved map. An empty string is a
+# resolved-and-missing email, which `anon` names exactly. (A process-env value of ''
+# never reaches the map - Import-ShipEnv only copies truthy ones - so, as in the Node
+# copy, "absent" and "exported empty" are deliberately the same case.)
 function Resolve-ShipActor {
+    if (-not $script:creds.ContainsKey('ROGUE_ACTOR_EMAIL') -and
+        -not $script:creds.ContainsKey('ROGUE_ACTOR_NAME')) { return $false }
     $script:actorEmail = ([string]$script:creds['ROGUE_ACTOR_EMAIL']).Trim()
     $script:actorName = ([string]$script:creds['ROGUE_ACTOR_NAME']).Trim()
-    if (-not $script:actorEmail) { return $false }
+    if (-not $script:actorEmail) { $script:actorEmail = 'anon' }
     $script:hostName = $env:COMPUTERNAME
     if (-not $script:hostName) {
         try { $script:hostName = [System.Net.Dns]::GetHostName() } catch { $script:hostName = 'unknown' }
@@ -792,7 +825,11 @@ function Send-ChunkRequest {
     # ever marked exported on unconfirmed data. This makes 2xx load-bearing - it must
     # mean DURABLY ACCEPTED on the server, not merely received.
     if ($httpCode -ge 200 -and $httpCode -lt 300) { return $true }
-    Write-ShipLog "outcome=fail file=$($script:targetBaseName) offset=$Offset bytes=$Count http=$httpCode"
+    # THREE DIGITS, because curl prints `000` for a transport failure or a timeout and
+    # both status documents tell the operator to look for `http=000`. Left as $httpCode
+    # this logged `http=0` on Windows only, so the one string support greps for existed
+    # on one platform. A real status is unaffected (401 formats as 401).
+    Write-ShipLog ("outcome=fail file=$($script:targetBaseName) offset=$Offset bytes=$Count http=" + $httpCode.ToString('000'))
     return $false
 }
 
@@ -887,6 +924,10 @@ function Invoke-Main {
     Initialize-Args
     Import-ShipEnv
     Resolve-Knobs
+    if ($script:shipDisabledByFile) {
+        Write-ShipDebug 'ROGUE_SHIP_LOGS=0 in an env file -> no-op (a config kill switch is not overridable)'
+        exit 0
+    }
     if (-not (Test-FlagEnabled ([string]$script:creds['ROGUE_SHIP_LOGS']))) {
         $flagValue = [string]$script:creds['ROGUE_SHIP_LOGS']
         if (-not $flagValue) { $flagValue = '<unset>' }

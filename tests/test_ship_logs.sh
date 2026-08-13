@@ -698,6 +698,41 @@ ship "ROGUE_SHIP_LOGS=yes"
 check "a non-numeric value is not an opt-in either" "0" "$(bodies)"
 ship "ROGUE_SHIP_LOGS=1"
 check "an explicit 1 opts in" "1" "$(bodies)"
+# AN ENV FILE'S EXPLICIT ZERO IS A KILL SWITCH, and an inline ROGUE_SHIP_LOGS=1 must
+# not defeat it. Every other knob here is "process env beats the files", so this is the
+# one deliberate exception: the documented support one-liner passes =1 inline, and under
+# plain precedence it would silently re-enable uploading on a machine whose MDM profile
+# or whose user had turned it off - in the privacy-sensitive path of all places.
+new_case killswitch
+seed 1 3
+printf 'export ROGUE_SHIP_LOGS=0\n' > "$CASE/home/.rogue-env"
+chmod 600 "$CASE/home/.rogue-env"
+ship "ROGUE_SHIP_LOGS=1"
+check "an env file's 0 beats an inline 1" "0" "$(bodies)"
+check "…and leaves no state" "" "$(state offset)"
+# A zero-padded 00 is the same explicit off (phase 1's rotation-cap precedent).
+printf 'export ROGUE_SHIP_LOGS=00\n' > "$CASE/home/.rogue-env"
+ship "ROGUE_SHIP_LOGS=1"
+check "a zero-padded 00 in the file also holds" "0" "$(bodies)"
+# A file that merely says nothing must NOT block: absent and non-numeric both mean
+# "said nothing", or a typo in one line would silently disable uploading everywhere.
+printf 'export ROGUE_SHIP_LOGS=yes\n' > "$CASE/home/.rogue-env"
+ship "ROGUE_SHIP_LOGS=1"
+check "a non-numeric file value is not a kill switch" "1" "$(bodies)"
+# The Node shipper must agree - it shares ~/.rogue/ship and the same documented
+# semantics, and a kill switch honored on one implementation only is not one.
+if command -v node >/dev/null 2>&1; then
+  new_case killswitch-mjs
+  glog="$CASE/home/.rogue/logs/gemini.log"
+  seed 1 3 gemini "$glog"
+  printf 'export ROGUE_SHIP_LOGS=0\n' > "$CASE/home/.rogue-env"
+  chmod 600 "$CASE/home/.rogue-env"
+  ship_mjs gemini 9.9.9 gemini "ROGUE_SHIP_LOGS=1"
+  check "an env file's 0 beats an inline 1 (Node)" "0" "$(bodies)"
+  printf 'export ROGUE_SHIP_LOGS=yes\n' > "$CASE/home/.rogue-env"
+  ship_mjs gemini 9.9.9 gemini "ROGUE_SHIP_LOGS=1"
+  check "a non-numeric file value is not a kill switch (Node)" "1" "$(bodies)"
+fi
 # The debug stream must carry the reason, because a no-arg support run has no log
 # file of its own to write to (SELF_LOG_FILE is empty when the slug is `unknown`).
 new_case debug-reason

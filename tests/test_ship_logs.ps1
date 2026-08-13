@@ -134,6 +134,29 @@ Check 'unset does NOT ship'            'False' ([string](Test-FlagEnabled ''))
 Check 'a typo is not an opt-in'        'False' ([string](Test-FlagEnabled 'yes'))
 Check 'ROGUE_SHIP_LOGS=0 stays off'    'False' ([string](Test-FlagEnabled '0'))
 Check 'a zero-padded 00 stays off'     'False' ([string](Test-FlagEnabled '00'))
+# An env file's explicit 0 is a KILL SWITCH that an inline ROGUE_SHIP_LOGS=1 must not
+# defeat - the one deliberate exception to "process env beats the files", because the
+# documented support one-liner passes =1 inline and would otherwise re-enable uploading
+# on a machine whose MDM profile or whose user had turned it off. Absent and
+# non-numeric are "said nothing", or a typo in one line would disable it everywhere.
+Check 'an explicit 0 is a kill switch'      'True'  ([string](Test-ValueIsZero '0'))
+Check 'a zero-padded 00 is too'             'True'  ([string](Test-ValueIsZero '00'))
+Check 'unset is not a kill switch'          'False' ([string](Test-ValueIsZero ''))
+Check 'a typo is not a kill switch'         'False' ([string](Test-ValueIsZero 'yes'))
+Check '1 is not a kill switch'              'False' ([string](Test-ValueIsZero '1'))
+# The wiring, since Invoke-Main cannot run here: the flag has to be set per file while
+# the files are read (the process-env pass overwrites the value), and checked before
+# the opt-in test.
+$psShipSource = Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/ship-logs.ps1')
+# Index comparison rather than one big regex: the assertion is about ORDER (the flag
+# must be recorded while the files are read, BEFORE the process-env pass overwrites the
+# value), and a windowed `[\s\S]{0,600}` match silently depends on comment length.
+$zeroTestAt = $psShipSource.IndexOf("Test-ValueIsZero ([string]`$resolved['ROGUE_SHIP_LOGS'])")
+$processPassAt = $psShipSource.IndexOf('$processValue = [Environment]::GetEnvironmentVariable($varName)')
+Check 'Import-ShipEnv records the kill switch while reading the files' 'True' `
+    ([string]($zeroTestAt -gt 0 -and $processPassAt -gt 0 -and $zeroTestAt -lt $processPassAt))
+Check 'Invoke-Main checks it before the opt-in flag' 'True' ([string](
+    $psShipSource -match '\$script:shipDisabledByFile\)\s*\{[\s\S]{0,400}?Test-FlagEnabled'))
 
 # ── state key ──────────────────────────────────────────────────────────────
 Write-Host ''
@@ -209,6 +232,40 @@ $hasBom = ($stateBytes.Length -ge 3 -and $stateBytes[0] -eq 0xEF -and $stateByte
 Check 'the state file has no UTF-8 BOM' 'False' ([string]$hasBom)
 Check 'and uses LF, not CRLF'           'False' `
     ([string]([System.IO.File]::ReadAllText((Join-Path $sandbox 'claude.state')).Contains("`r")))
+
+# ── identity ───────────────────────────────────────────────────────────────
+Write-Host ''
+Write-Host '== an empty actor email canonicalises to anon, exactly as sh and Node do'
+# This diverged silently: Resolve-ShipActor returned $false for an absent, empty or
+# whitespace-only email, so a WINDOWS machine whose `git config user.email` is unset
+# shipped nothing while the identical POSIX machine shipped under `anon` - and `anon`
+# is the roster fingerprint's own fallback, so it is what joins the logs to the row the
+# heartbeat created.
+foreach ($case in @(
+    @{ what = 'an empty email';           creds = @{ ROGUE_ACTOR_EMAIL = '' };    expect = 'anon' },
+    @{ what = 'a whitespace-only email';  creds = @{ ROGUE_ACTOR_EMAIL = '   ' }; expect = 'anon' },
+    @{ what = 'a real email';             creds = @{ ROGUE_ACTOR_EMAIL = 'a@b.c' }; expect = 'a@b.c' })) {
+    $script:creds = $case.creds
+    $script:actorEmail = ''
+    Check "$($case.what) -> $($case.expect)" 'True' ([string](Resolve-ShipActor))
+    Check "…and the value is $($case.expect)" $case.expect $script:actorEmail
+}
+# An identity that was never PASSED is a different thing from one resolved as empty:
+# neither key present means the caller resolved nothing, which must still skip rather
+# than invent `anon` for a machine we cannot name.
+$script:creds = @{}
+Check 'no actor key at all still skips' 'False' ([string](Resolve-ShipActor))
+
+# ── the transport-failure code is three digits ─────────────────────────────
+Write-Host ''
+Write-Host '== a transport failure logs http=000, matching curl'
+# `http=000` is the string both status documents tell an operator to look for. Left
+# unformatted this logged `http=0` on Windows only, so the one token support greps for
+# existed on one platform.
+Check 'zero formats as 000' '000' ((0).ToString('000'))
+Check 'a real status is unchanged' '401' ((401).ToString('000'))
+Check 'Send-ChunkRequest formats it' 'True' ([string](
+    $psShipSource -match 'http=" \+ \$httpCode\.ToString\(''000''\)'))
 
 # ── diagnostics reach the operator with no log file ────────────────────────
 Write-Host ''

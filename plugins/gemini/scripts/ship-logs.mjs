@@ -33,6 +33,7 @@ import { shellUnquote, IS_WIN } from "./shared.mjs";
 
 // ── constants ──────────────────────────────────────────────────────────────
 const SHIP_ENDPOINT_PATH = "/api/v1/hooks/logs";
+const SHIP_DISABLED_BY_FILE = Symbol("rogueShipDisabledByFile");
 const KNOWN_LOG_SLUGS = ["claude", "codex", "cursor", "gemini", "copilot", "antigravity"];
 // Bytes scanned when fingerprinting a log's first line. NOT 200: a real log line is
 // timestamp + provider + event + up to 400 chars of `raw=`, i.e. commonly 500-700
@@ -49,6 +50,14 @@ const HTTP_TIMEOUT_MS = 15000;
 
 const HOME = os.homedir() || process.env.HOME || process.env.USERPROFILE || ".";
 
+// An EXPLICIT numeric zero, including a zero-padded one. Absent and non-numeric are
+// both "said nothing", which is what separates a kill switch (see loadEnv) from a
+// default (see flagIsEnabled).
+function valueIsZero(value) {
+  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
+  return Number(value) === 0;
+}
+
 // ── env files ──────────────────────────────────────────────────────────────
 // Same platform-aware chain as every dispatcher (later file wins; process env wins
 // over all files). Takes the root as an argument rather than using shared.mjs's
@@ -61,6 +70,7 @@ function loadEnv(pluginRoot) {
     IS_WIN ? "C:\\ProgramData\\rogue\\env" : "/etc/rogue/env",
     path.join(HOME, ".rogue-env"),
   ];
+  let shipDisabledByFile = false;
   for (const envFile of envFiles) {
     if (!envFile) continue;
     let text;
@@ -73,10 +83,20 @@ function loadEnv(pluginRoot) {
       const assignment = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
       if (assignment) merged[assignment[1]] = shellUnquote(assignment[2]);
     }
+    // OFF WINS. Every other knob here follows "process env beats the files", but an
+    // explicit ROGUE_SHIP_LOGS=0 in a CONFIG FILE is a kill switch, and a kill switch a
+    // process variable can defeat is not one: the documented support one-liner sets
+    // ROGUE_SHIP_LOGS=1 inline, so under plain precedence it would silently re-enable
+    // uploading on a machine whose MDM profile or whose user had turned it off.
+    // Recorded per file, because the process-env pass below is about to overwrite it.
+    if (valueIsZero(merged.ROGUE_SHIP_LOGS)) shipDisabledByFile = true;
   }
   for (const varName of Object.keys(process.env)) {
     if (varName.startsWith("ROGUE_") && process.env[varName]) merged[varName] = process.env[varName];
   }
+  // A non-enumerable marker rather than another ROGUE_* key: `merged` is the credential
+  // map, and anything enumerable in it would be read as a knob by name elsewhere.
+  Object.defineProperty(merged, SHIP_DISABLED_BY_FILE, { value: shipDisabledByFile });
   return merged;
 }
 
@@ -92,8 +112,6 @@ function numberOrDefault(value, fallback, allowZero) {
   return parsed;
 }
 
-// Numeric zero (including a zero-padded "00", matching phase 1's rotation cap) means
-// off; a non-numeric value means the default.
 // SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
 // turns it on. That is the reverse of every other knob here, and deliberate - the
 // receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
@@ -742,6 +760,10 @@ class Shipper {
   async run() {
     this.env = loadEnv(this.pluginRoot);
     this.resolveKnobs();
+    if (this.env[SHIP_DISABLED_BY_FILE]) {
+      this.debug("ROGUE_SHIP_LOGS=0 in an env file -> no-op (a config kill switch is not overridable)");
+      return;
+    }
     if (!flagIsEnabled(this.env.ROGUE_SHIP_LOGS)) {
       this.debug(
         `ROGUE_SHIP_LOGS=${this.env.ROGUE_SHIP_LOGS || "<unset>"} -> no-op (shipping is opt-in)`,
