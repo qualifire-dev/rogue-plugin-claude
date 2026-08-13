@@ -94,6 +94,15 @@ cleanup() {
       && echo "  uninstalled rogue@$MARKETPLACE_NAME (user scope)"
     claude plugin marketplace remove "$MARKETPLACE_NAME" >/dev/null 2>&1 \
       && echo "  removed the $MARKETPLACE_NAME marketplace"
+    # Uninstalling drops the record but LEAVES the extracted tree in the plugin cache,
+    # and that leftover is not inert: it is a newer copy of this plugin than the real
+    # install, so anything resolving the plugin root by "newest under the cache" - the
+    # last-resort layer of the /rogue:status support snippet - picks this test's copy.
+    # The path is this test's own marketplace directory, so it cannot touch a real one.
+    if [ -d "$HOME/.claude/plugins/cache/$MARKETPLACE_NAME" ]; then
+      rm -rf "$HOME/.claude/plugins/cache/$MARKETPLACE_NAME" \
+        && echo "  removed the $MARKETPLACE_NAME plugin cache"
+    fi
   fi
   [ -n "$RECEIVER_PID" ] && kill "$RECEIVER_PID" 2>/dev/null && echo "  stopped the receiver"
   # Only the state this run created. The key is the log's basename, and the log lived

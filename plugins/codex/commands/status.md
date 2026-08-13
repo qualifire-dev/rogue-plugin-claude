@@ -114,17 +114,50 @@ flips and the paragraph above applies unchanged.
 
 - macOS / Linux:
 ```bash
-ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "${PLUGIN_ROOT}/scripts/ship-logs.sh"
+# PLUGIN_ROOT is exported to HOOK processes, not to this shell, so the script is
+# located on disk the same way Step 1 locates the bundled env file.
+SHIP="${PLUGIN_ROOT:+$PLUGIN_ROOT/scripts/ship-logs.sh}"
+[ -r "$SHIP" ] || SHIP=$(find "$HOME/.codex" -type f -name ship-logs.sh -path '*rogue*' 2>/dev/null | head -1)
+if [ -r "$SHIP" ]; then
+  ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$SHIP"
+else
+  echo "ship-logs.sh not found - list ~/.codex/plugins/ and report what is there"
+fi
 ```
 - Windows (PowerShell):
 ```powershell
-$env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
-$env:ROGUE_SHIPPER_SCRIPT = Join-Path (Get-Item Env:PLUGIN_ROOT).Value 'scripts\ship-logs.ps1'
-$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
-  '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
-Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
-  -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+$ship = $null
+if ($env:PLUGIN_ROOT) {
+  $candidate = Join-Path $env:PLUGIN_ROOT 'scripts\ship-logs.ps1'
+  if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
+}
+if (-not $ship) {
+  $ship = Get-ChildItem (Join-Path $env:USERPROFILE '.codex') -Recurse -Filter ship-logs.ps1 -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like '*rogue*' } | Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.codex\plugins and report what is there' }
+else {
+  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  $env:ROGUE_SHIPPER_SCRIPT = $ship
+  $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+    '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
+  Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+    -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+}
 ```
+
+**Resolve the script, never assume `PLUGIN_ROOT`.** That variable is exported to
+hook processes only — in the shell a slash command runs in it is empty, and
+`sh "/scripts/ship-logs.sh"` fails silently at exactly the moment support is
+trying to collect logs. The fallback is the same `find` under `~/.codex` that
+Step 1 uses for the bundled env file. **Which copy runs does not matter**: the
+support form takes no arguments, so no plugin root is passed and no per-agent
+value is read, and `ship-logs.sh` is byte-identical across all five sh plugins
+(enforced by `scripts/sync-shared-scripts.sh --check`).
+
+`PLUGIN_ROOT`, never `CLAUDE_PLUGIN_ROOT` — the Codex plugin uses Codex-native
+variables only, even though Codex exposes the Claude names as compat shims.
 
 **A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
 loading it into the current session would terminate *that* session rather than
@@ -132,9 +165,6 @@ the shipper. The script path travels as an environment variable and the command
 itself is a constant, so a path containing a quote cannot alter it;
 `-EncodedCommand` because `-ArgumentList` quoting is unreliable on Windows
 PowerShell 5.1. Same shape `heartbeat.ps1` uses.
-
-`PLUGIN_ROOT`, never `CLAUDE_PLUGIN_ROOT` — the Codex plugin uses Codex-native
-variables only, even though Codex exposes the Claude names as compat shims.
 
 Run with **no arguments**, which is the support form: it uploads *every* agent's
 log in the log directory, not just `codex.log`. Each line is attributed by its own

@@ -153,17 +153,56 @@ flips and the paragraph above applies unchanged.
 
 - macOS / Linux:
 ```bash
-ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "${CLAUDE_PLUGIN_ROOT}/scripts/ship-logs.sh"
+# CLAUDE_PLUGIN_ROOT is exported to HOOK processes, not to this shell, so the
+# script is located on disk the same way Step 1 locates the bundled env file.
+SHIP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/scripts/ship-logs.sh}"
+if [ ! -r "$SHIP" ]; then
+  ROOT=$(grep -o '"installPath": *"[^"]*"' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null \
+           | sed 's/.*"\(\/[^"]*\)"$/\1/' | grep '/rogue/' | tail -1)
+  SHIP="${ROOT:+$ROOT/scripts/ship-logs.sh}"
+fi
+[ -r "$SHIP" ] || SHIP=$(ls -t "$HOME"/.claude/plugins/cache/*/rogue*/*/scripts/ship-logs.sh 2>/dev/null | head -1)
+if [ -r "$SHIP" ]; then
+  ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$SHIP"
+else
+  echo "ship-logs.sh not found - list ~/.claude/plugins/cache/*/rogue*/ and report what is there"
+fi
 ```
 - Windows (PowerShell):
 ```powershell
-$env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
-$env:ROGUE_SHIPPER_SCRIPT = Join-Path (Get-Item Env:CLAUDE_PLUGIN_ROOT).Value 'scripts\ship-logs.ps1'
-$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
-  '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
-Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
-  -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+$ship = $null
+if ($env:CLAUDE_PLUGIN_ROOT) {
+  $candidate = Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts\ship-logs.ps1'
+  if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
+}
+if (-not $ship) {
+  $ship = Get-ChildItem (Join-Path $env:USERPROFILE '.claude\plugins') -Recurse -Filter ship-logs.ps1 -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like '*rogue*' } | Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.claude\plugins and report what is there' }
+else {
+  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  $env:ROGUE_SHIPPER_SCRIPT = $ship
+  $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+    '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
+  Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+    -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+}
 ```
+
+**Resolve the script, never assume `CLAUDE_PLUGIN_ROOT`.** That variable is
+exported to hook processes only — in the shell this command runs in it is empty,
+and `sh "/scripts/ship-logs.sh"` fails silently at exactly the moment support is
+trying to collect logs. Three layers, in order: the variable if something did set
+it, then the `installPath` recorded in `installed_plugins.json` (authoritative —
+it names the version actually installed, and ignores stale cache directories left
+by an uninstalled marketplace), then the newest copy under
+`~/.claude/plugins/cache/`. **Which copy runs does not matter much**: the support
+form takes no arguments, so no plugin root is passed and no per-agent value is
+read, and `ship-logs.sh` is byte-identical across all five sh plugins (enforced by
+`scripts/sync-shared-scripts.sh --check`). The last layer therefore exists to
+survive a change in Claude Code's own bookkeeping file, not to pick a "right" copy.
 
 **A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
 loading it into the current session would terminate *that* session — the one

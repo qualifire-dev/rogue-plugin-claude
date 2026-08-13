@@ -78,6 +78,62 @@ jobs:
           done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh' 'scripts/shared/*.sh')
           [ "$fail" = 0 ] || exit 1
 
+      - name: Command and skill snippets parse
+        # Every fenced sh/bash and powershell block in a /rogue:setup or /rogue:status
+        # document is RUN VERBATIM by the agent when a user invokes the command, so a
+        # syntax error there is a product bug in the only diagnostic path support has -
+        # and nothing else in this workflow reads these files. Parse-only (`sh -n`, the
+        # PowerShell parser), so a block that references a variable set by an earlier
+        # block is fine; what it catches is an unbalanced quote, paren or heredoc.
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          files = subprocess.run(['git', 'ls-files', 'plugins/*/skills/*/SKILL.md',
+                                  'plugins/*/commands/*.md'],
+                                 capture_output=True, text=True).stdout.split()
+          bad = 0
+          ps_blocks = []
+          for path in files:
+              text = open(path, encoding='utf-8').read()
+              for match in re.finditer(r'```(bash|sh|powershell)\n(.*?)```', text, re.S):
+                  line = text[:match.start()].count('\n') + 1
+                  if match.group(1) == 'powershell':
+                      ps_blocks.append((path, line, match.group(2)))
+                      continue
+                  result = subprocess.run(['sh', '-n'], input=match.group(2),
+                                          capture_output=True, text=True)
+                  if result.returncode:
+                      print(f"::error file={path},line={line}::sh -n: "
+                            f"{result.stderr.strip()}")
+                      bad = 1
+          # The PowerShell blocks go through the real parser in one pwsh start-up.
+          for index, (path, line, code) in enumerate(ps_blocks):
+              open(f'/tmp/ps_block_{index}.ps1', 'w', encoding='utf-8').write(code)
+          script = '\n'.join([
+              '$bad = 0',
+              'foreach ($f in (Get-ChildItem /tmp/ps_block_*.ps1 | Sort-Object Name)) {',
+              '  $errs = $null',
+              '  $null = [System.Management.Automation.Language.Parser]::ParseFile(',
+              '            $f.FullName, [ref]$null, [ref]$errs)',
+              '  if ($errs -and $errs.Count -gt 0) { $bad = 1',
+              '    Write-Host ($f.Name + " :: " + ($errs[0].Message)) }',
+              '}',
+              'exit $bad'])
+          open('/tmp/parse_ps_blocks.ps1', 'w', encoding='utf-8').write(script)
+          if ps_blocks:
+              result = subprocess.run(['pwsh', '-NoProfile', '-File',
+                                       '/tmp/parse_ps_blocks.ps1'],
+                                      capture_output=True, text=True)
+              for report in result.stdout.splitlines():
+                  index = int(re.search(r'ps_block_(\d+)', report).group(1))
+                  path, line, _ = ps_blocks[index]
+                  print(f"::error file={path},line={line}::PowerShell parse error: "
+                        f"{report.split(' :: ', 1)[-1]}")
+                  bad = 1
+          print(f"checked {len(files)} documents, {len(ps_blocks)} PowerShell blocks")
+          sys.exit(bad)
+          PY
+
       - name: Shared plugin scripts are in sync
         # scripts/shared/ holds the ONLY editable copy of ship-logs.sh / ship-logs.ps1;
         # each plugin carries a committed byte-identical copy, because three plugins
