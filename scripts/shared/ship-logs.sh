@@ -412,7 +412,13 @@ resolve_actor() { # returns non-zero when there is no identity to ship under
       set -u
       ACTOR_EMAIL="$(trim "${ROGUE_ACTOR_EMAIL:-}")"
       ACTOR_NAME="$(trim "${ROGUE_ACTOR_NAME:-}")"
-    else
+    elif [ -z "$ACTOR_NAME" ]; then
+      # Nothing was passed and there is no actor.sh to ask - THAT is the case this
+      # skip was written for. A NAME on its own is still an inherited identity, and
+      # the PowerShell and Node copies (which have no actor.sh at all, so they land
+      # here for every empty email) canonicalize it to `anon` and ship. Returning 1
+      # here instead made `plugins/cursor` - the one plugin that ships a shipper but
+      # no actor.sh - the only place on a machine where that state shipped nothing.
       return 1
     fi
   fi
@@ -744,12 +750,29 @@ ship_oversize_line() { # <file> <offset> <rotated> <expected-head> <file-size>
     # and will never grow: send it rather than stalling on .1 forever, which would
     # also stop the live log from ever resetting.
     if [ "$_oversize_rotated" = 1 ]; then
+      # The ceiling applies to this tail too. It is a line like any other, and
+      # the newline search that produced it may have spanned every scan window -
+      # up to MAX_SCAN_WINDOWS * MAX_LINE_BYTES, 256 MiB at the defaults - so
+      # without this the branch can post a single body far past the ~1 MiB (4 MiB
+      # for one oversized line) the receiver is promised, after allocating it.
+      if [ "$_oversize_remaining_bytes" -gt "$MAX_LINE_BYTES" ]; then
+        log "outcome=skip reason=oversize-line file=$TARGET_BASENAME offset=$_oversize_offset bytes=$_oversize_remaining_bytes"
+        ADVANCE_BYTES=$_oversize_remaining_bytes
+        return 0
+      fi
       _oversize_tmp_file="$TMP_DIR/chunk"
       read_range "$_oversize_source_file" "$_oversize_offset" "$_oversize_remaining_bytes" \
         > "$_oversize_tmp_file" 2>/dev/null
-      post_chunk "$_oversize_tmp_file" "$_oversize_offset" "$_oversize_remaining_bytes" \
+      # What was READ, not what the size snapshot said: `.1` can be replaced by a
+      # fresh rotation between the two, and posting `bytes=` for a length that was
+      # never read - then advancing the offset by it - skips real content. The
+      # terminated branch above already reads the length back for this reason;
+      # PowerShell and Node use their buffer's own length and never had the gap.
+      _oversize_bytes=$(file_size "$_oversize_tmp_file")
+      [ "$_oversize_bytes" -gt 0 ] || return 1
+      post_chunk "$_oversize_tmp_file" "$_oversize_offset" "$_oversize_bytes" \
         "$_oversize_rotated" || return 1
-      ADVANCE_BYTES=$_oversize_remaining_bytes
+      ADVANCE_BYTES=$_oversize_bytes
       return 0
     fi
     # A LIVE file's unterminated tail is a line still being written. Wait for its

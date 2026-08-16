@@ -275,6 +275,10 @@ check "…reporting the plugin version, not \"unknown\"" "no" \
 echo
 echo "== an unconfigured install ships nothing"
 rm -f "$HOME/.rogue-env"
+# Fresh lines FIRST, as in the opt-in case above. The previous `ship` drained the
+# log, so without new bytes the shipper would make no request whether or not a key
+# is configured, and this case would pass for the wrong reason.
+dispatch 2
 unconfigured_before="$(envelopes)"
 ship
 check "no API key -> no upload" "$unconfigured_before" "$(envelopes)"

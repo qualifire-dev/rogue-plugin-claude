@@ -3,8 +3,8 @@
 Capability A from [log-shipping.md](log-shipping.md). This is the build spec: what
 files, what contract, what each step does and why. Review this before code lands.
 
-Storage decision is settled: hook logs go to a **separate Axiom dataset**, not into
-the endpoint agent's table. Axiom is an append-only event store, so at-least-once
+Storage decision is settled: hook logs go to a **separate dataset in the log store**, not into
+the endpoint agent's table. the log store is append-only, so at-least-once
 delivery just means an occasional duplicate event and there is **no client-side
 dedup work** — a query can collapse on `(log_source_id, log_file, ts, raw)` if it
 ever matters.
@@ -178,7 +178,7 @@ no `provider=` (a torn line, or a future format change). In the normal per-file
 configuration every line in `claude.log` says `provider=claude`, so per-line and
 per-file agree and nothing changes; collapse mode simply works.
 
-This costs nothing on the server — the ingest already emits one Axiom event per
+This costs nothing on the server — the ingest already emits one event per
 line, so deriving that line's `log_source` alongside its other fields is the same
 loop. It costs nothing on the client either: no slug table, no per-line work, no
 new field.
@@ -269,9 +269,9 @@ covers it because the key is the file.
 
 ### 9. Identity — send the PII, store the id
 
-The privacy boundary is **Rogue → Axiom**, not plugin → Rogue. Every hook POST and
+The privacy boundary is **Rogue → the log store**, not plugin → Rogue. Every hook POST and
 every heartbeat already sends `host` + `actor_email` to our own API, so sending
-them to `/hooks/logs` adds no new exposure. What must stay clean is the Axiom
+them to `/hooks/logs` adds no new exposure. What must stay clean is the log store's
 dataset, whose retention and access controls are not the main database's.
 
 So the shipper sends the identity fields as-is and the **backend resolves them to an
@@ -282,7 +282,7 @@ plugin  → POST /hooks/logs   host, actor_email, actor_name, agent_family,
                              log_file, chunk
 backend → resolve-or-create log_source row for
           (org_id, host, actor_email, family-of-this-line)  → random uuid
-Axiom   ← log_source_id, log_file, offset, chunk                  (no PII)
+store   ← log_source_id, log_file, offset, chunk                  (no PII)
 ```
 
 #### A log file is coarser than a `coding_agent` row
@@ -293,8 +293,8 @@ half is the interesting one.
 
 The roster's real dedup key is **four** parts, not three —
 `` `${hostname}|${actorEmail ?? "anon"}|${family}|${agent}` ``
-(`apps/rogue-aidr-api/src/routers/hooks.ts:343`, and the `fingerprint` column
-comment in `packages/rogue-database/src/schema.ts` says the same). `agent` is the
+(the roster fingerprint the hooks router computes, which the database column
+comment repeats). `agent` is the
 *surface*: `claude_code` | `claude_desktop` | `cowork`, `codex_cli` | `codex_app`,
 `antigravity_ide` | `antigravity_cli`.
 
@@ -314,7 +314,7 @@ name — and the fix is to stop pretending it is a `coding_agent.id`:
 - The backend keeps a **`log_source` table** — `id` (random uuid), `org_id`,
   `hostname`, `actor_email`, `agent_family`, unique on the four — and resolves or
   creates a row per `(org, host, actor, family)`. Only `log_source_id` reaches
-  Axiom.
+  the log store.
 - "Show me this roster row's plugin log" is a lookup of that row's own columns in
   `log_source`. No schema change to `coding_agent`, no PII crossing over.
 - The UI surfaces plugin logs at machine + family granularity, which is what the
@@ -333,19 +333,19 @@ opaque. **It is not.** Hostnames and work emails are extremely low-entropy,
 especially within one organisation: `firstname@rogue.security` over a known
 employee list, `<firstname>-mbp` / `<firstname>-macbook` over the same list, six
 known families. That is a few thousand candidates — a dictionary attack completes
-in milliseconds, so anyone with Axiom-only access recovers every hostname and email
+in milliseconds, so anyone with store-only access recovers every hostname and email
 exactly. It would have been pseudonymisation dressed up as removal, which is worse
 than an honest plaintext field because it invites reliance it cannot support.
 
 Three ways to fix it, in increasing strength:
 
 1. **Salted hash** — no better. The salt must be stored, and whoever can query
-   Axiom is inside the same system.
+   the store is inside the same system.
 2. **HMAC under a server-held key** — genuinely resistant, and it keeps the
    derive-from-any-row property.
 3. **A random id in a `log_source` table** — what this spec now requires.
 
-(3) beats (2) on two counts beyond the crypto. **Erasure**: Axiom is append-only, so
+(3) beats (2) on two counts beyond the crypto. **Erasure**: the store is append-only, so
 an HMAC scheme cannot honour a delete request without rewriting immutable data,
 whereas deleting the `log_source` row leaves the events permanently unlinkable —
 which is precisely what "erase this person" requires. And **rotation**: there is no
@@ -456,11 +456,11 @@ orphan Cursor's logs.
 
 ### 10. Not re-reading what was already exported
 
-State is one file per log, `~/.rogue/ship/<key>.state`, two `k=v` lines:
+State is one file per log, `~/.rogue/ship/<key>.state`, **four** `k=v` lines. Every persistence writes all four — a write that omitted `path=` would leave the next run unable to tell this file from another agent's log of the same basename, and one that omitted `size=` would drop the `.1` recovery gate:
 
 ```text
 offset=12345          bytes the backend has ACCEPTED for this file
-head=MjAyNi0w…        base64 of the file's FIRST LINE, as of that offset
+head=MjAyNi0w…        base64 of the file's FIRST LINE *including its newline*
 size=98304            the file's size when that offset was persisted
 path=/Users/…/claude.log   absolute path the offset belongs to
 ```
@@ -495,7 +495,13 @@ if stored_path != normalize(file): off = 0; stored_head = none  # different file
                                       # normalize: lexical, collapses // . ..,
                                       # never resolves symlinks
 size = wc -c < file                   # NOT stat — BSD and GNU differ on flags
-head = base64(first line of file)     # bytes up to the first \n, window 4096
+head = base64(first line of file)     # the COMPLETE first line INCLUDING its
+                                      # \n, when that \n falls inside the 4096
+                                      # byte window; the whole window otherwise.
+                                      # Byte-for-byte identical in sh, PowerShell,
+                                      # Node and the tests - an implementation
+                                      # that dropped the \n would read an
+                                      # unchanged file as rotated and re-upload it
 
 rotated = (size < off) or (head is known and head != stored_head)
 
@@ -507,14 +513,14 @@ if rotated:
         while off < size(file.1) and run budget remains:
             ship_one_chunk(file.1, off, rotated=true)
             on failure: return        # state untouched; next run resumes .1
-            off += n; persist offset=off head=stored_head size=stored_size
+            off += n; persist offset=off head=stored_head size=stored_size path=normalize(file)
         if off < size(file.1): return # budget spent — finish .1 next run, do NOT
                                       # reset, or the rest of it is lost
-    off = 0; persist offset=0 head=<head> size=<size>   # only once .1 is drained
+    off = 0; persist offset=0 head=<head> size=<size> path=normalize(file)  # .1 drained
 while off < size and run budget remains:
     ship_one_chunk(file, off, rotated=false)
     on failure: return
-    off += n; persist offset=off head=<head> size=<size>
+    off += n; persist offset=off head=<head> size=<size> path=normalize(file)
 
 ship_one_chunk(f, off, rotated):
     n     = min(size(f) - off, ROGUE_SHIP_MAX_BYTES)
@@ -532,10 +538,10 @@ exported on unconfirmed data.
 > contract.** A 2xx from `/hooks/logs` is the *only* thing that makes the plugin
 > forget a byte range, so 2xx must mean **durably accepted**. The existing endpoint
 > sink is the counter-example to copy from carefully:
-> `apps/rogue-aispm-api/src/services/endpoint-logs-sink.ts` calls
-> `axiomClient.ingest(...)` **without `await`** inside a `try/catch` — so an async
+> the existing endpoint-log sink fires the store
+> client's ingest **without `await`** inside a `try/catch` — so an async
 > rejection is not even caught — and returns `accepted: events.length`
-> unconditionally, including when `axiomClient` is null or the dataset env var is
+> unconditionally, including when the store client is absent or the dataset env var is
 > unset. Built that way, `/hooks/logs` would 200 on a dropped chunk and the shipper
 > would advance its offset past data that never landed: **silent, permanent loss**,
 > which is exactly what the offset design exists to prevent. The ingest must be
@@ -659,7 +665,7 @@ extra short read per chunk; the next run then handles the rotation properly.
 #### Chunks end on line boundaries
 
 Hitting `ROGUE_SHIP_MAX_BYTES` mid-line would put a line's first half in chunk *N*
-and its second half in chunk *N+1* — two Axiom events, two corrupt lines instead of
+and its second half in chunk *N+1* — two events, two corrupt lines instead of
 one good one. Same hazard from a torn concurrent append at the tail.
 
 So every chunk is **trimmed back to the last `\n`** and the offset advances by the
@@ -714,7 +720,15 @@ if the chunk [off, off+n) contains no \n:
     found, line >  MAX_LINE_BYTES  → skip it: advance off PAST THAT \n, and log
                                      outcome=skip reason=oversize-line
     no \n, hit EOF, file is .1     → the generation is frozen, so this really is
-                                     the final line: send it
+                                     the final line. The CEILING STILL APPLIES: a
+                                     tail over MAX_LINE_BYTES is skipped to EOF
+                                     with outcome=skip reason=oversize-line, since
+                                     the search that produced it may have spanned
+                                     every window (256 MiB) and the receiver is
+                                     promised at most one line's worth. Otherwise
+                                     send it, sized by what was actually READ - the
+                                     size snapshot predates the read and `.1` can
+                                     be replaced by a fresh rotation in between
     no \n, hit EOF, file is live   → a line still being written. Send nothing and
                                      do not advance; next run picks it up
     no \n, scan bound exhausted    → STALL. Do not advance. Log
@@ -797,7 +811,7 @@ Open with `ReadWrite -bor Delete`, keep the open window as short as possible.
 #### Delivery is at-least-once, deliberately
 
 If the backend commits a chunk and the 2xx is lost in transit, the next run re-sends
-that range. Axiom is append-only and hook logs go to their own dataset, so that is
+that range. the store is append-only and hook logs go to their own dataset, so that is
 a duplicate event, not corruption, and a query can collapse on
 `(log_source_id, log_file, ts, raw)`. The alternative — advancing the offset
 before confirmation — trades duplicates for silent loss, the wrong trade for
@@ -843,13 +857,13 @@ grepped out of the current dispatchers rather than assumed:
 
 So the requirement is **not** "redact two fields": server-side redaction must run
 over **every parsed field and the raw line**, the way
-`apps/rogue-aispm-api/src/services/endpoint-logs-redact.ts` already does for the
-endpoint agent — `redactEvent` walks every string value through `redactString`,
+the endpoint agent's redaction helper already does for the
+endpoint agent — it walks every string value through one redaction function,
 which rewrites `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` to `~`. Reuse
 it rather than growing a second implementation. Two gaps it does not cover today
 and this ingest needs:
 
-- **`name=`** is arbitrary text, not a path, so `redactString` passes it through
+- **`name=`** is arbitrary text, not a path, so that redaction passes it through
   untouched. Needs its own decision — keep (it is a tool label, usually harmless),
   or drop under the same policy switch as `raw=`.
 - **`raw=` / `reason=`** likewise. Whether it is kept, truncated or dropped is
@@ -880,7 +894,7 @@ Headers: `x-rogue-api-key`, `Content-Type: application/json`. Nothing else — n
 
 ```jsonc
 { "host":             "…",          // resolve-or-create a log_source row; only
-  "actor_email":      "…",          //   its random id reaches Axiom — see §9
+  "actor_email":      "…",          //   its random id reaches the store — see §9
   "actor_name":       "…",
   "agent_family":     "claude",     // roster vocabulary: codex's family is `openai`
   "shipper":          "claude",     // which plugin's copy ran (log-slug vocabulary)
@@ -1064,7 +1078,7 @@ preconditions, in order:
    answering **2xx only after a durable write**. This is a correctness requirement,
    not a preference: the client forgets bytes the moment it sees a 2xx, so an
    accepted-then-dropped chunk is unrecoverable data loss with no error anywhere.
-   `forwardEndpointLogs`'s un-awaited `axiomClient.ingest(...)` is exactly the shape
+   the endpoint-log sink's un-awaited the store client's ingest call is exactly the shape
    this must not have.
 2. The `log_source` mapping in place, so a chunk's `host` / `actor_email` /
    `agent_family` resolve to a row rather than being stored raw.

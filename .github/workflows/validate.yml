@@ -19,7 +19,12 @@ jobs:
   manifests:
     runs-on: ubuntu-latest
     steps:
+      # persist-credentials: false - checkout otherwise writes the job token into
+      # .git/config, and every step below runs product scripts out of the checked-out
+      # tree. They need the source, never the credential.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Pinned so the Gemini dispatcher is actually exercised: tests/test_hook_logs.sh
       # SKIPS its gemini leg when `node` is missing, which would pass silently.
@@ -88,9 +93,17 @@ jobs:
         run: |
           python3 - <<'PY'
           import re, subprocess, sys
-          files = subprocess.run(['git', 'ls-files', 'plugins/*/skills/*/SKILL.md',
-                                  'plugins/*/commands/*.md'],
-                                 capture_output=True, text=True).stdout.split()
+          listing = subprocess.run(['git', 'ls-files', 'plugins/*/skills/*/SKILL.md',
+                                    'plugins/*/commands/*.md'],
+                                   capture_output=True, text=True)
+          files = listing.stdout.split()
+          # A failed `git` or a glob that stopped matching would leave this empty, and
+          # the step would pass having validated nothing - the silent green this whole
+          # workflow exists to avoid. There is always at least one status document.
+          if listing.returncode or not files:
+              print(f"::error::git ls-files found no command/skill documents "
+                    f"(rc={listing.returncode})")
+              sys.exit(1)
           bad = 0
           ps_blocks = []
           for path in files:
@@ -228,8 +241,15 @@ jobs:
           import re, subprocess, sys
           DANGEROUS = '‐‑‒–—―‘’‚‛“”→←'
           bad = 0
-          for path in subprocess.run(['git', 'ls-files', '*.ps1'],
-                                     capture_output=True, text=True).stdout.split():
+          listing = subprocess.run(['git', 'ls-files', '*.ps1'],
+                                   capture_output=True, text=True)
+          paths = listing.stdout.split()
+          # Same silent-green guard as the snippet step: an empty list here would
+          # "check" nothing and report success. The repo always ships .ps1 files.
+          if listing.returncode or not paths:
+              print(f"::error::git ls-files found no .ps1 files (rc={listing.returncode})")
+              sys.exit(1)
+          for path in paths:
               for number, line in enumerate(open(path, encoding='utf-8'), 1):
                   code = re.sub(r'#.*', '', line)
                   hits = sorted({c for c in code if c in DANGEROUS})
@@ -263,7 +283,12 @@ jobs:
     # user silently loses the feature.
     runs-on: windows-latest
     steps:
+      # persist-credentials: false - checkout otherwise writes the job token into
+      # .git/config, and this job runs product scripts and a Node receiver out of
+      # the checked-out tree. It only needs the source, never the credential.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The e2e receiver is Node; the shipper itself needs nothing but PowerShell.
       - uses: actions/setup-node@v4

@@ -23,6 +23,9 @@
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $failures = 0
+# Set by the catch below so the finally block keeps the sandbox and the summary
+# cannot report success on a run that never finished.
+$script:aborted = $false
 
 function Pass { param([string]$M) Write-Host "  ok: $M" }
 function Fail { param([string]$M) Write-Host "FAIL: $M"; $script:failures++ }
@@ -317,6 +320,66 @@ $unconfiguredBefore = Envelopes
 Invoke-Shipper
 Check 'no API key -> no upload' ([string]$unconfiguredBefore) ([string](Envelopes))
 
+# ── the DOCUMENTED support snippet, executed verbatim ──────────────────────
+# Parser-only coverage of the fenced blocks (validate.yml) cannot catch the failure
+# this case exists for: the snippet used to invoke ship-logs.ps1 through
+# [scriptblock]::Create with NO arguments, and $PSCommandPath is empty there, so the
+# shipper self-located its plugin root to the OPERATOR'S CWD and never read the
+# bundled <root>\env - on the one command support tells a customer to run.
+#
+# The sandbox tree below puts BOTH credentials only in that bundled env: no
+# ~/.rogue-env, nothing in the process environment. So the upload can only succeed
+# if the snippet passed the root through. (Both-in-the-bundle also means a
+# regression cannot accidentally reach production: with no key resolved the shipper
+# skips before it makes any request.)
+Write-Host ''
+Write-Host '== the documented Windows support snippet reads the bundled env'
+$snippetHome = Join-Path $sandbox 'home4'
+New-Item -ItemType Directory -Path (Join-Path (Join-Path $snippetHome '.rogue') 'logs') -Force | Out-Null
+[System.IO.File]::WriteAllText(
+    (Join-Path (Join-Path (Join-Path $snippetHome '.rogue') 'logs') 'claude.log'),
+    "2026-08-12T00:00:09Z provider=claude event=PreToolUse outcome=allow snippet=1`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+
+# A plugin tree that looks like an install: scripts/ship-logs.ps1 plus the bundled
+# env file that is FIRST in the credential chain.
+$snippetRoot = Join-Path $sandbox 'plugintree'
+New-Item -ItemType Directory -Path (Join-Path $snippetRoot 'scripts') -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $repo 'plugins\rogue\scripts\ship-logs.ps1') `
+          -Destination (Join-Path $snippetRoot 'scripts\ship-logs.ps1') -Force
+[System.IO.File]::WriteAllText((Join-Path $snippetRoot 'env'),
+    "export ROGUE_API_KEY='snippet-key'`nexport ROGUE_BASE_URL='$baseUrl'`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+
+# The block is READ OUT OF THE DOCUMENT, not retyped here: a copy would drift from
+# what the agent actually runs, which is the whole point of testing it.
+$doc = Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins\rogue\skills\status\SKILL.md')
+$snippet = $null
+foreach ($m in [regex]::Matches($doc, '(?s)```powershell\r?\n(.*?)```')) {
+    if ($m.Groups[1].Value -match 'ROGUE_SHIPPER_SCRIPT') { $snippet = $m.Groups[1].Value; break }
+}
+if (-not $snippet) { Fail 'no PowerShell upload snippet found in the status document' }
+else {
+    $env:USERPROFILE = $snippetHome
+    # The snippet's FIRST resolution layer is $env:CLAUDE_PLUGIN_ROOT, so this points
+    # it at the sandbox tree without touching anything else it does.
+    $env:CLAUDE_PLUGIN_ROOT = $snippetRoot
+    $env:ROGUE_ACTOR_EMAIL = 'snippet@rogue.security'
+    $env:ROGUE_ACTOR_NAME = 'Snippet Person'
+    $snippetBefore = Envelopes
+    & ([scriptblock]::Create($snippet)) | Out-Null
+    Check 'the snippet uploaded using the bundled env' `
+        ([string]($snippetBefore + 1)) ([string](Envelopes))
+    Check 'and under the actor it inherited' 'snippet@rogue.security' (LastEnvelopeField 'actor_email')
+    Remove-Item Env:CLAUDE_PLUGIN_ROOT, Env:ROGUE_ACTOR_EMAIL, Env:ROGUE_ACTOR_NAME -ErrorAction SilentlyContinue
+}
+
+} catch {
+    # An exception skips the summary below, so record it for the finally block -
+    # otherwise a throw with $failures still 0 would delete the very sandbox its
+    # message tells the reader to open.
+    $script:aborted = $true
+    Write-Host "ABORTED: $($_.Exception.Message)"
 } finally {
     $env:USERPROFILE = $realUserProfile
     # Put the caller's session back exactly as it was: absent stays absent, set goes
@@ -329,13 +392,26 @@ Check 'no API key -> no upload' ([string]$unconfiguredBefore) ([string](Envelope
     if ($receiver -and -not $receiver.HasExited) {
         try { $receiver.Kill() } catch {}
     }
-    try { Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    # KEEP the sandbox when anything went wrong. Several failure paths name a file
+    # inside it - `throw "the receiver never wrote a port file (see $sandbox\recv.err)"`
+    # is the important one, since that stderr is the only record of why `node` did
+    # not start - and deleting it unconditionally meant the message pointed at a
+    # path that no longer existed by the time anyone read it.
+    if ($failures -eq 0 -and -not $script:aborted) {
+        try { Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    } else {
+        Write-Host "sandbox kept for diagnosis: $sandbox"
+    }
 }
 
 Write-Host ''
-if ($failures -eq 0) {
+# `-not $script:aborted` is load-bearing: the catch above swallows the exception so
+# the finally block can keep the sandbox, and without this an abort with zero
+# recorded failures would print "all passed" and exit 0.
+if ($failures -eq 0 -and -not $script:aborted) {
     Write-Host 'All end-to-end Windows log-shipper tests passed.'
     exit 0
 }
+if ($script:aborted) { Write-Host 'aborted before the suite finished.' }
 Write-Host "$failures failure(s)."
 exit 1

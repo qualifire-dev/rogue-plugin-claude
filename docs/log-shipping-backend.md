@@ -12,8 +12,14 @@ the plugin:
 
 | # | what | where | blocks what |
 |---|---|---|---|
-| **1** | `POST /api/v1/hooks/logs` + the `log_source` mapping + redaction | `rogue-ui/apps/rogue-aidr-api` | flipping the plugin's default on |
-| **2** | `CodingAgentLogUpload` task worker | `qualifire/rogue-endpoint` | nothing — independent of 1 and of the plugin |
+| **1** | `POST /api/v1/hooks/logs` + the `log_source` mapping + redaction | the AIDR API service | flipping the plugin's default on |
+| **2** | coding-agent log-upload task worker | the endpoint agent | nothing — independent of 1 and of the plugin |
+
+> **This repository is public, so no backend coordinates appear here.** No repo
+> names, file paths, module or symbol names, and no infrastructure vendor — only the
+> requirements and the wire contract, which is what a client repo can legitimately
+> pin down. Anyone implementing this has the internal locations already; anyone who
+> does not have them should not be learning them from here.
 
 > **The plugin ships nothing until #1 is live.** `ROGUE_SHIP_LOGS` defaults to off in
 > all three client implementations precisely because the route does not exist: prod
@@ -100,7 +106,7 @@ The format is phase 1's, identical across all six dispatchers:
   diagnostics data whose value is highest exactly when something unexpected happened.
 
 Suggested record shape, matching what the endpoint agent already produces so one
-Axiom schema covers both capabilities:
+Log-store schema covers both capabilities:
 
 ```jsonc
 { "ts": "2026-08-11T11:26:16Z", "provider": "claude", "event": "PreToolUse",
@@ -111,13 +117,13 @@ Axiom schema covers both capabilities:
 
 ## `log_source` — a table, not a hash
 
-Rows in Axiom carry a random `log_source_id`, resolved (create-or-get) from
+Rows in the log store carry a random `log_source_id`, resolved (create-or-get) from
 `(org_id, host, actor_email, agent_family)`.
 
 - **A hash of those four is not a privacy boundary.** Work emails and hostnames inside
   one org are low-entropy enough to dictionary in milliseconds.
 - **A random id makes erasure work on an append-only store**: delete the mapping row
-  and the events become unlinkable, with no rewrite of Axiom.
+  and the events become unlinkable, with no rewrite of the store.
 - **Resolve-or-create, and never reject.** The client has no `log_source_id` to send
   and no way to learn one — it reads only the status code. A 4xx for "unknown source"
   would be a permanent stall.
@@ -157,11 +163,10 @@ is worse than absent.)
 
 The route must **await** its write and **fail the request** if the write fails.
 
-`forwardEndpointLogs` (`apps/rogue-aispm-api/src/services/endpoint-logs-sink.ts`) is
-the shape to avoid: it calls `axiomClient.ingest(...)` without `await` inside its
-`try/catch` — so an async rejection is not even caught — and returns
-`accepted: events.length` unconditionally, including when `axiomClient` is null or
-`AXIOM_ENDPOINT_LOGS_DATASET` is unset. For a fire-and-forget tracing sink that is a
+The existing endpoint-log sink is the shape to avoid: it fires the store client's
+ingest without `await` inside its `try/catch` — so an async rejection is not even caught — and returns
+`accepted: events.length` unconditionally, including when the store client is absent or
+its dataset variable is unset. For a fire-and-forget tracing sink that is a
 defensible trade. Here it is silent, unrecoverable data loss: the client advances its
 offset on that 2xx and those bytes never exist anywhere again.
 
@@ -189,7 +194,7 @@ testable and changeable without a plugin release.
   parsed field claims stays in `raw`, and any field the redactor rewrites no longer
   matches the `raw` it came from. Redacting first makes `raw` and every parsed field
   consistent by construction.
-- Reuse `endpoint-logs-redact.ts`'s `redactEvent` / `redactString`, which already walk
+- Reuse the endpoint agent's redaction helpers, which already walk
   every string value and rewrite home paths.
 - **Persist the redacted line as `raw`, never the original.** There is no
   "store both" tier.
@@ -202,7 +207,7 @@ testable and changeable without a plugin release.
 
 ## Storage and volume
 
-- **Its own Axiom dataset** (settled). Hook logs are client-side diagnostics, not the
+- **Its own dataset in the log store** (settled). Hook logs are client-side diagnostics, not the
   security signal — what they add over `/hooks/<agent>` is transport failures plus
   outcomes the API never sees (a local alert, a failed enrichment, an unresolved
   subagent), not a second copy of the event stream.
@@ -226,7 +231,7 @@ testable and changeable without a plugin release.
 
 ---
 
-# Part 2 — `CodingAgentLogUpload` (rogue-endpoint)
+# Part 2 — the log-upload task (endpoint agent)
 
 Capability B. **Independent of Part 1 and of the plugin** — it needs nothing from
 either and neither needs it, so it can be built in any order. Full context in
@@ -237,8 +242,8 @@ Its distinct value over the plugin shipper is the reason to build it at all: it 
 uploads the **whole file** rather than the tail past an offset, and it carries a real
 `machine_id`.
 
-- New `src-tauri/src/tasks/coding_agent_log_upload_worker.rs`, registered in
-  `TaskRegistry::default()`, with `TaskType::CodingAgentLogUpload` added to the enum.
+- A new task worker module, registered in
+  the task registry, with a new task type added to its enum.
   `#[serde(other)] Unknown` already covers older agents, so an older install reports
   `unsupported` instead of breaking.
 - **File resolution must match the dispatchers**, or the agent reads a path nothing
@@ -252,7 +257,7 @@ uploads the **whole file** rather than the tail past an offset, and it carries a
   first).
 - Reuse the existing `LogShipRequest` and `/api/v1/endpoint/logs` rather than adding a
   third log path. **Batching is mandatory, and `max_bytes` does not cover it:**
-  `LogShipBodySchema` caps `records` at **1000 items**, and a 5 MiB hook log is ~65k
+  the existing endpoint-log upload schema caps `records` at **1000 items**, and a 5 MiB hook log is ~65k
   lines, so a single-request upload is rejected outright. Batch by record count as
   well as bytes.
 - Reuse `redact::redact_home_path` and `redact_pii_in_text` from `log_ship/`. Do
@@ -269,7 +274,7 @@ uploads the **whole file** rather than the tail past an offset, and it carries a
 
 ## Still open
 
-- Should a `CodingAgentLogUpload` assignment be creatable from the dashboard (support
+- Should a log-upload assignment be creatable from the dashboard (support
   clicks "collect logs" on a machine), or only by internal tooling? That decides
   whether Part 2 needs UI work at all.
 - **The shared env-file chain is sourced with no ownership or permission check** — in

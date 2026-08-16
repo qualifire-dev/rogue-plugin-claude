@@ -776,6 +776,17 @@ function Send-OversizeLine {
         # and will never grow: send it rather than stalling on .1 forever, which
         # would also stop the live log from ever resetting.
         if ($Rotated -eq 1) {
+            # The ceiling applies to this tail too. It is a line like any other,
+            # and the newline search that produced it may have spanned every scan
+            # window - up to MAX_SCAN_WINDOWS * maxLineBytes, 256 MiB at the
+            # defaults - so without this the branch can post a single body far
+            # past the ~1 MiB (4 MiB for one oversized line) the receiver is
+            # promised, after allocating it.
+            if ($remainingBytes -gt $script:maxLineBytes) {
+                Write-ShipLog "outcome=skip reason=oversize-line file=$($script:targetBaseName) offset=$Offset bytes=$remainingBytes"
+                $script:advanceBytes = $remainingBytes
+                return $true
+            }
             $tail = Read-Range $Path $Offset ([int]$remainingBytes)
             if ($null -eq $tail -or $tail.Length -eq 0) { return $false }
             if (-not (Send-ChunkRequest $tail $Offset $tail.Length $Rotated)) { return $false }

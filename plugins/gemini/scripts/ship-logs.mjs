@@ -612,6 +612,17 @@ class Shipper {
       // will never grow: send it rather than stalling on .1 forever, which would also
       // stop the live log from ever resetting.
       if (rotated) {
+        // The ceiling applies to this tail too. It is a line like any other, and the
+        // newline search that produced it may have spanned every scan window - up to
+        // MAX_SCAN_WINDOWS * maxLineBytes, 256 MiB at the defaults - so without this
+        // the branch can post a single body far past the ~1 MiB (4 MiB for one
+        // oversized line) the receiver is promised, after allocating it.
+        if (remainingBytes > this.maxLineBytes) {
+          this.log(
+            `outcome=skip reason=oversize-line file=${this.targetBaseName} offset=${offset} bytes=${remainingBytes}`,
+          );
+          return remainingBytes;
+        }
         const tail = readRange(filePath, offset, remainingBytes);
         if (!tail || tail.length === 0) return 0;
         if (!(await this.sendChunkRequest(tail, offset, tail.length, rotated))) return 0;

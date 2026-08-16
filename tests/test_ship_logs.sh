@@ -27,7 +27,13 @@ REPO="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SH="${SH:-sh}"
 FAILS=0
 T="$(mktemp -d "${TMPDIR:-/tmp}/rogue-shiptest.XXXXXX")" || exit 1
-trap 'rm -rf "$T"' EXIT INT TERM
+# Split, not one trap for all three: a bare `trap 'rm -rf …' INT` runs the handler
+# and then CONTINUES with the next statement, so a Ctrl-C would delete the fixtures
+# and let every remaining case run against a missing fake `curl` - a wall of
+# confusing failures instead of a stop.
+trap 'rm -rf "$T"' EXIT
+trap 'rm -rf "$T"; exit 130' INT
+trap 'rm -rf "$T"; exit 143' TERM
 
 pass() { echo "  ok: $1"; }
 fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }
@@ -607,6 +613,19 @@ check "no identity means no upload" "0" "$(bodies)"
 if grep -q 'outcome=skip reason=no-actor' "$LOG"; then pass "the skip is recorded"
 else fail "no outcome=skip reason=no-actor line was written"; fi
 check "no offset was persisted either" "" "$(state offset)"
+
+# A NAME with no email is still an inherited identity, and the plugin that lands
+# here is a real one: `plugins/cursor` ships a shipper and NO actor.sh, so every
+# empty-email run on it reaches this branch. The PowerShell and Node copies (which
+# have no actor.sh on any platform) canonicalise to `anon` and ship, so skipping
+# here made Cursor the only place on a machine that shipped nothing in that state.
+new_case nameonly
+seed 1 3
+mkdir -p "$CASE/root/scripts"
+ship "SHIP_ROOT=$CASE/root" "ROGUE_ACTOR_EMAIL=" "ROGUE_ACTOR_NAME=Amos"
+check "a name with no email still ships" "1" "$(bodies)"
+check "…under the canonical anon email" "anon" "$(strf 0 actor_email)"
+check "…carrying the name it was given" "Amos" "$(strf 0 actor_name)"
 
 # Absent, empty and whitespace-only must all produce ONE canonical value, matching
 # the roster fingerprint's `actorEmail ?? "anon"` extended to cover "" and "   ".

@@ -57,13 +57,24 @@ and orphan the logs. See **The actor is passed IN** in
 
 **Correction to an earlier version of this section**, which claimed the roster
 "dedups one row per `(host | actor-email | family)`". It does not: the fingerprint
-is four parts, `` `${hostname}|${actorEmail ?? "anon"}|${family}|${agent}` ``
-(`apps/rogue-aidr-api/src/routers/hooks.ts:343`), where `agent` is the surface
+is four parts, `` `${hostname}|${actorEmail ?? "anon"}|${family}|${agent}` `` (computed by the hooks router), where `agent` is the surface
 (`claude_code` | `claude_desktop` | `cowork`, `codex_cli` | `codex_app`, …). And
 because every surface of a family shares one log file, a chunk cannot resolve to a
 single row at all — it is coarser than the roster. See **A log file is coarser than
 a `coding_agent` row** in [plugin-log-shipper.md](plugin-log-shipper.md) for the
 `log_source` table that replaces the row lookup.
+
+**`actorEmail` is canonicalized before BOTH identity paths** — the roster
+fingerprint above and the `log_source` resolution a shipped chunk goes through.
+Canonical means: trim surrounding whitespace, then map absent, empty and
+whitespace-only to the literal `anon`. Case is preserved, deliberately: the
+roster's existing fingerprints were computed on the raw case, so folding it would
+re-key every install already registered. This is not a detail — a heartbeat that
+registers `"  "` and a chunk that resolves `anon` produce two different rows for
+one machine, and the logs then attach to a row nobody looks at. All three shippers
+implement exactly this (`ship-logs.sh`'s `resolve_actor`, `Resolve-ShipActor`,
+`resolveActor`), and `tests/test_ship_logs.sh` asserts the absent / empty /
+whitespace-only trio collapses to one value.
 
 `machine_id` remains the only way to join a plugin row to an `endpoint_agent` row
 on the same host. That join is capability B's contribution; if we want it for
@@ -73,7 +84,7 @@ row — **not** in every shipped log chunk.
 **The backend and agent work is now specced separately** in
 [log-shipping-backend.md](log-shipping-backend.md) — the `/hooks/logs` route, the
 `log_source` mapping, the durability requirement, the redaction boundary and the
-`CodingAgentLogUpload` checklist, in one place that can be handed to whoever picks it
+log-upload task checklist, in one place that can be handed to whoever picks it
 up. The open questions at the end of this file are the ones it does not settle.
 
 ## Phase 2 — the plugin shipper (this repo)
@@ -90,7 +101,7 @@ What changed, so a reader of the old version is not surprised:
 |---|---|---|
 | one agent-agnostic shipper uploads **all six** logs | each plugin ships **only its own** log; `ROGUE_SHIP_ALL=1` for support | the coverage argument rested on an agent's own shipper being unreachable, which the call-site fix removed. Cross-vendor file reads are a bad line in a security review |
 | `machine_id` in every chunk (phase 2b) | **not sent at all** | a random `log_source_id` identifies the source; `machine_id`'s only job is the endpoint-agent device join, which belongs on the roster row once |
-| `host`/`actor_email` stored alongside the chunk | sent to the API, mapped to a random `log_source_id`, **never forwarded to Axiom** | the privacy boundary is Rogue→Axiom, not plugin→Rogue |
+| `host`/`actor_email` stored alongside the chunk | sent to the API, mapped to a random `log_source_id`, **never forwarded to the log store** | the privacy boundary is Rogue→log store, not plugin→Rogue |
 | `$HOME` → `~` rewritten in the scripts | **redaction is server-side** | policy belongs where it is readable and testable, and can change without a plugin release |
 | `<slug>.offset`, rotation detected by `size < offset` | `<key>.state` with `offset=` **and** `head=` (first line) | `size < offset` alone silently skips the new file's first `offset` bytes when a rotated log grows past the old offset before the next run |
 | one chunk per run, 3600 s throttle | chunks loop until drained, 900 s throttle | a 10 MiB generation at 1 MiB/run would take ten runs to catch up |
@@ -98,9 +109,9 @@ What changed, so a reader of the old version is not surprised:
 The two sections above — **what the log is worth** and **why the plugin can
 attribute its own logs** — still hold and are the motivation for that spec.
 
-## Phase 3 — `CodingAgentLogUpload` task worker (rogue-endpoint)
+## Phase 3 — coding-agent log-upload task worker (endpoint agent)
 
-Capability B, in the `qualifire/rogue-endpoint` repo. Independent of phase 2:
+Capability B, in the endpoint agent. Independent of phase 2:
 it needs nothing from the plugins and the plugins need nothing from it.
 
 Its distinct value over the plugin shipper is the reason to build it anyway: it
@@ -108,15 +119,15 @@ is **pulled on demand** by the backend rather than pushed on a session that may
 not happen for days, it uploads the **whole file** rather than the tail past an
 offset, and it carries a real `machine_id`.
 
-New file `src-tauri/src/tasks/coding_agent_log_upload_worker.rs`, registered in
-`TaskRegistry::default()`, with `TaskType::CodingAgentLogUpload` added to the enum
+A new task worker module, registered in
+the task registry, with a new task type added to its enum.
 (`#[serde(other)] Unknown` already covers older agents, so an older install
 reports `unsupported` instead of breaking). From
-`src-tauri/src/tasks/task_worker.rs`: tasks are backend-dispatched — the agent
+the agent's task worker: tasks are backend-dispatched — the agent
 polls, receives a `PendingTask` (`id`, `type`, `task_key`, `payload`), runs a
 `TaskWorker`, and reports `Running → Uploaded → Succeeded | AgentFailed |
 AgentTimeout | Unsupported`. (`Uploaded` **is** a real variant of `TaskStatus`
-alongside the other five — `src-tauri/src/tasks/task_worker.rs:25-34`, used by
+alongside the other five, used by
 `adhoc_scan_upload_worker.rs:172`. An earlier version of this list omitted it and
 then used it in the flow below.) An install is per-machine and the backend addresses one at a time,
 which is literally "a task that runs on a single computer in a fleet".
@@ -156,8 +167,7 @@ plugin shipper this side has a real JSON serialiser, so it parses the lines
 itself into the same record shape the server produces from `content_b64`:
 
 > **Batching is not optional, and `max_bytes` alone does not cover it.**
-> `LogShipBodySchema` caps `records` at **1000 items**
-> (`apps/rogue-aispm-api/src/routers/endpoint-logs.schema.ts:12`). A 5 MiB hook log
+> the existing endpoint-log upload schema caps `records` at **1000 items**. A 5 MiB hook log
 > is on the order of 65k lines, so a single-request upload is rejected outright.
 > The worker must batch by **record count as well as bytes** — 1000 records per
 > request, looping — or the task needs its own endpoint and schema. This is the
@@ -180,11 +190,11 @@ records**, not a failure — the common case is a machine with no coding agent
 installed. Only an unreadable-but-present file or a failed POST is `AgentFailed`.
 
 > **`Succeeded` currently over-claims, and the route is why.**
-> `forwardEndpointLogs` (`apps/rogue-aispm-api/src/services/endpoint-logs-sink.ts`)
-> calls `axiomClient.ingest(...)` **without `await`** inside its `try/catch` — so an
+> the existing endpoint-log sink fires the store
+> client's ingest **without `await`** inside its `try/catch` — so an
 > async rejection is not even caught — and returns `accepted: events.length`
-> unconditionally, including when `axiomClient` is null or
-> `AXIOM_ENDPOINT_LOGS_DATASET` is unset. A 2xx therefore does not mean the records
+> unconditionally, including when the store client is absent or
+> its dataset variable is unset. A 2xx therefore does not mean the records
 > landed. For a fire-and-forget tracing sink that is a defensible trade; for an
 > **on-demand support collection** it means the task reports `Succeeded` while the
 > logs someone asked for were dropped.
@@ -202,7 +212,7 @@ lose lines.
 
 ## Open questions for the backend
 
-- ~~**One store or two?**~~ **Settled:** hook logs go to their own Axiom dataset.
+- ~~**One store or two?**~~ **Settled:** hook logs go to their own dataset in the log store.
 - ~~**Dedup key.**~~ **Settled:** duplicates are acceptable for diagnostics on an
   append-only store, so neither client does dedup work. A query can collapse on
   `(log_source_id, log_file, ts, raw)` if it ever matters.
@@ -210,7 +220,7 @@ lose lines.
   upload verbatim, so redaction is entirely server-side, and it must run over
   **every** parsed field plus the raw line — the log format carries `path=`
   (absolute transcript paths) and `name=` (subagent display names) as well as
-  `raw=`. `endpoint-logs-redact.ts`'s `redactEvent`/`redactString` already walk
+  `raw=`. the endpoint agent's redaction helpers already walk
   every string value and rewrite home paths; reuse them. Neither covers `name=` (not
   a path) or the `raw=` policy, so those two need an explicit decision.
 - **The shared env-file chain is sourced without any ownership or permission check**,
@@ -223,7 +233,7 @@ lose lines.
   tool calls) and a one-script check is a false sense of coverage. Wants its own PR: a
   `safe_source` helper in sh, PowerShell and Node, refusing world-writable and
   non-root-owned system paths, with tests. Not a blocker for either capability here.
-- **`log_source` needs a table, not a hash.** Axiom rows carry a random
+- **`log_source` needs a table, not a hash.** Log-store rows carry a random
   `log_source_id` resolved from `(org_id, hostname, actor_email, agent_family)`. A
   plain hash of those was the first proposal and is not a privacy boundary — work
   emails and hostnames are low-entropy enough inside one org to dictionary in
@@ -231,9 +241,9 @@ lose lines.
   deleting the mapping row leaves the events unlinkable. See
   [plugin-log-shipper.md](plugin-log-shipper.md) §9.
 - **Does a 2xx from the log routes mean durably ingested?** Today it does not (see
-  the `forwardEndpointLogs` note in phase 3). The plugin shipper advances its offset
+  the endpoint-log sink note in phase 3). The plugin shipper advances its offset
   on 2xx and forgets those bytes forever, so `/hooks/logs` must await its ingest and
   fail the request on error. This is a correctness requirement, not a preference.
-- Should a `CodingAgentLogUpload` assignment be creatable from the dashboard
+- Should a log-upload assignment be creatable from the dashboard
   (support clicks "collect logs" on a machine), or only by internal tooling? That
   decides whether B needs UI work at all.

@@ -292,8 +292,25 @@ check "the heartbeat reported an actor at all" "yes" \
   "$([ -n "$heartbeat_actor" ] && echo yes || echo no)"
 check "the upload reports the SAME actor, not a re-resolved one" "$heartbeat_actor" \
   "$(envelope_field logs actor_email)"
-_prod="$(grep -c 'api.rogue.security' "$SB/recv.out" 2>/dev/null)"
-check "nothing reached production" "0" "${_prod:-0}"
+# The old form here grepped the RECEIVER's stdout for `api.rogue.security`, which
+# it can never print - a request to production does not pass through this process,
+# so the assertion returned 0 whether or not one had been made, and passed for the
+# wrong reason. What IS observable locally is the precondition: every configuration
+# the session can read must name the local receiver. If one does not, a request to
+# production is possible, and that is the thing worth failing on.
+_prod_cfg=0
+for _cfg in "$HOME/.rogue-env" "$PLUGIN_ROOT/env" /etc/rogue/env; do
+  [ -r "$_cfg" ] || continue
+  grep -q 'ROGUE_BASE_URL' "$_cfg" 2>/dev/null || continue
+  grep 'ROGUE_BASE_URL' "$_cfg" | grep -q '127\.0\.0\.1\|localhost' || _prod_cfg=$((_prod_cfg + 1))
+done
+check "no config the session reads points at a non-local host" "0" "$_prod_cfg"
+check "the session's own base URL is the local receiver" "yes" \
+  "$(case "$BASE" in http://127.0.0.1:*) echo yes ;; *) echo no ;; esac)"
+# And the envelopes must have arrived HERE: a run where the local receiver saw
+# nothing is a run where nothing can be said about where the traffic went.
+check "the local receiver actually received the upload" "yes" \
+  "$([ -s "$RECV/envelopes.jsonl" ] && echo yes || echo no)"
 
 echo
 [ "$fails" = 0 ] && echo "LIVE TEST PASSED" || echo "$fails failure(s)"

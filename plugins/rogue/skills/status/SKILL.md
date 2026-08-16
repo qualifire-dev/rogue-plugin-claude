@@ -236,14 +236,23 @@ else {
   "using $ship"
   $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
   $env:ROGUE_SHIPPER_SCRIPT = $ship
+  # PASS THE ROOT. On a no-argument run the shipper self-locates its plugin root to
+  # read <root>\env, the FIRST file in the credential chain - and $PSCommandPath is
+  # EMPTY under [scriptblock]::Create, so it falls back to the current directory,
+  # which is the operator's cwd and has no env file. The bundled ROGUE_BASE_URL is
+  # then missed and identity can be absent entirely (outcome=skip reason=no-actor),
+  # on the one command support asks them to run. heartbeat.ps1 passes it for the
+  # same reason. The slug stays unset, which is what keeps this the
+  # collect-everything support invocation.
+  $env:ROGUE_SHIPPER_ROOT = Split-Path (Split-Path $ship -Parent) -Parent
   $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
-    '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))'))
+    '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT))) $env:ROGUE_SHIPPER_ROOT'))
   Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
     -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
   # One run only. The bash form scopes these to a single command; setting them as
   # session variables would leave later runs from this session with the 15-minute
   # throttle waived and debug output on.
-  Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT -ErrorAction SilentlyContinue
+  Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT, Env:ROGUE_SHIPPER_ROOT -ErrorAction SilentlyContinue
 }
 ```
 
