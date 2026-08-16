@@ -347,8 +347,10 @@ $snippetRoot = Join-Path $sandbox 'plugintree'
 New-Item -ItemType Directory -Path (Join-Path $snippetRoot 'scripts') -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'plugins\rogue\scripts\ship-logs.ps1') `
           -Destination (Join-Path $snippetRoot 'scripts\ship-logs.ps1') -Force
+# `e2e-key` because that is what the receiver accepts (E2E_API_KEY above); the point
+# of the case is WHERE the credentials came from, not what they are.
 [System.IO.File]::WriteAllText((Join-Path $snippetRoot 'env'),
-    "export ROGUE_API_KEY='snippet-key'`nexport ROGUE_BASE_URL='$baseUrl'`n",
+    "export ROGUE_API_KEY='e2e-key'`nexport ROGUE_BASE_URL='$baseUrl'`n",
     (New-Object System.Text.UTF8Encoding($false)))
 
 # The block is READ OUT OF THE DOCUMENT, not retyped here: a copy would drift from
