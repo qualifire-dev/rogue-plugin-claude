@@ -67,13 +67,25 @@ const LOG_FILE = ENV.ROGUE_LOG_FILE || path.join(LOG_DIR, `${PROVIDER}.log`);
 // rotation; a NON-NUMERIC value falls back to the default rather than disabling
 // it, so a typo can never leave the log growing unbounded. `Number("00") === 0`,
 // so any zero-padded zero disables too — matching the sh dispatchers' `-gt 0`
-// test and PowerShell's [int64] cast.
+// test and PowerShell's [int64]::TryParse.
 // Enforced on the WRITE PATH and not by a periodic job on purpose: an
 // UNCONFIGURED install writes a line per event and never runs anything else, so
 // a cap enforced anywhere else would not hold.
-const LOG_MAX_BYTES = /^\d+$/.test(ENV.ROGUE_LOG_MAX_BYTES ?? "")
-  ? Number(ENV.ROGUE_LOG_MAX_BYTES)
-  : 10 * 1024 * 1024;
+//
+// isSafeInteger, not a bare Number(): an all-digit value can be far too wide to
+// represent, and Number() turns those into Infinity, which no file size ever
+// reaches — rotation would be silently off and the log would grow unbounded.
+// An unrepresentable value is a typo, so it takes the default like a
+// non-numeric one. The sh dispatchers clamp at 18 digits against the identical
+// bug (dash calls it an "Illegal number" and answers FALSE); PowerShell already
+// landed on the default because its cast error is silenced, and uses TryParse
+// so that is stated rather than accidental.
+const LOG_MAX_BYTES = (() => {
+  const n = /^\d+$/.test(ENV.ROGUE_LOG_MAX_BYTES ?? "")
+    ? Number(ENV.ROGUE_LOG_MAX_BYTES)
+    : NaN;
+  return Number.isSafeInteger(n) ? n : 10 * 1024 * 1024;
+})();
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
 const sanitize = (s) => String(s ?? "").replace(CONTROL_CHARS, "");
@@ -89,10 +101,17 @@ function rotateLog() {
 }
 function log(msg) {
   try {
-    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    // 0700 dir / 0600 file, matching the `umask 077` the sh dispatchers use.
+    // The log carries the server's block reason, which quotes the content that
+    // tripped the rule, so it must not land 0644 where every other account on
+    // the box can read it. `mode` applies only when this call CREATES the path,
+    // so an existing log from an older version keeps its mode (and Windows
+    // ignores it, which is fine: another standard user cannot read the profile
+    // directory anyway).
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true, mode: 0o700 });
     rotateLog();
     const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    fs.appendFileSync(LOG_FILE, `${ts} provider=${PROVIDER} event=${EVENT} ${msg}\n`);
+    fs.appendFileSync(LOG_FILE, `${ts} provider=${PROVIDER} event=${EVENT} ${msg}\n`, { mode: 0o600 });
   } catch {
     /* logging is best-effort */
   }

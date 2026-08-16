@@ -67,7 +67,9 @@ Upgrades: re-run the one-line installer.
 Run `/status`. You should see HTTP 200 against the ping endpoint, your active
 rulesets, and a tail of recent hook activity (`~/.rogue/logs/antigravity.log` —
 each Rogue plugin logs to its own file, capped at 10 MiB with one `.1` rotation
-kept).
+kept). `ROGUE_LOG_MAX_BYTES` overrides that cap and `0` turns rotation off;
+`ROGUE_LOG_FILE` / `ROGUE_LOG_DIR` relocate the log. All three are read from
+`~/.rogue-env` (or `/etc/rogue/env`), with the process environment winning.
 
 ## Uninstall
 

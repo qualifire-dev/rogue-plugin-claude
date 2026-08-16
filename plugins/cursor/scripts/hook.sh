@@ -106,6 +106,17 @@ ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/cursor.log}"
 ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
 # Clamp per the rule above: anything non-numeric becomes the default.
 case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
+# An all-digit value can still overflow the shell's integer type: dash answers
+# `[ "$cap" -gt 0 ]` with "Illegal number" on stderr and a FALSE, which reads
+# as "rotation disabled" and lets the log grow unbounded. Node has the same
+# bug through Number() -> Infinity; PowerShell is the only one that already
+# lands on the default, and only because its cast error is silenced. All
+# three clamp explicitly now. 18 digits is the widest value guaranteed to fit
+# a signed 64-bit int; leading zeros are stripped first so "000...0" still
+# reads as the rotation-disabling zero.
+_lcap="$ROGUE_LOG_MAX_BYTES"
+while [ "${_lcap#0}" != "$_lcap" ]; do _lcap="${_lcap#0}"; done
+if [ "${#_lcap}" -gt 18 ]; then ROGUE_LOG_MAX_BYTES=10485760; fi
 rotate_log() {
   [ -f "$ROGUE_LOG_FILE" ] || return 0
   # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
@@ -118,10 +129,18 @@ rotate_log() {
   return 0
 }
 log() {
-  mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
-  rotate_log
-  printf '%s provider=cursor event=%s %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
+  # 0700 dir / 0600 file. The logged text is not only ours: it carries the
+  # server's block reason, which quotes the content that tripped the rule - a
+  # secret, a command, a slice of a prompt. Under the default umask the log
+  # lands 0644 and every other account on the box can read it. The umask
+  # applies to what THIS call creates, so a 0644 log from an older version
+  # keeps its mode; Windows needs no counterpart, since another standard user
+  # cannot read %USERPROFILE% to begin with.
+  ( umask 077
+    mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+    rotate_log
+    printf '%s provider=cursor event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 # Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
 # can carry anything), and a raw newline or CR would forge extra log lines.

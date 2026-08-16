@@ -91,8 +91,8 @@ function ConvertFrom-ShellQuoted {
 # reading a script variable from a function is implicit, but ASSIGNING one needs
 # the `$script:` prefix or the write lands in a function-local copy and silently
 # vanishes. Every write to shared state below is therefore `$script:`-qualified.
-$logFile     = ''       # resolved in Initialize-Logging
-$logMaxBytes = 10485760  # ditto; the default stands until then
+$script:logFile     = ''       # resolved in Initialize-Logging
+$script:logMaxBytes = 10485760  # ditto; the default stands until then
 $creds      = @{}  # credential files + process env, by Import-Credentials
 $apiKey     = ''
 $url        = ''
@@ -165,7 +165,17 @@ function Initialize-Logging {
     # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
     # zero disables too — matching hook.sh's `-gt 0` test).
     $cap = $Creds['ROGUE_LOG_MAX_BYTES']
-    if ($cap -match '^[0-9]+$') { $script:logMaxBytes = [int64]$cap }
+    # TryParse, NOT a plain [int64] cast: the cast raises "Value was either too
+    # large or too small for an Int64" on an all-digit value too wide for 64
+    # bits. The file-scope $ErrorActionPreference = 'SilentlyContinue' swallows
+    # that error and the assignment is skipped, so the cap happens to keep its
+    # default - the right answer, but reached by accident and invisible if the
+    # preference ever changes. TryParse states the fallback instead, and keeps
+    # this reading like the other two dispatchers, where the same input IS a
+    # live bug (sh disables rotation, Node yields Infinity). '00' still parses
+    # to 0, so a zero-padded zero keeps disabling rotation.
+    $capValue = [int64]0
+    if ($cap -match '^[0-9]+$' -and [int64]::TryParse($cap, [ref]$capValue)) { $script:logMaxBytes = $capValue }
     else { $script:logMaxBytes = 10485760 }
 }
 
