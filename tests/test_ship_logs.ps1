@@ -125,6 +125,10 @@ Check 'negative -> default'             '900' ([string](Get-NumberOrDefault '-5'
 Check 'zero with allowZero -> zero'     '0'   ([string](Get-NumberOrDefault '0' 900 1))
 Check 'zero without allowZero -> default' '1024' ([string](Get-NumberOrDefault '0' 1024 0))
 Check 'a real value is kept'            '42'  ([string](Get-NumberOrDefault '42' 900 1))
+# All digits, but too wide for an Int64. A plain [int64] cast raises here, and
+# this file runs under SilentlyContinue, so the value would land $null and
+# compare as smaller than every byte count it gates.
+Check 'unrepresentable -> default'      '1024' ([string](Get-NumberOrDefault ('9' * 400) 1024 0))
 # SHIPPING IS OPT-IN until /api/v1/hooks/logs is deployed, so the flag reads the
 # other way round from every knob above: unset is OFF, and only a numeric non-zero
 # value turns it on. Zero-padding counts as zero, matching phase 1's rotation cap,

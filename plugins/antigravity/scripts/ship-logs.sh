@@ -328,6 +328,16 @@ load_env() {
 # means "no throttle" and the documented support one-liner relies on it.
 number_or_default() { # <value> <default> <allow-zero:0|1>
   case "${1:-}" in ''|*[!0-9]*) printf '%s' "${2:-0}"; return 0 ;; esac
+  # All digits is not the same as representable: `[ "$1" -le 0 ]` on a value
+  # wider than a signed 64-bit int makes dash print "Illegal number" to stderr
+  # and answer FALSE, so the absurd value would sail through as a byte budget
+  # and every later comparison against it would fail the same way. 18 digits is
+  # the widest that always fits; strip leading zeros first so a padded zero is
+  # still judged on its value. Same clamp the dispatchers apply to
+  # ROGUE_LOG_MAX_BYTES, for the same reason.
+  _num_digits=$1
+  while [ "${_num_digits#0}" != "$_num_digits" ]; do _num_digits="${_num_digits#0}"; done
+  if [ "${#_num_digits}" -gt 18 ]; then printf '%s' "${2:-0}"; return 0; fi
   if [ "${3:-0}" != 1 ] && [ "$1" -le 0 ]; then printf '%s' "${2:-0}"; return 0; fi
   printf '%s' "$1"
 }

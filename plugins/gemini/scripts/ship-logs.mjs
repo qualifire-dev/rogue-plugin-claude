@@ -107,7 +107,12 @@ function loadEnv(pluginRoot) {
 // the documented support one-liner relies on it.
 function numberOrDefault(value, fallback, allowZero) {
   if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return fallback;
+  // All digits is not the same as representable: Number() turns a value wider
+  // than 2^53 into an imprecise float and a long enough one into Infinity,
+  // which no byte count ever reaches. Fall back, matching the sh copy's
+  // 18-digit clamp and the PowerShell copy's TryParse.
   const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return fallback;
   if (!allowZero && parsed <= 0) return fallback;
   return parsed;
 }

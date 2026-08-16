@@ -368,7 +368,14 @@ function Import-ShipEnv {
 function Get-NumberOrDefault {
     param([string]$Value, [int64]$Default, [int]$AllowZero = 0)
     if ($Value -notmatch '^[0-9]+$') { return $Default }
-    $parsed = [int64]$Value
+    # TryParse, not a cast: [int64] on an all-digit value wider than 64 bits
+    # raises "Value was either too large or too small for an Int64", and this
+    # script runs under $ErrorActionPreference = 'SilentlyContinue', so the
+    # error would vanish and $parsed would stay $null - which then compares as
+    # less than everything. Fall back to the default instead, matching the sh
+    # copy's 18-digit clamp.
+    $parsed = [int64]0
+    if (-not [int64]::TryParse($Value, [ref]$parsed)) { return $Default }
     if ($AllowZero -ne 1 -and $parsed -le 0) { return $Default }
     return $parsed
 }
