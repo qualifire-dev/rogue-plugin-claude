@@ -195,6 +195,20 @@ jobs:
           SH=dash sh tests/test_ship_logs.sh
           SH=bash bash tests/test_ship_logs.sh
 
+      - name: Beacon throttle contract (sh)
+        # The Stop trigger fires once per TURN, so this throttle is the only thing
+        # between it and a /hooks/status POST on every turn of every session in a
+        # fleet. Its failure modes are asymmetric and both bad: too loose floods the
+        # backend, too tight silences a machine's presence entirely - which on the
+        # roster is indistinguishable from an uninstalled plugin. Both shells, same
+        # reason as above: dash is what Claude Code actually invokes hooks with, and
+        # the int64 clamp exists precisely because dash answers `-lt` on an oversized
+        # value with "Illegal number" and a FALSE.
+        run: |
+          set -euo pipefail
+          SH=dash sh tests/test_heartbeat_sh.sh
+          SH=bash bash tests/test_heartbeat_sh.sh
+
       - name: Log-shipper end to end (real HTTP)
         # The contract suite above stubs `curl`, so it can only assert what the
         # shipper WOULD send. This one runs the real pipeline - real dispatcher, real
@@ -276,6 +290,7 @@ jobs:
           pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
           pwsh -NoProfile -File tests/test_hook_logs.ps1
           pwsh -NoProfile -File tests/test_ship_logs.ps1
+          pwsh -NoProfile -File tests/test_heartbeat_ps1.ps1
 
   windows:
     # The job the seam CANNOT stand in for. Every PowerShell test in the job above
@@ -321,4 +336,6 @@ jobs:
           powershell -NoProfile -File tests/test_hook_logs.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_ship_logs.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_heartbeat_ps1.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
