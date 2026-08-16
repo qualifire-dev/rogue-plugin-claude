@@ -139,8 +139,8 @@ function Repair-DoubleEncodedUtf8 {
 # would make the log shipper and the dispatcher disagree on the path.
 # Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
 # dot-source the helpers, and so Log is safe to call before initialisation.
-$logFile = $null
-$logMaxBytes = 10485760
+$script:logFile = $null
+$script:logMaxBytes = 10485760
 
 function Initialize-Logging {
     # $Creds is the merged credential map (bundled env → MDM → per-user file, then
@@ -164,7 +164,17 @@ function Initialize-Logging {
     # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
     # zero disables too — matching hook.sh's `-gt 0` test).
     $cap = $Creds['ROGUE_LOG_MAX_BYTES']
-    if ($cap -match '^[0-9]+$') { $script:logMaxBytes = [int64]$cap }
+    # TryParse, NOT a plain [int64] cast: the cast raises "Value was either too
+    # large or too small for an Int64" on an all-digit value too wide for 64
+    # bits. The file-scope $ErrorActionPreference = 'SilentlyContinue' swallows
+    # that error and the assignment is skipped, so the cap happens to keep its
+    # default - the right answer, but reached by accident and invisible if the
+    # preference ever changes. TryParse states the fallback instead, and keeps
+    # this reading like the other two dispatchers, where the same input IS a
+    # live bug (sh disables rotation, Node yields Infinity). '00' still parses
+    # to 0, so a zero-padded zero keeps disabling rotation.
+    $capValue = [int64]0
+    if ($cap -match '^[0-9]+$' -and [int64]::TryParse($cap, [ref]$capValue)) { $script:logMaxBytes = $capValue }
     else { $script:logMaxBytes = 10485760 }
 }
 

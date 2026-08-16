@@ -205,6 +205,42 @@ for slug in $SLUGS; do
 done
 
 echo
+echo "== an oversized cap falls back to the default, it does NOT disable rotation"
+# dash's `[ "$cap" -gt 0 ]` prints "Illegal number" to stderr and answers FALSE
+# (rotation off, log unbounded) and Node's Number() yields Infinity, which no
+# file size ever reaches - both are live bugs. PowerShell already landed on the
+# default, but only because its cast error is swallowed by
+# $ErrorActionPreference = 'SilentlyContinue'. Seeded just over 10 MiB so
+# "clamped to the default" is distinguishable from "disabled".
+_huge=$(: ; i=0; v=''; while [ "$i" -lt 400 ]; do v="${v}9"; i=$((i + 1)); done; printf '%s' "$v")
+for slug in $SLUGS; do
+  home="$TMPROOT/caphuge-$slug"; mkdir -p "$home/.rogue/logs"
+  logf="$home/.rogue/logs/$slug.log"
+  head -c 10485761 /dev/zero | tr '\0' 'x' > "$logf"
+  fire "$slug" "$home" "ROGUE_LOG_MAX_BYTES=$_huge"
+  rotated=$([ -e "$logf.1" ] && echo yes || echo no)
+  check "$slug clamps an unrepresentable cap to the 10 MiB default" "yes" "$rotated"
+done
+
+echo
+echo "== the log is not world-readable"
+# The line carries the server's block reason, which quotes the content that
+# tripped the rule, so a default-umask 0644 log would expose it to every other
+# account on the box. Dir 0700, file 0600. Windows has no counterpart: another
+# standard user cannot read %USERPROFILE%.
+for slug in $SLUGS; do
+  home="$TMPROOT/perm-$slug"; mkdir -p "$home"
+  fire "$slug" "$home"
+  logf="$home/.rogue/logs/$slug.log"
+  # `ls -l` not `stat`: BSD and GNU stat take different flags (same reason the
+  # dispatchers size the log with `wc -c`).
+  fmode=$(ls -l "$logf" 2>/dev/null | cut -c1-10)
+  dmode=$(ls -ld "$home/.rogue/logs" 2>/dev/null | cut -c1-10)
+  check "$slug log file is owner-only" "-rw-------" "$fmode"
+  check "$slug log dir is owner-only" "drwx------" "$dmode"
+done
+
+echo
 echo "== rotation replaces an EXISTING .1 rather than failing"
 for slug in $SLUGS; do
   home="$TMPROOT/rot2-$slug"; mkdir -p "$home/.rogue/logs"

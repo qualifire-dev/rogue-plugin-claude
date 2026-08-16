@@ -142,6 +142,16 @@ foreach ($c in $cases) {
     Check "$($c.slug) cap 00 also reads as zero" '0' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = '00' })['CAP']
     # A typo must NOT silently disable the disk cap.
     Check "$($c.slug) non-numeric cap falls back to the default" '10485760' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = 'abc' })['CAP']
+    # All digits, but far too wide for a signed 64-bit int. This case PASSED
+    # before the fix too, and that is the point of keeping it: the plain [int64]
+    # cast raised an error, $ErrorActionPreference = 'SilentlyContinue' ate it,
+    # the assignment was skipped and the cap kept its default by accident. It
+    # pins the value so a future change (a different preference, a different
+    # initial value) cannot turn the accident into rotation-off. The sh
+    # dispatchers' 18-digit clamp and Node's isSafeInteger reach the same
+    # number deliberately, where the same input WAS a live bug.
+    $huge = '9' * 400
+    Check "$($c.slug) unrepresentable cap falls back to the default" '10485760' (Invoke-Probe -Case $c -CaseHome $h -Creds @{ ROGUE_LOG_MAX_BYTES = $huge })['CAP']
 }
 
 Write-Host ""
@@ -152,8 +162,12 @@ foreach ($c in $cases) {
     # A UTC ISO-8601 second-precision stamp with no fractional part: the shipper's
     # line splitter and the backend's parser both key off it.
     $want = "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z provider=$($c.slug) event=$($c.event) outcome=probe$"
-    if ($f['LAST'] -match $want) { Pass "$($c.slug) line is '<ts> provider=$($c.slug) event=$($c.event) …'" }
-    else { Fail "$($c.slug) line shape [$($f['LAST'])]" }
+    # The FIRST physical line, not $f['LAST']: a dispatcher that emitted a
+    # leading blank line (or any preamble) would still put a well-formed record
+    # last and pass. The probe fires one event, so line 0 IS that record.
+    $firstLine = @([System.IO.File]::ReadAllLines($f['LOGFILE']))[0]
+    if ($firstLine -match $want) { Pass "$($c.slug) line is '<ts> provider=$($c.slug) event=$($c.event) …'" }
+    else { Fail "$($c.slug) line shape [$firstLine]" }
     # EF BB BF here would break any parser anchored on the timestamp.
     if ($f['HEAD'] -eq 'EF BB BF') { Fail "$($c.slug) log starts with a UTF-8 BOM" }
     else { Pass "$($c.slug) log has no UTF-8 BOM (head: $($f['HEAD']))" }

@@ -74,7 +74,26 @@ for f in "$HOME/.gemini/extensions/rogue/env" /etc/rogue/env "$HOME/.rogue-env";
 echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
 echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
 echo "--- recent hook activity ---"
-tail -n 20 "${ROGUE_LOG_FILE:-${ROGUE_LOG_DIR:-$HOME/.rogue/logs}/gemini.log}" 2>/dev/null || echo "no hook activity yet"
+# Same precedence as the dispatcher: the env files first (system, then per-user),
+# with the process environment winning over both. Read with sed, never by
+# sourcing - a status command must not execute an env file. Reading only
+# $ROGUE_LOG_* would report "no activity" on exactly the machines that relocate
+# their logs by policy, which are the ones support is called about.
+rogue_log_var() {
+  v=$(sed -n "s/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}$1=//p" \
+        /etc/rogue/env "$HOME/.rogue-env" 2>/dev/null | tail -1 | sed "s/^['\"]//;s/['\"]$//")
+  eval "p=\${$1:-}"
+  [ -n "$p" ] && v=$p
+  printf '%s' "$v"
+}
+log=$(rogue_log_var ROGUE_LOG_FILE)
+if [ -z "$log" ]; then
+  dir=$(rogue_log_var ROGUE_LOG_DIR)
+  [ -n "$dir" ] || dir="$HOME/.rogue/logs"
+  log="$dir/gemini.log"
+fi
+echo "Log: $log"
+tail -n 20 "$log" 2>/dev/null || echo "(no hook log yet)"
 ```
 
 Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
@@ -121,6 +140,13 @@ try {
 } catch { "Status check failed: $($_.Exception.Message)" }
 "Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
 "Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
+# The process environment wins over every file, exactly as it does in the
+# dispatcher - overlay it before deriving the path, or an operator who exported
+# ROGUE_LOG_DIR for this session is told there is no activity.
+foreach ($v in 'ROGUE_LOG_FILE','ROGUE_LOG_DIR') {
+  $pv = [Environment]::GetEnvironmentVariable($v)
+  if ($pv) { $creds[$v] = $pv }
+}
 $logPath = $creds['ROGUE_LOG_FILE']
 if (-not $logPath) {
   $logDir = $creds['ROGUE_LOG_DIR']
