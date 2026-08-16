@@ -598,12 +598,17 @@ read_body() {
 # surfaceFromTranscript). heartbeat.sh alone can only guess from the filesystem,
 # and on a machine with more than one installed it guesses wrong — collapsing
 # every surface into one roster row.
+# Pass the SAME surface the event headers carry (load_install_id, which runs
+# first), never a freshly-derived one. An unattributable payload yields an empty
+# surface, and heartbeat.sh's own fallback then sniffs the filesystem and picks
+# antigravity_cli whenever `agy` is installed — so this event would report
+# `antigravity` while its heartbeat reported `antigravity_cli`, and one install
+# would own two roster rows. One resolution, one row.
 maybe_heartbeat() {
   [ "$EVENT" = "PreInvocation" ] || return 0
   case "$BODY" in
     *'"invocationNum":0'*|*'"invocationNum": 0'*)
-      _hb_agent=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
-      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$_hb_agent" >/dev/null 2>&1 & ) ;;
+      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$ROGUE_INSTALL_AGENT" >/dev/null 2>&1 & ) ;;
   esac
 }
 

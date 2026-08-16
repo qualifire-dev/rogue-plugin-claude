@@ -11,6 +11,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$REPO/plugins/antigravity/scripts/hook.sh"
 ACTOR="$REPO/plugins/antigravity/scripts/actor.sh"
+INSTALL_ID="$REPO/plugins/antigravity/scripts/install-id.sh"
 SH="${TEST_SH:-sh}"
 
 PORT=$((RANDOM % 10000 + 30000))
@@ -199,6 +200,7 @@ STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
+cp "$INSTALL_ID" "$STAGE/scripts/install-id.sh"
 MARKER="$STAGE/heartbeat-fired"
 # The stub records its first argument: the heartbeat is told which surface fired
 # it, because three products share one install and only the hook can tell them
@@ -239,7 +241,12 @@ else
   echo "FAIL [heartbeat launch]: marker file $MARKER was never created" >&2
   exit 1
 fi
-assert_eq "$(cat "$MARKER")" "" "no transcriptPath → no surface passed (heartbeat falls back)"
+# No transcriptPath: the launcher passes the SAME fallback the event headers
+# carry (the 2.0 app), never an empty surface. Handing the heartbeat nothing let
+# it sniff the filesystem and pick antigravity_cli whenever `agy` was installed,
+# so one first-PreInvocation wrote `antigravity` from the event and
+# `antigravity_cli` from the heartbeat: two roster rows for one install.
+assert_eq "$(cat "$MARKER")" "antigravity" "no transcriptPath → heartbeat gets the same fallback surface as the headers"
 
 # The surface rides the transcriptPath: without it every surface on a machine
 # with the CLI installed collapses into one antigravity_cli roster row.
@@ -266,6 +273,7 @@ STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
+cp "$INSTALL_ID" "$STAGE/scripts/install-id.sh"
 MARKER="$STAGE/heartbeat-fired"
 cat > "$STAGE/scripts/heartbeat.sh" <<EOF
 #!/bin/sh
