@@ -228,7 +228,7 @@ foreach ($c in $cases) {
     # it, or `surface=unknown`, would both be worse than saying nothing: a reader
     # cannot tell either from a real value, and every line written by a version
     # before this one has no token at all.
-    $f = Invoke-Probe -Case $c -CaseHome $h -Surface ''
+    $f = Invoke-Probe -Case $c -CaseHome $h -Surface '<none>'   # see log_probe.ps1: 5.1 drops an empty argument
     $wantBare = "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z provider=$($c.slug) event=$($c.event) outcome=probe$"
     if (@([System.IO.File]::ReadAllLines($f['LOGFILE']))[-1] -match $wantBare) {
         Pass "$($c.slug) omits the token when the surface is unknown"

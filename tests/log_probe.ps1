@@ -24,6 +24,10 @@ param(
     [string]$CredsB64 = '',                      # base64 of a JSON object of ROGUE_* values
     [int]$SeedBytes = 0,                         # >0: pre-fill the log
     [string]$SeedPrevious = '',                  # non-empty: also create <log>.1
+    # '<default>' = leave the dispatcher's own value alone; '<none>' = force it
+    # EMPTY. A literal '' cannot be used for the second case: Windows PowerShell 5.1
+    # DROPS an empty native-command argument, so `-Surface ''` reaches this script as
+    # a bare `-Surface` and fails to bind ("Missing an argument for parameter").
     [string]$Surface = '<default>'               # override $script:surface before Log
 )
 
@@ -70,7 +74,9 @@ if ($SeedBytes -gt 0) {
 # explicitly so the EMIT shape - token present, token omitted - is testable; the
 # resolution itself is covered separately, against surface.ps1 and against the
 # main body's wiring.
-if ($surfaceOverride -ne '<default>') { $script:surface = $surfaceOverride }
+if ($surfaceOverride -ne '<default>') {
+    $script:surface = if ($surfaceOverride -eq '<none>') { '' } else { $surfaceOverride }
+}
 "SURFACE=$($script:surface)"
 
 Log 'outcome=probe'
