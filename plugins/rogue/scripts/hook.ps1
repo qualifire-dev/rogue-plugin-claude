@@ -221,6 +221,30 @@ if (-not $actorEmail) {
     else { $actorEmail = $env:COMPUTERNAME }
 }
 
+# -- install identity: host + version + surface label ------------------------
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only heartbeat.ps1 ever sent them, once, at session start. A session still
+# working a day later therefore aged out as disconnected. Sending the same three
+# as headers on EVERY event lets the backend refresh this exact row from ordinary
+# hook traffic. Resolved exactly as heartbeat.ps1 does (its sh sibling shares
+# scripts/install-id.sh instead; PowerShell has no such seam here). Any drift
+# between the two is a duplicate roster row.
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = 'unknown' } }
+
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $pluginRoot '.claude-plugin\plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $pluginJson), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+    if ($m.Success) { $pluginVersion = $m.Groups[1].Value }
+}
+
+# Family is the fixed enum "claude"; the surface is this free-form display label.
+$entrypoint = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
+if ($entrypoint -like '*cowork*')      { $installAgent = 'Claude Cowork' }
+elseif ($entrypoint -like '*desktop*') { $installAgent = 'Claude Code - Desktop' }
+else                                   { $installAgent = 'Claude Code - CLI' }
+
 # -- payload from stdin -----------------------------------------------------
 $payload = [Console]::In.ReadToEnd()
 if (-not $payload) { $payload = '{}' }
@@ -242,6 +266,9 @@ $headers = @{
     'x-rogue-event'       = $EventName
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
+    'x-rogue-agent'       = $installAgent
 }
 $url = "$baseUrl/api/v1/hooks/claude"
 Dbg "POST $url actor=$actorEmail"

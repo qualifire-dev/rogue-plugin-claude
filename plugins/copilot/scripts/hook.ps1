@@ -501,15 +501,36 @@ if ($EventName -eq 'agentStop' -or $EventName -eq 'subagentStop') {
     } catch { Dbg "transcript augment failed: $($_.Exception.Message)" }
 }
 
+# ── install identity: host + version ───────────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only heartbeat.ps1 ever sent them, once, at session start. A session still
+# working a day later therefore aged out as disconnected. Sending them as headers
+# on EVERY event lets the backend refresh this exact row from ordinary hook
+# traffic. Resolved exactly as heartbeat.ps1 does (its sh sibling shares
+# scripts/install-id.sh instead; PowerShell has no such seam here). Any drift
+# between the two is a duplicate roster row.
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = 'unknown' } }
+
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $PluginRoot 'plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $pluginJson), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+    if ($m.Success) { $pluginVersion = $m.Groups[1].Value }
+}
+
 # ── POST (fail-open) → relay verbatim ──────────────────────────────────────
 $headers = @{
     'x-rogue-api-key'     = $apiKey
     'x-rogue-event'       = $EventName
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
+    'x-rogue-agent'       = 'github_copilot'
 }
 # The subagent tag rides in the BODY (agentId/agentNameB64 — see Add-AgentTag), so
-# every event POSTs the same four headers. The local $subagent* variables keep
+# every event POSTs the same fixed headers. The local $subagent* variables keep
 # Copilot's own terminology, since Copilot is what calls these subagents; the wire
 # field names match the backend's agentId/agentName and the
 # aidr_message.agent_id/agent_name columns they land in.

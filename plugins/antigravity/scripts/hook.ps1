@@ -714,13 +714,41 @@ function Add-CapabilityFlag {
     } catch { Dbg "capability flag failed: $($_.Exception.Message)" }
 }
 
+# This install's fleet identity: host + version (from the bundled VERSION file,
+# NOT plugin.json — the Antigravity manifest schema is additionalProperties:false
+# with no version field) + the surface off this event's transcriptPath. Mirrors
+# heartbeat.ps1's Resolve-Version / Resolve-Surface, and must keep mirroring them:
+# the roster keys a row on host + actor + family + agent, so any drift between the
+# two senders is a duplicate row for one install.
+function Get-InstallId {
+    $h = $env:COMPUTERNAME
+    if (-not $h) { try { $h = [System.Net.Dns]::GetHostName() } catch { $h = 'unknown' } }
+    $v = 'unknown'
+    $versionFile = Join-Path $PluginRoot 'VERSION'
+    if (Test-Path -LiteralPath $versionFile) {
+        try {
+            $first = Get-Content -LiteralPath $versionFile -TotalCount 1
+            if ($first) { $v = $first.Trim() }
+        } catch {}
+    }
+    $a = Get-AntigravitySurface $script:payloadTp
+    if (-not $a) { $a = 'antigravity' }
+    return @{ host = $h; version = $v; agent = $a }
+}
+
 # ── POST (fail-open) → relay verbatim ──────────────────────────────────────
 function Invoke-Post {
+    # Sent on every event so the roster row stays fresh between session starts,
+    # which are the only moments heartbeat.ps1 runs. See Get-InstallId.
+    $install = Get-InstallId
     $headers = @{
         'x-rogue-api-key'     = $apiKey
         'x-rogue-event'       = $EventName
         'x-rogue-actor-email' = $actorEmail
         'x-rogue-actor-name'  = $actorName
+        'x-rogue-host'        = $install.host
+        'x-rogue-version'     = $install.version
+        'x-rogue-agent'       = $install.agent
     }
     # The agent tag rides in HEADERS, never in the body: the POSTed event must stay
     # byte-identical to what Antigravity handed us, so the stored raw payload is the

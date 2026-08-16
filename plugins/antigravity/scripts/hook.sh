@@ -567,6 +567,21 @@ load_actor() {
   return 0
 }
 
+# ROGUE_INSTALL_HOST / ROGUE_INSTALL_VERSION (shared with heartbeat.sh) plus the
+# surface, which only this script can resolve — it reads the event's
+# transcriptPath, exactly as the heartbeat's is derived. Sent as headers on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. Called after read_body: the surface needs
+# the payload.
+load_install_id() {
+  [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+  ROGUE_INSTALL_AGENT=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  # Unattributable payload: default to the 2.0 app, the same guess the backend's
+  # parser makes, so the roster row matches the events it stores.
+  [ -n "$ROGUE_INSTALL_AGENT" ] || ROGUE_INSTALL_AGENT="antigravity"
+  return 0
+}
+
 # Buffer stdin so we can enrich it (PreInvocation/PostInvocation/Stop) before
 # POSTing.
 read_body() {
@@ -654,6 +669,9 @@ post_and_relay() {
     -H "x-rogue-event: $EVENT" \
     -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
     -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+    -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+    -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
+    -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
     "$@" \
     -H 'Content-Type: application/json' \
     --data-binary @- --max-time 15 -w '\n%{http_code}')
@@ -689,6 +707,7 @@ main() {
   require_api_key        # exits before stdin is read when there is no key
   load_actor
   read_body
+  load_install_id
 
   maybe_heartbeat
   # Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON

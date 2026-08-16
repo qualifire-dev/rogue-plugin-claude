@@ -32,10 +32,10 @@ if [ -z "${ROGUE_API_KEY:-}" ]; then
 fi
 
 . "${PLUGIN_ROOT}/scripts/actor.sh"
-
-# Surface label (codex_app | codex_cli). Codex sets no app/cli entrypoint var, so
-# the installer pins ROGUE_CODEX_SURFACE per surface; default to codex_cli.
-SURFACE="${ROGUE_CODEX_SURFACE:-codex_cli}"
+# Host + version + surface, resolved exactly as heartbeat.sh does. Sent on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. See install-id.sh.
+. "${PLUGIN_ROOT}/scripts/install-id.sh"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/openai}"
 
@@ -45,7 +45,9 @@ URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks
 RAW=$(curl -sS -X POST "$URL" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "x-rogue-event: $EVENT" \
-  -H "x-rogue-agent: $SURFACE" \
+  -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
+  -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+  -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
   -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
   -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
   -H 'Content-Type: application/json' \

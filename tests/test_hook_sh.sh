@@ -76,6 +76,14 @@ assert_no_header() {
   assert_eq "$actual" "False" "$label"
 }
 
+# Presence-only: the value is this machine's hostname / installed version, so the
+# test can assert it is sent and non-empty but not what it says.
+assert_header_present() {
+  local key="$1" label="$2" actual
+  actual=$(python3 -c 'import json,sys; print(bool(json.load(open(sys.argv[1]))["headers"].get(sys.argv[2])))' "$HEADERS_FILE" "$key")
+  assert_eq "$actual" "True" "$label"
+}
+
 # ── Case 1: PreToolUse deny relayed verbatim + headers ─────────────────────
 start_mock '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"blocked"}}'
 out=$(run_dispatcher PreToolUse '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}')
@@ -85,6 +93,13 @@ assert_header "x-rogue-api-key"     "test-key"         "x-rogue-api-key forwarde
 assert_header "x-rogue-actor-email" "test@example.com" "x-rogue-actor-email forwarded"
 assert_header "x-rogue-actor-name"  "Test User"        "x-rogue-actor-name forwarded (with space)"
 assert_no_header "x-rogue-source"   "no x-rogue-source header (cursor-only)"
+# Fleet-liveness trio: the same host/version/agent the heartbeat sends, on EVERY
+# event, so the roster row is refreshed by ordinary traffic and not only at
+# session start. `agent` is the free-form surface label, and the test harness
+# sets CLAUDE_CODE_ENTRYPOINT=cli. See scripts/install-id.sh.
+assert_header "x-rogue-agent"       "Claude Code - CLI" "x-rogue-agent is the roster's surface label"
+assert_header_present "x-rogue-host"    "x-rogue-host sent on every event"
+assert_header_present "x-rogue-version" "x-rogue-version sent on every event"
 
 # ── Case 2: top-level block relayed + path is /hooks/claude ────────────────
 restart_mock '{"decision":"block","reason":"prompt injection"}'

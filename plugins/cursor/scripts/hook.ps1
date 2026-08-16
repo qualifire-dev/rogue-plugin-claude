@@ -366,6 +366,26 @@ if (-not $actorEmail) {
     else { $actorEmail = $env:COMPUTERNAME }
 }
 
+# ── install identity: host + plugin version ────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only the heartbeat below ever sent those, once, at session start. A session
+# still working a day later therefore aged out as disconnected. Sending the same
+# values as headers on EVERY event lets the backend refresh this exact row from
+# ordinary hook traffic. They must match the heartbeat body's values exactly, or
+# the two writers create two rows for one install.
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { $hostName = 'unknown' }
+
+# Plugin version from the manifest.
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $pluginRoot '.cursor-plugin/plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    try {
+        $v = (Get-Content -Raw -LiteralPath $pluginJson | ConvertFrom-Json).version
+        if ($v -match '^[0-9]+\.[0-9]+\.[0-9]+') { $pluginVersion = $Matches[0] }
+    } catch { Dbg "plugin.json parse failed: $($_.Exception.Message)" }
+}
+
 # ── payload from stdin ─────────────────────────────────────────────────────
 $payload = [Console]::In.ReadToEnd()
 if (-not $payload) { $payload = '{}' }
@@ -402,6 +422,9 @@ $headers = @{
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
     'x-rogue-source'      = 'cursor'
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
+    'x-rogue-agent'       = 'cursor'
 }
 
 $url = "$baseUrl/api/v1/hooks/cursor"
@@ -456,26 +479,16 @@ Emit-Json $resp
 # Creds/actor were already resolved above.
 if ($EventName -eq 'sessionStart') {
     try {
-        # Plugin version from the manifest.
-        $hbVer = 'unknown'
-        $hbPj = Join-Path $pluginRoot '.cursor-plugin/plugin.json'
-        if (Test-Path -LiteralPath $hbPj) {
-            try {
-                $v = (Get-Content -Raw -LiteralPath $hbPj | ConvertFrom-Json).version
-                if ($v -match '^[0-9]+\.[0-9]+\.[0-9]+') { $hbVer = $Matches[0] }
-            } catch { Dbg "plugin.json parse failed: $($_.Exception.Message)" }
-        }
-        $hbHost = $env:COMPUTERNAME
-        if (-not $hbHost) { $hbHost = 'unknown' }
-
         # `agent` is "cursor" (not a display label): the server keys its
         # latest-version lookup (PLUGIN_REPOS) on this value, so the roster can
-        # flag outdated installs.
+        # flag outdated installs. host/version come from the shared block above
+        # so this body and the per-event headers describe the same install
+        # (same fingerprint, one row).
         $hbBody = @{
             agent_family = 'cursor'
             agent        = 'cursor'
-            version      = $hbVer
-            host         = $hbHost
+            version      = $pluginVersion
+            host         = $hostName
             actor_email  = $actorEmail
             actor_name   = $actorName
         } | ConvertTo-Json -Compress
@@ -485,7 +498,7 @@ if ($EventName -eq 'sessionStart') {
             'x-rogue-source'  = 'cursor'
         }
         $hbUrl = "$baseUrl/api/v1/hooks/status"
-        Dbg "heartbeat POST $hbUrl ver=$hbVer host=$hbHost"
+        Dbg "heartbeat POST $hbUrl ver=$pluginVersion host=$hostName"
         $hbBytes = [System.Text.Encoding]::UTF8.GetBytes($hbBody)
         $r = Invoke-WebRequest -Uri $hbUrl -Method Post `
             -Headers $hbHeaders -ContentType 'application/json' -Body $hbBytes `

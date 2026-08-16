@@ -366,6 +366,10 @@ if [ -z "${ROGUE_API_KEY:-}" ]; then
 fi
 
 [ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
+# Host + version + surface, resolved exactly as heartbeat.sh does. Sent on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. See install-id.sh.
+[ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/copilot}"
 
@@ -387,13 +391,16 @@ esac
 # failure curl exits non-zero and the code is 000. Relay the body ONLY on a clean
 # HTTP 200 so an error page (401/404/500) is never handed to Copilot as a decision.
 # The subagent tag rides in the BODY (agentId/agentNameB64 — see
-# augment_with_agent_tag), so every event POSTs the same four headers. The local
+# augment_with_agent_tag), so every event POSTs the same fixed headers. The local
 # SUBAGENT_* variables keep Copilot's own terminology, since Copilot is what calls
 # these subagents; the wire field names match the backend's agentId/agentName and
 # the aidr_message.agent_id/agent_name columns they land in.
 RAW=$(printf '%s' "$BODY" | curl -sS -X POST "$URL" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "x-rogue-event: $EVENT" \
+  -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
+  -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+  -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
   -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
   -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
   -H 'Content-Type: application/json' \

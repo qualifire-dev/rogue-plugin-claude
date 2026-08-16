@@ -65,6 +65,32 @@ export function loadEnvFiles() {
   return merged;
 }
 
+/**
+ * This install's fleet identity: { host, version, agent }.
+ *
+ * heartbeat.mjs sends these in its /hooks/status body; hook.mjs sends the same
+ * three as x-rogue-host / x-rogue-version / x-rogue-agent on EVERY event, which
+ * is what keeps the roster row fresh between session starts (the only time the
+ * heartbeat fires). Resolved in ONE place because the backend keys the row on
+ * host + actor + family + agent: any disagreement between the two senders is a
+ * duplicate row for one install.
+ *
+ * `agent` is the surface and also the PLUGIN_REPOS key the backend resolves the
+ * latest version from, so it stays "gemini_cli".
+ */
+export function installId() {
+  let version = "unknown";
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(EXT_ROOT, "gemini-extension.json"), "utf8"),
+    );
+    if (typeof manifest.version === "string") version = manifest.version;
+  } catch {
+    /* unreadable manifest → "unknown", same as any other unresolved field */
+  }
+  return { host: os.hostname() || "unknown", version, agent: "gemini_cli" };
+}
+
 export function gitConfig(key) {
   try {
     return execFileSync("git", ["config", "--global", key], {

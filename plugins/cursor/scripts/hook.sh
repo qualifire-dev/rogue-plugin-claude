@@ -113,6 +113,25 @@ if [ -z "$actor_email" ]; then
   else actor_email="${_u:-$_h}"; fi
 fi
 
+# ── install identity: host + plugin version ────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only the heartbeat below ever sent those — once, at session start. A
+# session still working a day later therefore aged out as disconnected. Sending
+# the same values as headers on EVERY event lets the backend refresh this exact
+# row from ordinary hook traffic. They must match the heartbeat body's values
+# byte for byte, or the two writers create two rows for one install.
+host="$(hostname 2>/dev/null)" || host=unknown
+[ -n "$host" ] || host=unknown
+
+# Plugin version from the manifest, without python/jq.
+plugin_version="unknown"
+_pj="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
+if [ -r "$_pj" ]; then
+  _v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$_pj" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  [ -n "$_v" ] && plugin_version="$_v"
+fi
+
 # ── payload from stdin ─────────────────────────────────────────────────────
 PAYLOAD="$(cat 2>/dev/null)"
 [ -n "$PAYLOAD" ] || PAYLOAD='{}'
@@ -275,6 +294,9 @@ RESP="$(printf '%s' "$PAYLOAD" | curl -fsS --max-time 10 -X POST \
   -H "x-rogue-actor-email: $actor_email" \
   -H "x-rogue-actor-name: $actor_name" \
   -H 'x-rogue-source: cursor' \
+  -H "x-rogue-host: $host" \
+  -H "x-rogue-version: $plugin_version" \
+  -H 'x-rogue-agent: cursor' \
   --data-binary @- "$URL" 2>/dev/null)"; _rc=$?
 dbg "curl rc=$_rc resp_len=${#RESP}"
 [ "$_rc" -eq 0 ] || RESP=""
@@ -286,22 +308,14 @@ dbg "curl rc=$_rc resp_len=${#RESP}"
 # response below nor session start ever waits on it, and the response is
 # ignored. Creds/actor were already resolved above.
 if [ "$event" = "sessionStart" ]; then
-  # Plugin version from the manifest, without python/jq.
-  HB_VER="unknown"
-  HB_PJ="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
-  if [ -r "$HB_PJ" ]; then
-    _v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$HB_PJ" 2>/dev/null \
-          | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    [ -n "$_v" ] && HB_VER="$_v"
-  fi
-  HB_HOST=$(hostname 2>/dev/null) || HB_HOST=unknown
-  [ -n "$HB_HOST" ] || HB_HOST=unknown
   # `agent` is "cursor" (not a display label): the server keys its latest-version
   # lookup (PLUGIN_REPOS) on this value, so the roster can flag outdated installs.
+  # host/version come from the shared block above so this body and the per-event
+  # headers describe the same install (same fingerprint, one row).
   hb_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   HB_BODY=$(printf '{"agent_family":"cursor","agent":"cursor","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-    "$(hb_esc "$HB_VER")" "$(hb_esc "$HB_HOST")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
-  dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$HB_VER host=$HB_HOST"
+    "$(hb_esc "$plugin_version")" "$(hb_esc "$host")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
+  dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$plugin_version host=$host"
   ( curl -fsS --max-time 10 -X POST \
       -H 'Content-Type: application/json' \
       -H "x-rogue-api-key: $API_KEY" \

@@ -93,6 +93,14 @@ test("relays server body verbatim and sends the right headers", async () => {
     assert.equal(seen.headers["x-rogue-api-key"], "rsk_test");
     assert.equal(seen.headers["x-rogue-actor-email"], "dev@example.com");
     assert.equal(seen.headers["x-rogue-actor-name"], "Dev");
+    // Fleet-liveness trio: the same host/version/agent the heartbeat sends, on
+    // EVERY event, so the roster row is refreshed by ordinary traffic and not
+    // only at SessionStart. `agent` must stay the PLUGIN_REPOS key, or the
+    // backend stops resolving a latest version for these rows. Host and version
+    // are machine-specific, so they are only asserted non-empty (see installId).
+    assert.equal(seen.headers["x-rogue-agent"], "gemini_cli");
+    assert.ok(seen.headers["x-rogue-host"], "x-rogue-host sent on every event");
+    assert.ok(seen.headers["x-rogue-version"], "x-rogue-version sent on every event");
     assert.equal(seen.body, '{"tool_name":"run_shell_command"}');
   } finally {
     server.close();
