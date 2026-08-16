@@ -18,6 +18,20 @@ esac
 
 [ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ] && echo '{}' && exit 0
 
+# Which SURFACE of Claude wrote this line - cli, desktop or cowork. One file per
+# agent family means every surface on the machine appends to the same claude.log,
+# and nothing on the line said which one. The mapping is shared with heartbeat.sh
+# (see scripts/surface.sh) precisely so the line and the roster row it belongs to
+# can never name different surfaces. Sourcing is guarded and the result may be
+# empty; an empty SURFACE omits the token rather than writing surface=unknown.
+# Unreachable here in practice: the gate above already returned when the
+# entrypoint was unset, and any non-empty value maps to a slug.
+SURFACE=""
+if [ -r "${CLAUDE_PLUGIN_ROOT}/scripts/surface.sh" ]; then
+  . "${CLAUDE_PLUGIN_ROOT}/scripts/surface.sh"
+  SURFACE=$(rogue_surface_slug 2>/dev/null)
+fi
+
 # Log destination — ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a
 # machine running Claude Code + Codex + Cursor + … used to interleave all of them
 # into a single hook.log with no way to tell whose line was whose. Precedence:
@@ -67,8 +81,12 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=claude event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # `${SURFACE:+ surface=$SURFACE}` expands to NOTHING when the slug is empty,
+    # so an undetermined surface leaves the line exactly as older versions wrote
+    # it - the token is optional, never `surface=` and never `surface=unknown`.
+    printf '%s provider=claude%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 

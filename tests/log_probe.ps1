@@ -23,7 +23,8 @@ param(
     # ship transcript tails and subagent names base64-encoded.
     [string]$CredsB64 = '',                      # base64 of a JSON object of ROGUE_* values
     [int]$SeedBytes = 0,                         # >0: pre-fill the log
-    [string]$SeedPrevious = ''                   # non-empty: also create <log>.1
+    [string]$SeedPrevious = '',                  # non-empty: also create <log>.1
+    [string]$Surface = '<default>'               # override $script:surface before Log
 )
 
 # Parse BEFORE dot-sourcing, and never name this parameter `$Creds`: dot-sourcing
@@ -31,6 +32,14 @@ param(
 # file-scope `$creds = @{}`. PowerShell variable names are case-INSENSITIVE, so
 # that assignment would silently overwrite our own parameter with an empty
 # hashtable and every override in it would vanish.
+# Snapshot BEFORE the dot-source, for exactly the reason spelled out above: the
+# dispatcher declares a file-scope `$script:surface`, PowerShell variable names are
+# case-INSENSITIVE, and dot-sourcing therefore overwrites this script's own
+# `$Surface` parameter with the dispatcher's value. Read back afterwards it always
+# equalled the default the dispatcher had just set, so the override silently did
+# nothing - the same trap `$Creds` -> `$map` avoids one line below.
+$surfaceOverride = $Surface
+
 $map = @{}
 $credsJson = '{}'
 if ($CredsB64) {
@@ -55,6 +64,15 @@ if ($SeedBytes -gt 0) {
     # -NoNewline so the byte count is exact; rotation compares against Length.
     Set-Content -LiteralPath $logFile -Value ('s' * $SeedBytes) -NoNewline
 }
+# The surface is resolved in the MAIN BODY (below the seam), which never runs here,
+# so each dispatcher's file-scope default is what a probe sees: the constant for a
+# single-surface plugin, empty for one that detects per session. `-Surface` sets it
+# explicitly so the EMIT shape - token present, token omitted - is testable; the
+# resolution itself is covered separately, against surface.ps1 and against the
+# main body's wiring.
+if ($surfaceOverride -ne '<default>') { $script:surface = $surfaceOverride }
+"SURFACE=$($script:surface)"
+
 Log 'outcome=probe'
 
 $lines = @(Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue)

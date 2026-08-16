@@ -83,9 +83,17 @@ Four properties of the client that the server design has to respect:
 The format is phase 1's, identical across all six dispatchers:
 
 ```text
-2026-08-11T11:26:16Z provider=claude event=PreToolUse outcome=unconfigured
+2026-08-11T11:26:16Z provider=claude surface=cli event=PreToolUse outcome=unconfigured
 ```
 
+- **`surface=` is OPTIONAL, and sits between `provider=` and `event=`.** It names
+  which surface of that agent family wrote the line — `cli` / `desktop` / `cowork`
+  for `claude`, `codex_cli` / `codex_app`, `antigravity` / `antigravity_ide` /
+  `antigravity_cli`, and a constant for the single-surface plugins. It is absent on
+  every line written before the versions listed in
+  [hook-log-format.md](hook-log-format.md), and absent whenever the surface could
+  not be determined; there is no `surface=unknown` and no empty value. Treat the
+  token as optional and define a behaviour for lines that lack it.
 - **`provider=` is the per-line source of truth for attribution, not `log_file` and
   not `agent_family`.** A support upload (`ROGUE_SHIP_ALL=1`, which the no-argument
   form implies) carries several agents' files in one run, and an install that sets

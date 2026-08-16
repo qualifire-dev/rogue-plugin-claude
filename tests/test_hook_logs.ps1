@@ -53,6 +53,7 @@ function Invoke-Probe {
         [hashtable]$Creds = @{},
         [int]$SeedBytes = 0,
         [string]$SeedPrevious = '',
+        [string]$Surface = '<default>',   # override the dispatcher's $script:surface
         [switch]$NoUserProfile      # prove the USERPROFILE -> $HOME fallback
     )
 
@@ -82,6 +83,10 @@ function Invoke-Probe {
                       [System.Text.Encoding]::UTF8.GetBytes(($Creds | ConvertTo-Json -Compress))),
                   '-SeedBytes', $SeedBytes)
         if ($SeedPrevious) { $argv += @('-SeedPrevious', $SeedPrevious) }
+        # Appended only when set: Windows PowerShell 5.1 DROPS an empty native-command
+        # argument, which would shift every later positional and is why the sibling
+        # arguments above are conditional too.
+        if ($Surface -ne '<default>') { $argv += @('-Surface', $Surface) }
         $out = & (Get-Process -Id $PID).Path @argv 2>$null
     } finally {
         foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
@@ -180,7 +185,11 @@ foreach ($c in $cases) {
     $f = Invoke-Probe -Case $c -CaseHome $h
     # A UTC ISO-8601 second-precision stamp with no fractional part: the shipper's
     # line splitter and the backend's parser both key off it.
-    $want = "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z provider=$($c.slug) event=$($c.event) outcome=probe$"
+    # `surface=` is OPTIONAL, so the shape allows it and the dedicated section
+    # below pins which plugin emits which slug. Through the seam a single-surface
+    # plugin shows its constant while a per-session one is still empty, and both
+    # are well-formed lines.
+    $want = "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z provider=$($c.slug)( surface=[a-z_]+)? event=$($c.event) outcome=probe$"
     # The FIRST physical line, not $f['LAST']: a dispatcher that emitted a
     # leading blank line (or any preamble) would still put a well-formed record
     # last and pass. The probe fires one event, so line 0 IS that record.
@@ -191,6 +200,61 @@ foreach ($c in $cases) {
     if ($f['HEAD'] -eq 'EF BB BF') { Fail "$($c.slug) log starts with a UTF-8 BOM" }
     else { Pass "$($c.slug) log has no UTF-8 BOM (head: $($f['HEAD']))" }
 }
+
+Write-Host ""
+Write-Host "== the optional surface token"
+# Each dispatcher's file-scope default is what a probe sees: a single-surface plugin
+# hard-codes its slug, while one that detects per session leaves it empty until the
+# MAIN BODY resolves it (below the seam, so never here). Both are asserted, then the
+# emit shape is forced both ways with -Surface.
+$surfaceDefaults = @{
+    claude = ''; codex = ''; antigravity = ''   # resolved per session in the main body
+    cursor = 'cursor'; copilot = 'github_copilot'
+}
+foreach ($c in $cases) {
+    $h = New-CaseHome "surface-$($c.slug)"; $homes += $h
+    $f = Invoke-Probe -Case $c -CaseHome $h
+    Check "$($c.slug) file-scope surface default" $surfaceDefaults[$c.slug] $f['SURFACE']
+
+    # A resolved surface lands directly after provider= and before event=, so a
+    # reader scanning for the next `key=` gets the whole value.
+    $f = Invoke-Probe -Case $c -CaseHome $h -Surface 'desktop'
+    $want = "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z provider=$($c.slug) surface=desktop event=$($c.event) outcome=probe$"
+    if (@([System.IO.File]::ReadAllLines($f['LOGFILE']))[-1] -match $want) {
+        Pass "$($c.slug) stamps surface= between provider= and event="
+    } else { Fail "$($c.slug) surface placement [$($f['LAST'])]" }
+
+    # An UNDETERMINED surface omits the whole token. `surface=` with nothing after
+    # it, or `surface=unknown`, would both be worse than saying nothing: a reader
+    # cannot tell either from a real value, and every line written by a version
+    # before this one has no token at all.
+    $f = Invoke-Probe -Case $c -CaseHome $h -Surface ''
+    $wantBare = "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z provider=$($c.slug) event=$($c.event) outcome=probe$"
+    if (@([System.IO.File]::ReadAllLines($f['LOGFILE']))[-1] -match $wantBare) {
+        Pass "$($c.slug) omits the token when the surface is unknown"
+    } else { Fail "$($c.slug) emitted a placeholder surface [$($f['LAST'])]" }
+}
+
+Write-Host ""
+Write-Host "== claude's surface table is ONE table, shared with the heartbeat"
+# The whole point of plugins/rogue/scripts/surface.ps1: hook.ps1 stamps the slug and
+# heartbeat.ps1 sends the label, and a copy in each would eventually drift - leaving
+# a log line and the roster row for one session naming different surfaces. Mirrors
+# the sh half in tests/test_hook_logs.sh.
+. (Join-Path $repo 'plugins/rogue/scripts/surface.ps1')
+foreach ($row in @(
+    @{ ep = 'cli';               slug = 'cli';     label = 'Claude Code - CLI' },
+    @{ ep = 'desktop';           slug = 'desktop'; label = 'Claude Code - Desktop' },
+    @{ ep = 'cowork';            slug = 'cowork';  label = 'Claude Cowork' },
+    @{ ep = 'CLI';               slug = 'cli';     label = 'Claude Code - CLI' },
+    @{ ep = 'vscode-extension';  slug = 'cli';     label = 'Claude Code - CLI' },
+    @{ ep = '';                  slug = '';        label = 'Claude Code - CLI' }
+)) {
+    $env:CLAUDE_CODE_ENTRYPOINT = $row.ep
+    Check "entrypoint '$($row.ep)' -> slug '$($row.slug)'" $row.slug ([string](Get-RogueSurfaceSlug))
+    Check "entrypoint '$($row.ep)' -> label '$($row.label)'" $row.label ([string](Get-RogueSurfaceLabel))
+}
+Remove-Item Env:CLAUDE_CODE_ENTRYPOINT -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "== rotation at the cap, including over an EXISTING .1"

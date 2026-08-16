@@ -68,10 +68,25 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=codex event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # `${SURFACE:+ surface=$SURFACE}` expands to NOTHING when the slug is empty, so
+    # an undetermined surface leaves the line exactly as older versions wrote it -
+    # never `surface=` and never `surface=unknown`.
+    printf '%s provider=codex%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+
+# Which SURFACE of Codex wrote this - codex_app or codex_cli. Resolved HERE, above
+# the first log() call, so even an unconfigured install stamps it; the same value is
+# reused for the x-rogue-agent header below, and heartbeat.sh reads the same table
+# (scripts/surface.sh) so a log line and the roster row for one session cannot name
+# different surfaces. Guarded: no surface.sh, no token - never a broken hook.
+SURFACE=""
+if [ -r "${PLUGIN_ROOT}/scripts/surface.sh" ]; then
+  . "${PLUGIN_ROOT}/scripts/surface.sh"
+  SURFACE=$(codex_surface_slug 2>/dev/null)
+fi
 
 if [ -z "${ROGUE_API_KEY:-}" ]; then
   log "outcome=unconfigured"
@@ -81,9 +96,11 @@ fi
 
 . "${PLUGIN_ROOT}/scripts/actor.sh"
 
-# Surface label (codex_app | codex_cli). Codex sets no app/cli entrypoint var, so
-# the installer pins ROGUE_CODEX_SURFACE per surface; default to codex_cli.
-SURFACE="${ROGUE_CODEX_SURFACE:-codex_cli}"
+# SURFACE is already resolved above (scripts/surface.sh) and is reused verbatim for
+# the header, so the header, the log token and the roster row are one value. The
+# guard covers a damaged install where surface.sh was missing: the header has always
+# carried a surface and must keep carrying one, where the log token is optional.
+[ -n "$SURFACE" ] || SURFACE="codex_cli"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/openai}"
 

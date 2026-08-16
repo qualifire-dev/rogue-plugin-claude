@@ -83,6 +83,11 @@ rotate_log() {
   [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
   return 0
 }
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no `=`, so a reader finds the value by scanning to the next `key=` token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+SURFACE="github_copilot"
+
 log() {
   # 0700 dir / 0600 file. The logged text is not only ours: it carries the
   # server's block reason, which quotes the content that tripped the rule - a
@@ -94,8 +99,13 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=copilot event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # SURFACE is a constant here: this plugin has exactly one surface, so there is
+    # nothing to detect and nothing that can fail. It is still written through the
+    # same `${SURFACE:+ …}` expansion as the multi-surface plugins so all six
+    # dispatchers share one emit shape.
+    printf '%s provider=copilot%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 

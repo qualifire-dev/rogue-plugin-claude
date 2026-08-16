@@ -53,11 +53,16 @@ fi
 # x-rogue-agent header (free-form display label), derived from
 # CLAUDE_CODE_ENTRYPOINT (the same var hook.sh uses to tell GUI from cli).
 # Unknown → CLI.
-case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-  *cowork*)  AGENT="Claude Cowork" ;;
-  *desktop*) AGENT="Claude Code - Desktop" ;;
-  *)         AGENT="Claude Code - CLI" ;;
-esac
+# One table, in scripts/surface.sh, shared with hook.sh - which stamps the matching
+# SLUG on each log line. A `case` copied into both would eventually drift, and a log
+# line naming a different surface than the roster row for the same session is worse
+# than a line that names none. The literal below is a last-resort guard for a
+# damaged install (missing file), not a second copy of the mapping.
+if [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/surface.sh" ]; then
+  . "${CLAUDE_PLUGIN_ROOT}/scripts/surface.sh"
+  AGENT=$(rogue_surface_label 2>/dev/null)
+fi
+[ -n "${AGENT:-}" ] || AGENT="Claude Code - CLI"
 
 # POST /api/v1/hooks/status (GET route is gone). The former x-rogue-agent-*
 # headers now ride the JSON body; x-rogue-api-key stays a header. Backslash- and

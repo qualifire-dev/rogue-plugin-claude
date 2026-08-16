@@ -109,8 +109,10 @@ Every event registers two entries — an `sh` one and a PowerShell one — point
 Line format, identical across all six dispatchers:
 
 ```
-2026-08-11T11:26:16Z provider=claude event=PreToolUse outcome=unconfigured
+2026-08-11T11:26:16Z provider=claude surface=cli event=PreToolUse outcome=unconfigured
 ```
+
+- **`surface=` is OPTIONAL and sits between `provider=` and `event=`.** One file per agent family means every surface of that family appends to it — CLI, Desktop and Cowork all write `claude.log` — so the line has to say which one wrote it. Closed vocabulary, per plugin: `cli`/`desktop`/`cowork`, `codex_cli`/`codex_app`, `antigravity`/`antigravity_ide`/`antigravity_cli`, `cursor`, `github_copilot`, `gemini_cli`. **Absent** when the surface cannot be determined — never `surface=` and never `surface=unknown`, either of which a reader scanning `key=` tokens cannot tell from a real value. In practice that means lines from a version older than rogue 1.0.24 / codex 1.0.1 / cursor 1.1.1 / copilot 1.2.1 / antigravity 1.0.24 / gemini 1.0.25, and antigravity events whose payload has no `transcriptPath`. **Each plugin resolves it ONCE, from the same signal its heartbeat uses** — `plugins/{rogue,codex}/scripts/surface.{sh,ps1}` are shared tables read by both hook and heartbeat, and antigravity's hook passes its single resolution to its own heartbeat. Never add a second detection path: a line and the roster row for one session naming different surfaces is worse than a line naming none. Full table: [docs/hook-log-format.md](docs/hook-log-format.md).
 
 - **`provider=` is the agent slug, which is also the file's basename.** The two are kept equal on purpose so a merged grep and a file listing use one vocabulary. It is deliberately **NOT** the heartbeat's `agent_family`/`agent` (the server keys its roster and version lookup on those): five of six coincide, but Codex's family is `openai` while its slug is `codex`, and the roster labels are `gemini_cli` / `github_copilot` where the slugs are `gemini` / `copilot`. Don't "align" them.
 - **Path precedence**: `ROGUE_LOG_FILE` (exact path, back-compat) → `ROGUE_LOG_DIR/<slug>.log` → `~/.rogue/logs/<slug>.log`. Prefer `ROGUE_LOG_DIR` when relocating: `~/.rogue-env` is **shared by every plugin**, so a `ROGUE_LOG_FILE` set there re-collapses all six into one file.

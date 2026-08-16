@@ -91,6 +91,13 @@ function ConvertFrom-ShellQuoted {
 # reading a script variable from a function is implicit, but ASSIGNING one needs
 # the `$script:` prefix or the write lands in a function-local copy and silently
 # vanishes. Every write to shared state below is therefore `$script:`-qualified.
+# Which SURFACE of Antigravity wrote each line - antigravity, antigravity_ide or
+# antigravity_cli. Resolved from the payload's transcriptPath, the ONLY reliable
+# signal (three products share one install, so a filesystem probe cannot tell which
+# is running), and the same value the heartbeat reports. Empty for an event whose
+# payload carries no transcriptPath, and for every line written before the payload
+# is read: the token is then OMITTED, never `surface=` and never `surface=unknown`.
+$script:surface     = ''
 $script:logFile     = ''       # resolved in Initialize-Logging
 $script:logMaxBytes = 10485760  # ditto; the default stands until then
 $creds      = @{}  # credential files + process env, by Import-Credentials
@@ -226,9 +233,12 @@ function Log {
         # produced by a rotation) would start with EF BB BF and fail any parser
         # that anchors on the timestamp. "`n" keeps the line ending identical to
         # what the sh dispatchers write, so one log format covers both platforms.
+        # Empty slug -> empty string, so the line is byte-identical to what an
+        # older version wrote. Optional means optional.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
         [System.IO.File]::AppendAllText(
             $logFile,
-            "$stamp provider=antigravity event=$EventName $Msg`n",
+            "$stamp provider=antigravity$surfaceToken event=$EventName $Msg`n",
             (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
@@ -339,10 +349,11 @@ function Invoke-Heartbeat {
         # Pass the surface along: only the hook can know it (three products share
         # one install, and the event's transcriptPath names which state dir it
         # lives in). Mirrors hook.sh's `heartbeat.sh "$_hb_agent"`.
+        # Resolve-Surface already did this, off the same transcriptPath, so reuse it
+        # rather than re-matching: one resolution feeds the roster agent, the log
+        # token and the IDE-only enrichment branch, and they cannot disagree.
         $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath)
-        $hbTp = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value
-        $hbAgent = Get-AntigravitySurface $hbTp
-        if ($hbAgent) { $hbArgs += @('-Agent', $hbAgent) }
+        if ($script:surface) { $hbArgs += @('-Agent', $script:surface) }
         Start-Process -FilePath 'powershell' `
             -ArgumentList $hbArgs `
             -WindowStyle Hidden -ErrorAction Stop
@@ -705,6 +716,9 @@ function Add-StoreRead {
 function Resolve-Surface {
     $script:payloadTp = Get-PayloadTranscriptPath $payload
     $script:isIdeSurface = $script:payloadTp -like '*/antigravity-ide/*'
+    # Same path, same table: the log token, the heartbeat's roster agent and the
+    # IDE-only enrichment branch all come from this one resolution.
+    $script:surface = [string](Get-AntigravitySurface $script:payloadTp)
 }
 
 function Add-StoreReadForEvent {
@@ -857,6 +871,10 @@ function Invoke-Main {
     Resolve-Url
     Resolve-Actor
     Read-Payload
+    # Immediately after the payload, and BEFORE anything that logs - the same
+    # position hook.sh resolves it in. Every log line written from here on carries
+    # the surface, so the two dispatchers emit the same token for the same event.
+    Resolve-Surface
 
     Invoke-Heartbeat
     Initialize-SubagentDirs
@@ -865,7 +883,6 @@ function Invoke-Main {
     # appended base64 blob.
     Resolve-Subagent
 
-    Resolve-Surface
     Add-StoreReadForEvent
     Add-TranscriptTail
     Add-CapabilityFlag

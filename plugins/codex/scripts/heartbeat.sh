@@ -30,9 +30,16 @@ if [ -r "$PJ" ]; then
   [ -n "$v" ] && VER="$v"
 fi
 
-# Family is the fixed enum "openai"; surface (codex_app|codex_cli) rides the
-# agent field. Installer pins ROGUE_CODEX_SURFACE; default codex_cli.
-AGENT="${ROGUE_CODEX_SURFACE:-codex_cli}"
+# Family is the fixed enum "openai"; the surface (codex_app|codex_cli) rides the
+# agent field. One table, in scripts/surface.sh, shared with hook.sh - which stamps
+# the same slug on each log line and sends it as x-rogue-agent. The literal is a
+# last-resort guard for a damaged install, not a second copy of the mapping.
+AGENT=""
+if [ -r "${PLUGIN_ROOT:-}/scripts/surface.sh" ]; then
+  . "${PLUGIN_ROOT}/scripts/surface.sh"
+  AGENT=$(codex_surface_slug 2>/dev/null)
+fi
+[ -n "$AGENT" ] || AGENT="codex_cli"
 
 HOST=$(hostname 2>/dev/null || echo unknown)
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }

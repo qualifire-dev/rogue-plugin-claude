@@ -128,6 +128,11 @@ rotate_log() {
   [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
   return 0
 }
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no `=`, so a reader finds the value by scanning to the next `key=` token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+SURFACE="cursor"
+
 log() {
   # 0700 dir / 0600 file. The logged text is not only ours: it carries the
   # server's block reason, which quotes the content that tripped the rule - a
@@ -139,8 +144,13 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=cursor event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # SURFACE is a constant here: this plugin has exactly one surface, so there is
+    # nothing to detect and nothing that can fail. It is still written through the
+    # same `${SURFACE:+ …}` expansion as the multi-surface plugins so all six
+    # dispatchers share one emit shape.
+    printf '%s provider=cursor%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 # Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
 # can carry anything), and a raw newline or CR would forge extra log lines.

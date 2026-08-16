@@ -44,6 +44,7 @@
 EVENT=""          # hook event name, from $1
 PLUGIN_ROOT=""    # <root> of this plugin, derived from $0
 BODY=""           # the hook payload, as received then enriched
+SURFACE=""        # antigravity | antigravity_ide | antigravity_cli, or empty
 URL=""            # where to POST it
 SUBAGENT_ID=""    # set by reattribute_subagent when this event is a subagent's
 SUBAGENT_NAME=""
@@ -135,8 +136,13 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=antigravity event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # `${SURFACE:+ surface=$SURFACE}` expands to NOTHING when the slug is empty -
+    # which is the normal case for an event whose payload carries no transcriptPath,
+    # and for every line written before read_body. Never `surface=`, never
+    # `surface=unknown`.
+    printf '%s provider=antigravity%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 
@@ -634,7 +640,7 @@ maybe_heartbeat() {
   [ "$EVENT" = "PreInvocation" ] || return 0
   case "$BODY" in
     *'"invocationNum":0'*|*'"invocationNum": 0'*)
-      _hb_agent=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+      _hb_agent="$SURFACE"
       ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$_hb_agent" >/dev/null 2>&1 & ) ;;
   esac
 }
@@ -649,7 +655,7 @@ maybe_heartbeat() {
 #     so the wait was pure latency on the event that blocks the developer. The
 #     prompt comes from the conversation store instead.
 enrich_body() {
-  _surface=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  _surface="$SURFACE"
   if [ "$_surface" = "antigravity_ide" ]; then
     case "$EVENT" in
       # The pending prompt, before the model call that would consume it.
@@ -736,6 +742,12 @@ main() {
   require_api_key        # exits before stdin is read when there is no key
   load_actor
   read_body
+  # ONE resolution, three consumers: the log token, the heartbeat's roster agent
+  # and enrich_body's IDE-only branch. transcriptPath is the only reliable signal
+  # (three products share one install, so a filesystem probe cannot tell which is
+  # running), and it is absent from some events - which is exactly why the log
+  # token is optional. Empty here means the line carries no surface= at all.
+  SURFACE=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
 
   maybe_heartbeat
   # Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON

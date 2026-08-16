@@ -88,7 +88,18 @@ if (Test-Path -LiteralPath $pj) {
 }
 
 # Family is the fixed enum "openai"; surface rides the agent field.
-$agent = $creds['ROGUE_CODEX_SURFACE']; if (-not $agent) { $agent = 'codex_cli' }
+# One table, in scripts/surface.ps1, shared with hook.ps1 - which stamps the same
+# slug on each log line and sends it as x-rogue-agent. The literal is a last-resort
+# guard for a damaged install, not a second copy of the mapping.
+$agent = ''
+try {
+    $surfaceLib = Join-Path $pluginRoot 'scripts\surface.ps1'
+    if (Test-Path -LiteralPath $surfaceLib) {
+        . $surfaceLib
+        $agent = [string](Get-CodexSurfaceSlug $creds)
+    }
+} catch { $agent = '' }
+if (-not $agent) { $agent = 'codex_cli' }
 
 $host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 
