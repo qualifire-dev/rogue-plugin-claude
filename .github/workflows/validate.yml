@@ -80,7 +80,12 @@ jobs:
           while IFS= read -r f; do
             if head -1 "$f" | grep -q bash; then chk="bash -n"; else chk="dash -n"; fi
             if ! $chk "$f"; then echo "::error file=$f::$chk parse error"; fail=1; fi
-          done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh' 'scripts/shared/*.sh')
+          # tests/manual/*.sh is here because nothing else in CI reads it: those
+          # scripts are run by hand against a live CLI, so a parse error sits
+          # undiscovered until someone reaches for the harness - which is exactly
+          # when they are least able to debug it. The automated suites under tests/
+          # are covered by being executed.
+          done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh' 'scripts/shared/*.sh' 'tests/manual/*.sh')
           [ "$fail" = 0 ] || exit 1
 
       - name: Command and skill snippets parse
