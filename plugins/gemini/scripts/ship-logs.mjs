@@ -560,7 +560,7 @@ class Shipper {
     if (!chunk || chunk.length === 0) return 0;
 
     // Chunks end on line boundaries. Hitting the cap mid-line would put a line's first
-    // half in chunk N and its second in chunk N+1 - two Axiom events, two corrupt
+    // half in chunk N and its second in chunk N+1 - two stored events, two corrupt
     // lines instead of one good one - and the same hazard exists at the tail from a
     // torn concurrent append.
     const fragmentBytes = trailingFragmentLength(chunk);

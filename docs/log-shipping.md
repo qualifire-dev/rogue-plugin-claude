@@ -9,9 +9,9 @@ There are **two independent capabilities**, and they are independent on purpose:
 | | ships from | auth | trigger | coverage |
 |---|---|---|---|---|
 | **A. Plugin shipper** | the plugin itself | `ROGUE_API_KEY` | its own detached session-start process | every machine that has a Rogue plugin |
-| **B. Endpoint collector** | `rogue-endpoint` | enrolled agent secret | a backend-dispatched task | machines that also run the endpoint agent |
+| **B. Endpoint collector** | the endpoint agent | enrolled agent secret | a backend-dispatched task | machines that also run the endpoint agent |
 
-**A is the baseline** — not every customer runs `rogue-endpoint`, so a design that
+**A is the baseline** — not every customer runs the endpoint agent, so a design that
 depends on it leaves logs unreachable on exactly the installs we most often need
 to debug (a fresh one-liner install that never showed up in the dashboard). **B
 is an on-demand pull** for support and IR: "collect this machine's logs now",

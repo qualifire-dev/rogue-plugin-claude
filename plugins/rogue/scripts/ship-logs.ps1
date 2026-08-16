@@ -715,7 +715,7 @@ function Send-NextChunk {
     if ($null -eq $chunk -or $chunk.Length -eq 0) { return $false }
 
     # Chunks end on line boundaries. Hitting the cap mid-line would put a line's
-    # first half in chunk N and its second in chunk N+1 - two Axiom events, two
+    # first half in chunk N and its second in chunk N+1 - two stored events, two
     # corrupt lines instead of one good one - and the same hazard exists at the tail
     # from a torn concurrent append.
     $fragmentBytes = Get-TrailingFragmentLength $chunk

@@ -677,7 +677,7 @@ ship_next_chunk() { # <file> <offset> <rotated:0|1> <expected-head>
   [ "$_chunk_bytes" -gt 0 ] || return 1
 
   # Chunks end on line boundaries. Hitting the cap mid-line would put a line's
-  # first half in chunk N and its second in chunk N+1 - two Axiom events, two
+  # first half in chunk N and its second in chunk N+1 - two stored events, two
   # corrupt lines instead of one good one - and the same hazard exists at the tail
   # from a torn concurrent append.
   _chunk_fragment_bytes=$(trailing_fragment_bytes "$_chunk_tmp_file")
