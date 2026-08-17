@@ -93,15 +93,21 @@ stage_tree() {
 }
 
 cmd_up() {
-  URL="$DEFAULT_URL"; KEY="$DEFAULT_KEY"; SHIP=0
+  URL="$DEFAULT_URL"; KEY="$DEFAULT_KEY"; SHIP=0; BEACON=''
   while [ $# -gt 0 ]; do
     case "$1" in
       --url) URL="${2:?--url needs a value}"; shift 2 ;;
       --key) KEY="${2:?--key needs a value}"; shift 2 ;;
       --ship) SHIP=1; shift ;;
+      # The Stop-triggered beacon is throttled to 900s by default, so a test session
+      # shorter than 15 minutes sees exactly ONE beacon - indistinguishable from the
+      # old SessionStart-only behaviour, which makes the feature unobservable. 0 means
+      # every turn.
+      --beacon-interval) BEACON="${2:?--beacon-interval needs a value}"; shift 2 ;;
       *) die "unknown argument: $1" ;;
     esac
   done
+  case "${BEACON:-0}" in *[!0-9]*) die "--beacon-interval takes seconds, got: $BEACON" ;; esac
 
   case "$URL" in
     # The brackets are ESCAPED. `http://[::1]:*` is a glob bracket expression, not
@@ -164,10 +170,12 @@ cmd_up() {
       echo "export ROGUE_ACTOR_NAME=${ROGUE_ACTOR_NAME:-Local Dev}"
       [ "$SHIP" = 1 ] && echo "export ROGUE_SHIP_LOGS=1"
       [ "$SHIP" = 1 ] && echo "export ROGUE_SHIP_MIN_INTERVAL=0"
+      [ -n "$BEACON" ] && echo "export ROGUE_HEARTBEAT_MIN_INTERVAL=$BEACON"
     } > "$ENV_FILE"
   )
   say "  wrote $ENV_FILE (mode 600) -> $URL"
   [ "$SHIP" = 1 ] && say "  log shipping ON (your API must serve POST /api/v1/hooks/logs)"
+  [ -n "$BEACON" ] && say "  beacon throttle ${BEACON}s (0 = a beacon on every Stop)"
 
   rule "next"
   say "  1. Start your local API on $URL"
@@ -235,7 +243,13 @@ cmd_check() {
   ok()   { say "  ok: $1"; }
   bad()  { say "  FAIL: $1"; fails=$((fails + 1)); }
 
-  recent="$(tail -40 "$LOG")"
+  # DISPATCHER lines only. `event=ShipLogs` lines are written by ship-logs.sh, which
+  # is the byte-identical shared script - it takes the slug as an argument and has no
+  # surface signal at all, so an absent surface= is correct there per the spec ("absent
+  # when the surface cannot be determined"). Counting them as dispatcher lines made
+  # every assertion below fail as soon as one landed in the tail, i.e. exactly when
+  # --ship is on and the thing under test is working.
+  recent="$(tail -40 "$LOG" | grep -v 'event=ShipLogs')"
   total="$(printf '%s\n' "$recent" | grep -c 'provider=claude')"
   tagged="$(printf '%s\n' "$recent" | grep -c 'provider=claude surface=')"
 
@@ -286,6 +300,25 @@ cmd_check() {
   # plugin failure - the plugin relayed exactly what it got.
   rule "what your API answered"
   printf '%s\n' "$recent" | grep 'raw=' | tail -4 | sed 's/^/  /' || say "  (no raw= lines)"
+
+  # REPORTED, not asserted. Whether shipping should have run at all depends on flags
+  # this subcommand cannot see (a `up` without --ship, an env-file kill switch), so a
+  # zero here is not necessarily a failure - but it is the number you came to read.
+  rule "shipping and the Stop beacon"
+  ships="$(grep -c 'event=ShipLogs' "$LOG" 2>/dev/null)"
+  say "  $ships ShipLogs line(s) in the whole log; last few:"
+  grep 'event=ShipLogs' "$LOG" 2>/dev/null | tail -3 | sed 's/^/    /' || say "    (none)"
+  BEACON_STAMP="$HOME/.rogue/beacon/.last-claude"
+  if [ -r "$BEACON_STAMP" ]; then
+    _bs="$(head -n1 "$BEACON_STAMP" | tr -d '[:space:]')"
+    _now="$(date -u +%s)"
+    case "$_bs" in
+      ''|*[!0-9]*) say "  beacon stamp is NOT an integer ($_bs) - the throttle reads it as untrusted" ;;
+      *) say "  last beacon $(( _now - _bs ))s ago (stamp $_bs)" ;;
+    esac
+  else
+    say "  no beacon stamp yet at $BEACON_STAMP"
+  fi
 
   say
   [ "$fails" = 0 ] && say "LOCAL API CHECK PASSED" || say "$fails failure(s)"
