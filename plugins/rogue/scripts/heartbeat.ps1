@@ -25,90 +25,51 @@ $ProgressPreference = 'SilentlyContinue'
 function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.WriteLine("[rogue-heartbeat] $Msg") } }
 
 # ── beacon throttle ────────────────────────────────────────────────────────
-# Mirrors heartbeat.sh stage for stage. SessionStart is never throttled: it fires
-# once per session, and a brand-new session is exactly when the roster most wants
-# the update. Only the per-turn trigger is rate-limited.
+# Mirrors heartbeat.sh stage for stage, and now literally so: the rule itself lives
+# in scripts/beacon.ps1, a byte-identical copy of scripts/shared/beacon.ps1 shared
+# with the other four PowerShell plugins, whose sh twin scripts/beacon.sh is what
+# heartbeat.sh loads. Same arrangement as ship-logs.ps1, and for the same reason -
+# all six plugins now beacon on a per-turn trigger, and eleven hand-written copies
+# of these semantics would drift silently in one of two directions, "no beacon ever
+# again" or "a beacon on every turn". Every per-plugin difference is an argument:
+# the stamp slug, and whether this trigger is the session one.
 #
-# Defined UP HERE, above the credential loading, purely so the ROGUE_PS_LIB_ONLY
-# seam below can expose them to the tests without the dot-source running a real
-# beacon. The default stands alone so a dot-source that never calls
-# Initialize-BeaconThrottle still has a usable interval.
-$script:beaconMinInterval = 900
-
-# The interval is resolved from the CREDENTIAL MAP, not from $env: directly, and
-# therefore only once the env files have been parsed - exactly like
-# Initialize-Logging in hook.ps1, and for the same reason. Read at file scope this
-# silently ignored every env file: heartbeat.sh sources them BEFORE it reads the
-# knob, so `ROGUE_HEARTBEAT_MIN_INTERVAL` in ~/.rogue-env or in an MDM
-# C:\ProgramData\rogue\env took effect on macOS and Linux and did nothing on
-# Windows, leaving every Windows machine on the 900s default. There is no
-# workaround from a user's shell either: this script is spawned DETACHED by
-# hook.ps1, so its process environment comes from Claude Code, not from whoever
-# configured the machine. ROGUE_HEARTBEAT_MIN_INTERVAL rides the process-env
-# override list below, so process env still wins over the files.
+# SessionStart is never throttled: it fires once per session, and a brand-new
+# session is exactly when the roster most wants the update. Only the per-turn
+# trigger is rate-limited.
 #
-# A numeric zero DISABLES the throttle; a non-numeric value falls back to the
-# default. Same rule as ROGUE_LOG_MAX_BYTES and ROGUE_SHIP_MIN_INTERVAL, so there
-# is one convention to remember. On a Stop trigger zero means a beacon every turn:
-# that is the knob doing what it says, and the default is what protects the fleet.
-#
-# TryParse, not a plain [int64] cast: the cast throws on a value too wide for the
-# type, and while $ErrorActionPreference = 'SilentlyContinue' would swallow it and
-# leave the default standing, that is the right answer reached by accident.
-function Initialize-BeaconThrottle {
-    # [hashtable], defaulted, exactly like Initialize-Logging in hook.ps1: the merged
-    # credential map, whose precedence is already correct by the time it gets here.
-    param([hashtable]$Creds = @{})
-    $script:beaconMinInterval = 900
-    $raw = [string]$Creds['ROGUE_HEARTBEAT_MIN_INTERVAL']
-    if (-not $raw) { return }
-    $parsed = [int64]0
-    if ([int64]::TryParse($raw, [ref]$parsed) -and $parsed -ge 0) {
-        $script:beaconMinInterval = $parsed
-    }
-}
-
-# $HOME backs up USERPROFILE so this path also resolves when the file is
-# dot-sourced on macOS/Linux by the test suite.
-$beaconHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
-$script:beaconStamp = Join-Path (Join-Path (Join-Path $beaconHome '.rogue') 'beacon') '.last-claude'
-
-# $true = skip this beacon. Every unreadable or unparseable case answers $false:
-# a stamp we cannot trust must never be able to silence presence reporting.
-function Test-BeaconThrottled {
-    param([string]$TriggerName = $script:trigger)
-    if ($TriggerName -eq 'SessionStart') { return $false }
-    if ($script:beaconMinInterval -le 0) { return $false }
-    if (-not (Test-Path -LiteralPath $script:beaconStamp)) { return $false }
-    $raw = (Get-Content -LiteralPath $script:beaconStamp -TotalCount 1) -replace '\s', ''
-    $last = [int64]0
-    if (-not [int64]::TryParse($raw, [ref]$last)) { return $false }
-    $now = Get-UnixSeconds
-    # A stamp in the FUTURE (clock stepped back, bad write) is stale, not a reason
-    # to stay quiet until the clock catches up.
-    if ($last -gt $now) { return $false }
-    return (($now - $last) -lt $script:beaconMinInterval)
-}
-
-function Get-UnixSeconds {
-    # The epoch is CONSTRUCTED with DateTimeKind::Utc, never parsed from a string.
-    # `[datetime]'1970-01-01T00:00:00Z'` looks equivalent and is not: .NET reads the Z
-    # as UTC and then CONVERTS TO LOCAL, yielding Kind=Local (1970-01-01T02:00+02:00
-    # on a UTC+2 box). Subtracting a Local from a Utc does naive tick arithmetic, so
-    # this returned epoch MINUS the machine's UTC offset. The throttle still worked -
-    # the same function writes and reads the stamp, so the delta was right - but the
-    # number on disk was wrong by hours, disagreeing with the true epoch that
-    # heartbeat.sh writes to the same path with `date -u +%s` and with
-    # ship-logs.ps1's Get-EpochSeconds, which already does it this way.
-    $epoch = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
-    return [int64][Math]::Floor(((Get-Date).ToUniversalTime() - $epoch).TotalSeconds)
-}
+# The plugin root and the library load sit UP HERE, above the credential loading and
+# above the ROGUE_PS_LIB_ONLY seam, so the tests can exercise the real wiring - the
+# library that actually ships, not a stand-in - without the load running a beacon.
+# Both are pure: reading an env var and defining functions.
+$pluginRoot = $env:CLAUDE_PLUGIN_ROOT
+if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
 
 # The param() lands in the caller's scope when this file is dot-sourced, so the
-# trigger is copied to a $script: variable that Test-BeaconThrottled can default
-# to. PowerShell variable names are case-insensitive, which is exactly how the
-# tests' own -Trigger parameter would otherwise be clobbered.
+# trigger is copied to a $script: variable. PowerShell variable names are
+# case-insensitive, which is exactly how the tests' own -Trigger parameter would
+# otherwise be clobbered.
 $script:trigger = $Trigger
+$script:beaconUnthrottled = ($script:trigger -eq 'SessionStart')
+
+# Loaded as a SCRIPTBLOCK from the file's text, never dot-sourced by path and never
+# with -File: running a .ps1 directly is subject to ExecutionPolicy and to a
+# GPO-enforced policy that -ExecutionPolicy Bypass cannot override. Dot-invoking the
+# scriptblock defines the library's functions in THIS scope with no policy involved,
+# the same trick hooks.json uses for the dispatchers.
+#
+# A missing or unparseable library degrades to an UNTHROTTLED beacon - today's
+# behaviour on every plugin, and the safe direction: a beacon too often is noise,
+# while a beacon never again is a roster row indistinguishable from an uninstalled
+# plugin.
+$beaconLib = Join-Path $pluginRoot 'scripts\beacon.ps1'
+if (Test-Path -LiteralPath $beaconLib) {
+    try { . ([scriptblock]::Create((Get-Content -Raw -LiteralPath $beaconLib))) } catch { }
+}
+if (-not (Get-Command Request-RogueBeaconSlot -ErrorAction SilentlyContinue)) {
+    function Initialize-RogueBeacon { param([hashtable]$Creds = @{}) }
+    function Request-RogueBeaconSlot { param([string]$Slug, [bool]$Unthrottled = $false) return $true }
+}
 
 # Test seam: everything above is pure and safe to dot-source on any platform;
 # everything below reads credentials and POSTs. Same seam hook.ps1 uses.
@@ -152,9 +113,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
 # the entrypoint decides whether there is a SESSION to report presence for, which is
 # a different question from whether the log on disk is worth uploading. Behaviour of
 # the beacon itself is unchanged - it still fires exactly when it did.
-
-$pluginRoot = $env:CLAUDE_PLUGIN_ROOT
-if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
+# ($pluginRoot was resolved above the seam, because the beacon library loads from it.)
 
 # -- credential resolution --------------------------------------------------
 $creds = @{}
@@ -175,7 +134,7 @@ foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BAS
 
 # Resolved HERE - after the env files are parsed so they can set it, and before the
 # API-key check below so the ordering cannot regress into reading it too early again.
-Initialize-BeaconThrottle $creds
+Initialize-RogueBeacon $creds
 
 $apiKey = $creds['ROGUE_API_KEY']
 if (-not $apiKey) { Dbg 'not configured -> no-op'; exit 0 }
@@ -233,24 +192,11 @@ $body = @{
 } | ConvertTo-Json -Compress
 
 # The beacon, and ONLY the beacon, is gated on there being a session (see the note
-# where that check used to live).
-if ($env:CLAUDE_CODE_ENTRYPOINT -and -not (Test-BeaconThrottled)) {
-    # Stamped BEFORE the request, like the shipper's: this is a crash-loop guard as
-    # much as a rate limit, so a beacon that hangs or dies still costs the next turn
-    # its attempt rather than retrying on every one. No umask counterpart is needed
-    # here - another standard user cannot read %USERPROFILE% to begin with.
-    try {
-        $stampDir = Split-Path -Parent $script:beaconStamp
-        if (-not (Test-Path -LiteralPath $stampDir)) {
-            New-Item -ItemType Directory -Path $stampDir -Force | Out-Null
-        }
-        # BOM-less UTF-8 and an LF, matching the log writers: Add-Content -Encoding
-        # UTF8 emits a BOM on Windows PowerShell 5.1 when it creates the file, and
-        # the leading EF BB BF would then fail every TryParse that reads it back -
-        # turning the throttle off permanently instead of noisily.
-        [System.IO.File]::WriteAllText($script:beaconStamp, "$(Get-UnixSeconds)`n",
-            (New-Object System.Text.UTF8Encoding $false))
-    } catch { Dbg "beacon stamp failed: $($_.Exception.Message)" }
+# where that check used to live). Request-RogueBeaconSlot writes the stamp itself,
+# BEFORE the request below - deciding and stamping are one call so a caller cannot
+# leave the window permanently open by forgetting the second half.
+if ($env:CLAUDE_CODE_ENTRYPOINT -and
+    (Request-RogueBeaconSlot -Slug 'claude' -Unthrottled $script:beaconUnthrottled)) {
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
         Invoke-WebRequest -Uri "$baseUrl/api/v1/hooks/status" -Method Post `

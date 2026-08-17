@@ -26,8 +26,10 @@
 #   provider= token      claude                        cursor
 #   surface= vocabulary  cli|desktop|cowork            cursor (one, always present)
 #   shipper slug/family  claude / claude               cursor / cursor
-#   beacon               heartbeat.ps1, SessionStart    inline in hook.ps1, sessionStart
-#                        AND Stop, throttled            only - no throttle, no stamp
+#   beacon               heartbeat.ps1, DETACHED,      INLINE in hook.ps1, a SYNC
+#                        SessionStart AND Stop         POST, sessionStart AND stop
+#   beacon throttle      yes, stamped                  yes, stamped (same library)
+#   beacon in the log    no (detached: unobservable)   yes - heartbeat=<status>|throttled
 #   headless probe       yes (`claude -p`)             no such CLI
 #
 # Cursor has NO plugin CLI at all - that asymmetry is load-bearing in install.ps1 and
@@ -116,7 +118,8 @@ $agents = @{
         Surfaces    = 'cli|desktop|cowork'
         InstallMode = 'marketplace'
         MarketName  = 'rogue-localdev'
-        HasBeacon   = $true      # heartbeat.ps1, with a throttle stamp
+        HasBeacon   = $true      # heartbeat.ps1, detached, with a throttle stamp
+        InlineBeacon = $false    # so its outcome never reaches the hook log
         HasProbe    = $true      # `claude -p`
         Restart     = 'Claude Code'
     }
@@ -132,7 +135,13 @@ $agents = @{
         InstallMode = 'copy'
         # The same path install.ps1 writes, which is why `up` backs up what is there.
         Dest        = (Join-Path $userHome '.cursor\plugins\local\rogue')
-        HasBeacon   = $false     # inline in hook.ps1 at sessionStart; no stamp
+        # Both triggers (sessionStart + stop) since cursor 1.1.2, so it stamps and
+        # honours -BeaconInterval exactly as claude does.
+        HasBeacon   = $true
+        # ...but the POST is SYNCHRONOUS, inside the dispatcher, so unlike every other
+        # plugin its outcome lands in the hook log (`heartbeat=<status>|throttled`).
+        # That is the only reason this flag exists.
+        InlineBeacon = $true
         HasProbe    = $false
         Restart     = 'Cursor'
     }
@@ -268,9 +277,8 @@ function Invoke-Up {
         Fail "-BeaconInterval takes seconds, got: $BeaconInterval"
     }
     if ($BeaconInterval -ne '' -and -not $cfg.HasBeacon) {
-        Say "  NOTE: -BeaconInterval is ignored for $Agent - its beacon fires once per"
-        Say '  session from hook.ps1 and has no throttle. The knob is written anyway,'
-        Say '  harmlessly, since the env file is shared.'
+        Say "  NOTE: -BeaconInterval is ignored for $Agent - it has no throttled beacon."
+        Say '  The knob is written anyway, harmlessly, since the env file is shared.'
     }
 
     Rule 'the API'
@@ -565,26 +573,32 @@ function Invoke-Check {
 
     # ---- the beacon --------------------------------------------------------
     Rule 'the beacon'
-    if (-not $cfg.HasBeacon) {
-        # Cursor beacons inline from hook.ps1 at sessionStart and logs the HTTP status,
-        # so the log line IS the evidence; there is no stamp because there is nothing
-        # to throttle.
+    if ($cfg.InlineBeacon) {
+        # Cursor's beacon is SYNCHRONOUS inside the dispatcher, so unlike every other
+        # plugin it logs its own outcome - `heartbeat=<status>` when it went out,
+        # `heartbeat=throttled` when the window swallowed it. Both are evidence the
+        # per-turn trigger is wired, and the throttled line is the only place in the
+        # whole fleet where a throttle decision is directly observable.
         $hb = @($logText -split "`n" | Where-Object { $_ -match 'heartbeat=' })
         if ($hb.Count) {
             Say "  $($hb.Count) heartbeat line(s); last few:"
             Indent ($hb | Select-Object -Last 3) '    '
+            $thr = @($hb | Where-Object { $_ -match 'heartbeat=throttled' }).Count
+            if ($thr) { Ok "$thr throttled beacon(s) - the per-turn throttle is live" }
         } else {
-            Say '  no heartbeat= lines yet. Cursor beacons once per session, at'
-            Say '  sessionStart - start a fresh session if you expected one.'
+            Say '  no heartbeat= lines yet. Cursor beacons at sessionStart and on every'
+            Say '  stop - start a session and send one prompt if you expected one.'
         }
-        Say "  (no throttle stamp for $Agent - its beacon fires once per session)"
+    }
+    if (-not $cfg.HasBeacon) {
+        Say "  (no throttle stamp for $Agent - it has no throttled beacon)"
     } elseif (Test-Path -LiteralPath $beaconStamp) {
         $stampBytes = [System.IO.File]::ReadAllBytes($beaconStamp)
         if ($stampBytes.Length -ge 3 -and $stampBytes[0] -eq 0xEF -and
             $stampBytes[1] -eq 0xBB -and $stampBytes[2] -eq 0xBF) {
             Bad 'the beacon stamp has a BOM - TryParse fails on it, so the throttle is off'
         } else { Ok 'the beacon stamp has no BOM' }
-        # Parsed exactly as Test-BeaconThrottled parses it. An unparseable stamp reads
+        # Parsed exactly as Request-RogueBeaconSlot parses it. An unparseable stamp reads
         # as "not throttled", so the failure is a silent beacon on every single turn.
         $raw = (Get-Content -LiteralPath $beaconStamp -TotalCount 1) -replace '\s', ''
         $last = [int64]0

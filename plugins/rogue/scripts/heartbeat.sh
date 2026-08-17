@@ -95,53 +95,33 @@ BODY=$(printf '{"agent_family":"claude","agent":"%s","version":"%s","host":"%s",
 # most wants the update (a re-install with a new version, a different surface).
 # Throttling it would have been a behaviour change for no gain.
 #
-# A numeric zero DISABLES the throttle, and a non-numeric value falls back to the
-# default - the same rule as ROGUE_LOG_MAX_BYTES and ROGUE_SHIP_MIN_INTERVAL, so
-# there is one convention to remember. Note what zero means on a Stop trigger: a
-# beacon every turn. That is the knob doing what it says, not a footgun to clamp
-# away; the default is what protects the fleet.
-BEACON_MIN_INTERVAL="${ROGUE_HEARTBEAT_MIN_INTERVAL:-900}"
-case "$BEACON_MIN_INTERVAL" in ''|*[!0-9]*) BEACON_MIN_INTERVAL=900 ;; esac
-# All-digit is not the same as representable: dash answers `-lt` on a value wider
-# than a signed 64-bit int with "Illegal number" on stderr and a FALSE, which
-# reads as "not throttled" and would loose a per-turn beacon. 18 digits is the
-# widest that always fits; strip leading zeros first so a padded zero is still
-# judged on its value. Same clamp, same reason, as hook.sh's rotation cap.
-_bmi="$BEACON_MIN_INTERVAL"
-while [ "${_bmi#0}" != "$_bmi" ]; do _bmi="${_bmi#0}"; done
-[ "${#_bmi}" -gt 18 ] && BEACON_MIN_INTERVAL=900
-
-# Per-agent, under the ~/.rogue tree every plugin shares - so a machine running
-# several coding agents throttles each family's beacon separately.
-BEACON_STAMP="$HOME/.rogue/beacon/.last-claude"
-
-# 0 = skip this beacon. Every unreadable/unparseable case answers "not throttled":
-# a stamp we cannot trust must not be able to silence presence reporting.
-beacon_throttled() {
-  [ "$TRIGGER" = "SessionStart" ] && return 1
-  [ "$BEACON_MIN_INTERVAL" -gt 0 ] || return 1
-  [ -r "$BEACON_STAMP" ] || return 1
-  _blast=$(head -n1 "$BEACON_STAMP" 2>/dev/null | tr -d '[:space:]')
-  case "${_blast:-}" in ''|*[!0-9]*) return 1 ;; esac
-  _bnow=$(date -u +%s 2>/dev/null)
-  case "${_bnow:-}" in ''|*[!0-9]*) return 1 ;; esac
-  # A stamp in the FUTURE (clock stepped back, or a bad write) is stale, not a
-  # reason to stay quiet until the clock catches up.
-  [ "$_blast" -gt "$_bnow" ] && return 1
-  [ $((_bnow - _blast)) -lt "$BEACON_MIN_INTERVAL" ]
-}
+# The rule itself lives in scripts/beacon.sh, a byte-identical copy of
+# scripts/shared/beacon.sh shared with the other four sh-side plugins - the same
+# arrangement as ship-logs.sh, and for the same reason: all six plugins now beacon
+# on a per-turn trigger, and six hand-written copies of these semantics would
+# drift silently in one of two directions, "no beacon ever again" or "a beacon on
+# every turn". Every per-plugin difference is an ARGUMENT: the stamp slug here, and
+# whether this trigger is the session one.
+#
+# The knob (ROGUE_HEARTBEAT_MIN_INTERVAL, numeric zero disables, non-numeric falls
+# back to the default) is read from the environment inside the library, which is
+# correct because the env files were sourced above.
+#
+# `-r` guarded so a partial or older install degrades to an unthrottled beacon -
+# today's behaviour - rather than erroring out under `set -u`.
+BEACON_UNTHROTTLED=0
+[ "$TRIGGER" = "SessionStart" ] && BEACON_UNTHROTTLED=1
+if [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/beacon.sh" ]; then
+  . "${CLAUDE_PLUGIN_ROOT}/scripts/beacon.sh"
+else
+  rogue_beacon_claim() { return 0; }
+fi
 
 # The beacon, and ONLY the beacon, is gated on there being a session (see the note
-# where that check used to live).
-if [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ] && ! beacon_throttled; then
-  # Stamped BEFORE the request, like the shipper's: this is a crash-loop guard as
-  # much as a rate limit, so a beacon that hangs or dies must still cost the next
-  # turn its attempt rather than retrying on every single one. 0700/0600 to match
-  # the log tree - this file says when a machine was active, and nothing else on
-  # the box needs to read that.
-  ( umask 077
-    mkdir -p "${BEACON_STAMP%/*}" 2>/dev/null
-    date -u +%s > "$BEACON_STAMP" 2>/dev/null ) || true
+# where that check used to live). rogue_beacon_claim writes the stamp itself, BEFORE
+# the request below - deciding and stamping are one call so a caller cannot leave
+# the window permanently open by forgetting the second half.
+if [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ] && rogue_beacon_claim claude "$BEACON_UNTHROTTLED"; then
   curl -sS --max-time 10 -X POST \
     "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
     -H "x-rogue-api-key: $ROGUE_API_KEY" \

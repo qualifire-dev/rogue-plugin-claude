@@ -1,6 +1,6 @@
 {
   "name": "rogue-marketplace",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Rogue Security extensions for OpenAI Codex",
   "owner": {
     "name": "Qualifire (Rogue Security)",
@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "rogue",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "description": "Rogue Security AIDR — real-time AI agent detection and response for OpenAI Codex",
       "author": {
         "name": "Rogue Security",

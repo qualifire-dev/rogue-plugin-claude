@@ -593,6 +593,50 @@ if ($EventName -eq 'agentStop' -or $EventName -eq 'subagentStop') {
     } catch { Dbg "transcript augment failed: $($_.Exception.Message)" }
 }
 
+# ── per-turn presence heartbeat + log ship (agentStop only) ────────────────
+# The PowerShell twin of hook.sh's agentStop block. sessionStart's heartbeat is
+# spawned by hooks.json; this is its per-TURN sibling, fired from HERE rather than
+# from a second hooks.json entry because Copilot skips untrusted command hooks until
+# reviewed via /hooks - a new entry would silently disable every Rogue hook on every
+# existing install until each user re-approved. heartbeat.ps1 throttles the beacon
+# itself (scripts/beacon.ps1, 900s default) and the shipper throttles itself, so a
+# per-turn trigger is not a per-turn request.
+#
+# MAIN AGENT ONLY: Copilot fires agentStop for a subagent too, and $subagentId is
+# already resolved by this point, so this skips those - a subagent's stop is not a
+# user turn.
+#
+# A SEPARATE, HIDDEN PROCESS, for the same two reasons every PowerShell caller here
+# spawns one: in-process, heartbeat.ps1's `$script:` writes would land on this
+# dispatcher's variables and its `exit 0` would end the dispatcher before it relays
+# the response. -EncodedCommand with the path in an env var, so the command is a
+# constant with nothing to escape (Start-Process -ArgumentList quoting is unreliable
+# on Windows PowerShell 5.1). Start-Process without -Wait returns immediately.
+#
+# COPILOT_PLUGIN_ROOT is set explicitly because heartbeat.ps1 self-locates from
+# $PSCommandPath, which is EMPTY under [scriptblock]::Create - the -File spawn in
+# hooks.json has it, this one does not, and COPILOT_PLUGIN_ROOT is its documented
+# next fallback. Without it the child would resolve its root from the CWD and find no
+# bundled env, no manifest version and no shipper.
+if ($EventName -eq 'agentStop' -and -not $subagentId) {
+    $hbScript = Join-Path $pluginRoot 'scripts\heartbeat.ps1'
+    if (Test-Path -LiteralPath $hbScript) {
+        try {
+            $env:COPILOT_PLUGIN_ROOT    = $pluginRoot
+            $env:ROGUE_HEARTBEAT_SCRIPT = $hbScript
+            $hbInner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath' +
+                       ' $env:ROGUE_HEARTBEAT_SCRIPT))) agentStop'
+            $hbEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($hbInner))
+            $hbExe = 'powershell'
+            try { if ((Get-Process -Id $PID).Path) { $hbExe = (Get-Process -Id $PID).Path } } catch {}
+            Start-Process -FilePath $hbExe `
+                -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $hbEncoded `
+                -WindowStyle Hidden -ErrorAction Stop | Out-Null
+            Dbg 'stop heartbeat started'
+        } catch { Dbg "stop heartbeat not started: $($_.Exception.Message)" }
+    }
+}
+
 # ── POST (fail-open) → relay verbatim ──────────────────────────────────────
 $headers = @{
     'x-rogue-api-key'     = $apiKey

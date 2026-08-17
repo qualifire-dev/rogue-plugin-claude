@@ -148,13 +148,18 @@ function resolveActor(env) {
   return { email, name: name || "unknown" };
 }
 
-// ── Detached heartbeat (SessionStart only) ──────────────────────────────────
-// Fire-and-forget so it never adds latency to session start.
-function fireHeartbeat() {
+// ── Detached heartbeat (SessionStart + AfterAgent) ──────────────────────────
+// Fire-and-forget so it never adds latency to session start or to a turn.
+//
+// The TRIGGER is passed through, because heartbeat.mjs rate-limits its beacon on
+// anything that is not SessionStart: AfterAgent fires once per turn, and without the
+// distinction a long session would either beacon on every turn or (if it were
+// throttled unconditionally) miss the update a brand-new session most wants.
+function fireHeartbeat(trigger) {
   try {
     const child = spawn(
       process.execPath,
-      [path.join(SCRIPT_DIR, "heartbeat.mjs")],
+      [path.join(SCRIPT_DIR, "heartbeat.mjs"), trigger],
       { detached: true, stdio: "ignore" },
     );
     child.unref();
@@ -211,12 +216,30 @@ async function main() {
           "[Rogue Security] Not configured. Run /setup to connect your API key.",
       });
     }
-    fireHeartbeat();
+    fireHeartbeat("SessionStart");
   }
 
   if (!apiKey) {
     log("outcome=unconfigured");
     return emit({});
+  }
+
+  // AfterAgent is the per-TURN heartbeat trigger: it fires when the agent has
+  // finished replying, so the hook log's lines for this turn are already on disk for
+  // the shipper that rides along inside heartbeat.mjs. Before this, SessionStart was
+  // the only trigger, so a session left open for days produced exactly one beacon and
+  // one log upload for its whole lifetime.
+  //
+  // It falls THROUGH to the POST below like any other event - this is an extra side
+  // effect on an event we already relay, not a new branch. No hooks.json change was
+  // needed (AfterAgent is already registered), which also means Gemini's hook-trust
+  // fingerprint is untouched: a new command string would have left every existing
+  // install's hooks unrun until the user re-reviewed them via /hooks.
+  //
+  // Chosen over SessionEnd, which Gemini explicitly "will not wait" for on exit -
+  // the process can be gone before a detached child gets to send anything.
+  if (EVENT === "AfterAgent") {
+    fireHeartbeat("AfterAgent");
   }
 
   const payload = await readStdin();

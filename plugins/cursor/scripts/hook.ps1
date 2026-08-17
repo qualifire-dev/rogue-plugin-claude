@@ -465,7 +465,8 @@ foreach ($f in $credFiles) {
 # ROGUE_LOG_* ride the same list so a process-env value still beats the files,
 # which is what makes the resolved precedence identical to hook.sh's.
 foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL',
-               'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES') {
+               'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES',
+               'ROGUE_HEARTBEAT_MIN_INTERVAL') {
     $val = [Environment]::GetEnvironmentVariable($k)
     if ($val) { $creds[$k] = $val }
 }
@@ -598,14 +599,50 @@ else            { Log "raw=$(Sanitize $respHead)" }
 
 Emit-Json $resp
 
-# ── presence heartbeat (sessionStart only) ──────────────────────────────────
+# ── presence heartbeat (sessionStart + stop) ────────────────────────────────
 # POSTs /api/v1/hooks/status so this install shows in the dashboard's Coding
 # Agents roster (Connected / version / host / user). Pure side-effect: response
 # ignored, fully wrapped so it can never affect the already-emitted hook
 # response. Runs AFTER Emit-Json; PowerShell has no reliable fire-and-forget
-# across process exit, so this is a sync POST (10s cap) on sessionStart only.
-# Creds/actor were already resolved above.
-if ($EventName -eq 'sessionStart') {
+# across process exit, so this is a sync POST (10s cap). Creds/actor were already
+# resolved above.
+#
+# TWO TRIGGERS, matching hook.sh. `sessionStart` fires once per session; `stop` fires
+# once per TURN, and it exists because a session left open for days used to produce
+# exactly one beacon and one log upload for its whole lifetime - the roster row went
+# stale and the hook log sat on disk unshipped.
+#
+# There is no heartbeat.ps1 here to carry the trigger, so the throttle is applied
+# inline via scripts/beacon.ps1 - a byte-identical copy of scripts/shared/beacon.ps1,
+# the same library the other four PowerShell heartbeats load. `sessionStart` stays
+# unthrottled. THE SYNC POST IS EXACTLY WHY THE THROTTLE MATTERS MORE HERE than
+# anywhere else: on this plugin the beacon is not detached, so an unthrottled
+# per-turn beacon would add its latency to every single turn.
+$hbUnthrottled = $null
+if     ($EventName -eq 'sessionStart') { $hbUnthrottled = $true }
+elseif ($EventName -eq 'stop')         { $hbUnthrottled = $false }
+if ($null -ne $hbUnthrottled) {
+    # Loaded as a SCRIPTBLOCK from the file's text, at SCRIPT scope: dot-sourcing runs
+    # in the caller's scope, so loading it inside a function would define the library
+    # there and lose it on return. Never -File or a path dot-source - both are subject
+    # to ExecutionPolicy and to a GPO-enforced policy that Bypass cannot override.
+    #
+    # A missing or unparseable library degrades to an UNTHROTTLED beacon - today's
+    # behaviour, and the safe direction.
+    $beaconLib = Join-Path $pluginRoot 'scripts\beacon.ps1'
+    if (Test-Path -LiteralPath $beaconLib) {
+        try { . ([scriptblock]::Create((Get-Content -Raw -LiteralPath $beaconLib))) }
+        catch { Dbg "beacon library not loaded: $($_.Exception.Message)" }
+    }
+    if (-not (Get-Command Request-RogueBeaconSlot -ErrorAction SilentlyContinue)) {
+        function Initialize-RogueBeacon { param([hashtable]$Creds = @{}) }
+        function Request-RogueBeaconSlot { param([string]$Slug, [bool]$Unthrottled = $false) return $true }
+    }
+    # From the CREDENTIAL MAP, not $env: - the map is what carries the env files'
+    # resolved precedence, and ROGUE_HEARTBEAT_MIN_INTERVAL rides its process-env
+    # override list above so process env still wins.
+    Initialize-RogueBeacon $creds
+
     try {
         # Plugin version from the manifest.
         $hbVer = 'unknown'
@@ -636,13 +673,24 @@ if ($EventName -eq 'sessionStart') {
             'x-rogue-source'  = 'cursor'
         }
         $hbUrl = "$baseUrl/api/v1/hooks/status"
-        Dbg "heartbeat POST $hbUrl ver=$hbVer host=$hbHost"
-        $hbBytes = [System.Text.Encoding]::UTF8.GetBytes($hbBody)
-        $r = Invoke-WebRequest -Uri $hbUrl -Method Post `
-            -Headers $hbHeaders -ContentType 'application/json' -Body $hbBytes `
-            -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        Dbg "heartbeat HTTP $($r.StatusCode)"
-        Log "heartbeat=$($r.StatusCode) ver=$hbVer"
+        # Request-RogueBeaconSlot writes the stamp itself, BEFORE the request -
+        # deciding and stamping are one call so a caller cannot leave the window
+        # permanently open by forgetting the second half.
+        if (Request-RogueBeaconSlot -Slug 'cursor' -Unthrottled $hbUnthrottled) {
+            Dbg "heartbeat POST $hbUrl ver=$hbVer host=$hbHost"
+            $hbBytes = [System.Text.Encoding]::UTF8.GetBytes($hbBody)
+            $r = Invoke-WebRequest -Uri $hbUrl -Method Post `
+                -Headers $hbHeaders -ContentType 'application/json' -Body $hbBytes `
+                -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            Dbg "heartbeat HTTP $($r.StatusCode)"
+            Log "heartbeat=$($r.StatusCode) ver=$hbVer"
+        } else {
+            # Logged, unlike the other plugins' silent throttle, because this is the
+            # only plugin whose beacon decision happens in the dispatcher - so the
+            # hook log is where an operator can see it at all. Matches hook.sh.
+            Dbg 'heartbeat throttled'
+            Log "heartbeat=throttled ver=$hbVer"
+        }
     } catch {
         Dbg "heartbeat POST failed: $($_.Exception.Message)"
         Log "heartbeat=fail ver=$hbVer error=`"$(Sanitize $_.Exception.Message)`""
@@ -658,6 +706,11 @@ if ($EventName -eq 'sessionStart') {
     # -Wait returns immediately.
     #
     # After the heartbeat, so the roster row the log attaches to exists first.
+    #
+    # Runs on BOTH triggers and deliberately OUTSIDE the beacon throttle above: a
+    # throttled beacon still means a turn happened, and the log is worth draining
+    # either way. This is the whole point of the `stop` trigger - on `sessionStart`
+    # alone, a long session's log never left the disk.
     #
     # Every value travels as an environment variable, so the command is a constant
     # with nothing to escape. The actor is passed in, never re-resolved: Cursor's

@@ -25,7 +25,20 @@ Callers (one line each, no `hooks.json` change anywhere):
 |---|---|
 | claude, codex, copilot, antigravity | `scripts/heartbeat.sh` / `heartbeat.ps1` |
 | gemini | `scripts/heartbeat.mjs` |
-| cursor | inside the existing `if [ "$event" = "sessionStart" ]` block in `hook.sh` / `hook.ps1` |
+| cursor | the inline beacon block in `hook.sh` / `hook.ps1` (it has no heartbeat script) |
+
+**Every one of those call sites now runs on a PER-TURN trigger as well as a session
+one** — `Stop` (claude, codex, antigravity), `agentStop` (copilot), `stop` (cursor),
+`AfterAgent` (gemini). Before that, a session left open for days shipped exactly ONCE,
+at its start, when the log was still nearly empty. Only the claude plugin got a new
+`hooks.json` group for it; the rest fire from inside the dispatcher, because Codex,
+Copilot and Gemini fingerprint the hook definition and would have skipped every Rogue
+hook until each user re-approved via `/hooks`.
+
+**The shipper call sits OUTSIDE the beacon throttle** that the per-turn trigger
+introduced (`scripts/shared/beacon.{sh,ps1}`, 900 s default). A throttled beacon still
+means a turn happened, and the log is worth draining either way; the shipper's own
+interval is what limits it.
 
 **Never behind an agent-specific gate.** `plugins/rogue/scripts/heartbeat.sh` opened
 with `[ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ] && exit 0`; a shipper call anywhere below
@@ -236,12 +249,16 @@ The throttle exists to bound *our own worst case*:
 - **Rate ceiling per machine**, for the same reason, on any future bug that makes
   the shipper chattier than intended.
 
-**Why 900 s and not less:** the trigger is *session start*, not a timer. Someone
-in one four-hour session ships nothing during it no matter what the interval says
-— their logs arrive at their next session. So a lower interval only helps people
-who open many sessions, and 15 minutes already puts that group inside the window
-where a support request is still warm. Going to 60 s would multiply the crash-loop
-ceiling by 15 to make no practical difference to freshness.
+**Why 900 s and not less:** the trigger is not a timer, it is a *turn* — so the
+interval is the floor on how fresh a log can be, and 15 minutes puts a support
+request inside the window while it is still warm. Going to 60 s would multiply the
+crash-loop ceiling by 15 for no practical gain.
+
+This paragraph used to argue from *session start* being the only trigger, and
+concluded that "someone in one four-hour session ships nothing during it no matter
+what the interval says". That was true and was the bug: a long session's log sat on
+disk unshipped for its whole lifetime. Every plugin now also ships on a per-turn
+trigger, so the interval finally does the job this number was chosen for.
 
 #### The lock
 

@@ -360,13 +360,33 @@ dbg "curl rc=$_rc resp_len=${#RESP}"
 log "rc=$_rc raw=$(sanitize "$RESP" | head -c 400)"
 [ "$_rc" -eq 0 ] || RESP=""
 
-# ── presence heartbeat (sessionStart only, fire-and-forget) ────────────────
+# ── presence heartbeat (sessionStart + stop, fire-and-forget) ──────────────
 # POSTs /api/v1/hooks/status so this install shows in the dashboard's Coding
 # Agents roster (Connected / version / host / user). Pure side-effect: the POST
 # runs in a detached double-fork with all fds redirected, so neither the relayed
 # response below nor session start ever waits on it, and the response is
 # ignored. Creds/actor were already resolved above.
-if [ "$event" = "sessionStart" ]; then
+#
+# TWO TRIGGERS, as in every other plugin. `sessionStart` fires once per session;
+# `stop` fires once per TURN, and it exists because a session left open for days
+# used to produce exactly one beacon and one log upload for its whole lifetime -
+# the roster row went stale and the hook log sat on disk unshipped.
+#
+# There is no heartbeat.sh here to carry the trigger, so the throttle is applied
+# inline: scripts/beacon.sh (a byte-identical copy of scripts/shared/beacon.sh, the
+# same one the other four sh plugins load from their heartbeats) rate-limits the
+# beacon on a `stop`, while `sessionStart` stays unthrottled. The shipper below needs
+# no such gate - it already throttles itself, and a run with nothing new makes no
+# request at all.
+#
+# UNLIKE the other plugins this block runs INSIDE the synchronous dispatcher, so
+# everything it starts must be detached; see the shipper's comment below.
+case "$event" in
+  sessionStart) hb_unthrottled=1 ;;
+  stop)         hb_unthrottled=0 ;;
+  *)            hb_unthrottled="" ;;
+esac
+if [ -n "$hb_unthrottled" ]; then
   # Plugin version from the manifest, without python/jq.
   HB_VER="unknown"
   HB_PJ="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
@@ -382,16 +402,38 @@ if [ "$event" = "sessionStart" ]; then
   hb_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   HB_BODY=$(printf '{"agent_family":"cursor","agent":"cursor","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
     "$(hb_esc "$HB_VER")" "$(hb_esc "$HB_HOST")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
+  # ── beacon throttle ──────────────────────────────────────────────────────
+  # `-r` guarded so a partial or older install degrades to an unthrottled beacon -
+  # today's behaviour - rather than failing the hook. The knob
+  # (ROGUE_HEARTBEAT_MIN_INTERVAL, numeric zero disables, non-numeric falls back to
+  # the default) is read from the environment inside the library, which is correct
+  # because the env files were sourced at the top of this script.
+  if [ -r "$PLUGIN_ROOT/scripts/beacon.sh" ]; then
+    . "$PLUGIN_ROOT/scripts/beacon.sh"
+  else
+    rogue_beacon_claim() { return 0; }
+  fi
+
   dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$HB_VER host=$HB_HOST"
-  # Detached, so its HTTP outcome is unobservable — record only that it fired.
-  log "heartbeat=fired ver=$HB_VER"
-  ( curl -fsS --max-time 10 -X POST \
-      -H 'Content-Type: application/json' \
-      -H "x-rogue-api-key: $API_KEY" \
-      -H 'x-rogue-source: cursor' \
-      -d "$HB_BODY" \
-      "$BASE_URL/api/v1/hooks/status" \
-      </dev/null >/dev/null 2>&1 & )
+  # rogue_beacon_claim writes the stamp itself, BEFORE the request - deciding and
+  # stamping are one call so a caller cannot leave the window permanently open by
+  # forgetting the second half.
+  if rogue_beacon_claim cursor "$hb_unthrottled"; then
+    # Detached, so its HTTP outcome is unobservable — record only that it fired.
+    log "heartbeat=fired ver=$HB_VER"
+    ( curl -fsS --max-time 10 -X POST \
+        -H 'Content-Type: application/json' \
+        -H "x-rogue-api-key: $API_KEY" \
+        -H 'x-rogue-source: cursor' \
+        -d "$HB_BODY" \
+        "$BASE_URL/api/v1/hooks/status" \
+        </dev/null >/dev/null 2>&1 & )
+  else
+    # Logged, unlike the other plugins' silent throttle, because this is the only
+    # plugin whose beacon decision happens in the dispatcher - so the hook log is
+    # where an operator can see it at all.
+    log "heartbeat=throttled ver=$HB_VER"
+  fi
 
   # ── ship the hook log ────────────────────────────────────────────────────
   # DETACHED, with the same double-fork as the heartbeat above. That is not
@@ -403,6 +445,11 @@ if [ "$event" = "sessionStart" ]; then
   #
   # After the heartbeat, for the same reason as everywhere else: the heartbeat
   # creates or refreshes the roster row the uploaded log attaches to.
+  #
+  # Runs on BOTH triggers and deliberately OUTSIDE the beacon throttle above: a
+  # throttled beacon still means a turn happened, and the log is worth draining
+  # either way. This is the whole point of the `stop` trigger - on `sessionStart`
+  # alone, a long session's log never left the disk.
   #
   # The actor MUST be passed explicitly. Unlike the other plugins, which get it
   # from actor.sh (which exports), this dispatcher resolves the actor into plain

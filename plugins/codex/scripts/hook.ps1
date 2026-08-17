@@ -248,6 +248,47 @@ if (-not $actorEmail) {
     elseif ($env:USERNAME) { $actorEmail = $env:USERNAME } else { $actorEmail = $env:COMPUTERNAME }
 }
 
+# ── per-turn presence heartbeat + log ship (Stop only) ─────────────────────
+# The PowerShell twin of hook.sh's Stop block. SessionStart's heartbeat is spawned by
+# hooks.json; this is its per-TURN sibling, fired from HERE rather than from a second
+# hooks.json entry because Codex hashes the whole hook definition and skips untrusted
+# command hooks until reviewed via /hooks - a new entry would silently disable every
+# Rogue hook on every existing install until each user re-approved. heartbeat.ps1
+# throttles the beacon itself (scripts/beacon.ps1, 900s default) and the shipper
+# throttles itself, so a per-turn trigger is not a per-turn request.
+#
+# A SEPARATE, HIDDEN PROCESS, for the same two reasons every PowerShell caller in
+# this repo spawns one: in-process, heartbeat.ps1's `$script:` writes would land on
+# this dispatcher's variables and its `exit 0` would end the dispatcher before it
+# relays the response. -EncodedCommand with the path in an env var, so the command is
+# a constant with nothing to escape (Start-Process -ArgumentList quoting is
+# unreliable on Windows PowerShell 5.1). Start-Process without -Wait returns
+# immediately, so the relayed decision below is never delayed.
+#
+# PLUGIN_ROOT is set explicitly for the child: everything heartbeat.ps1 needs hangs
+# off it (bundled env file, surface.ps1, the manifest version, the shipper), and
+# $pluginRoot here may have come from the Get-Location fallback rather than the
+# environment. Writing $env: in the dispatcher is safe - it only adds what the child
+# reads, and this process exits a few lines below.
+if ($EventName -eq 'Stop') {
+    $hbScript = Join-Path $pluginRoot 'scripts\heartbeat.ps1'
+    if (Test-Path -LiteralPath $hbScript) {
+        try {
+            $env:PLUGIN_ROOT          = $pluginRoot
+            $env:ROGUE_HEARTBEAT_SCRIPT = $hbScript
+            $hbInner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath' +
+                       ' $env:ROGUE_HEARTBEAT_SCRIPT))) Stop'
+            $hbEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($hbInner))
+            $hbExe = 'powershell'
+            try { if ((Get-Process -Id $PID).Path) { $hbExe = (Get-Process -Id $PID).Path } } catch {}
+            Start-Process -FilePath $hbExe `
+                -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $hbEncoded `
+                -WindowStyle Hidden -ErrorAction Stop | Out-Null
+            Dbg 'stop heartbeat started'
+        } catch { Dbg "stop heartbeat not started: $($_.Exception.Message)" }
+    }
+}
+
 # ── payload from stdin (recover UTF-8, strip BOM) ──────────────────────────
 $payload = [Console]::In.ReadToEnd()
 if (-not $payload) { $payload = '{}' }
