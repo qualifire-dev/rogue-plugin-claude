@@ -30,8 +30,22 @@ function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.Writ
 # the update. Only the per-turn trigger is rate-limited.
 #
 # Defined UP HERE, above the credential loading, purely so the ROGUE_PS_LIB_ONLY
-# seam below can expose it to the tests without the dot-source running a real
-# beacon. Nothing in it depends on the credentials.
+# seam below can expose them to the tests without the dot-source running a real
+# beacon. The default stands alone so a dot-source that never calls
+# Initialize-BeaconThrottle still has a usable interval.
+$script:beaconMinInterval = 900
+
+# The interval is resolved from the CREDENTIAL MAP, not from $env: directly, and
+# therefore only once the env files have been parsed - exactly like
+# Initialize-Logging in hook.ps1, and for the same reason. Read at file scope this
+# silently ignored every env file: heartbeat.sh sources them BEFORE it reads the
+# knob, so `ROGUE_HEARTBEAT_MIN_INTERVAL` in ~/.rogue-env or in an MDM
+# C:\ProgramData\rogue\env took effect on macOS and Linux and did nothing on
+# Windows, leaving every Windows machine on the 900s default. There is no
+# workaround from a user's shell either: this script is spawned DETACHED by
+# hook.ps1, so its process environment comes from Claude Code, not from whoever
+# configured the machine. ROGUE_HEARTBEAT_MIN_INTERVAL rides the process-env
+# override list below, so process env still wins over the files.
 #
 # A numeric zero DISABLES the throttle; a non-numeric value falls back to the
 # default. Same rule as ROGUE_LOG_MAX_BYTES and ROGUE_SHIP_MIN_INTERVAL, so there
@@ -41,12 +55,17 @@ function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.Writ
 # TryParse, not a plain [int64] cast: the cast throws on a value too wide for the
 # type, and while $ErrorActionPreference = 'SilentlyContinue' would swallow it and
 # leave the default standing, that is the right answer reached by accident.
-$script:beaconMinInterval = 900
-$parsedInterval = [int64]0
-if ($env:ROGUE_HEARTBEAT_MIN_INTERVAL -and
-    [int64]::TryParse($env:ROGUE_HEARTBEAT_MIN_INTERVAL, [ref]$parsedInterval) -and
-    $parsedInterval -ge 0) {
-    $script:beaconMinInterval = $parsedInterval
+function Initialize-BeaconThrottle {
+    # [hashtable], defaulted, exactly like Initialize-Logging in hook.ps1: the merged
+    # credential map, whose precedence is already correct by the time it gets here.
+    param([hashtable]$Creds = @{})
+    $script:beaconMinInterval = 900
+    $raw = [string]$Creds['ROGUE_HEARTBEAT_MIN_INTERVAL']
+    if (-not $raw) { return }
+    $parsed = [int64]0
+    if ([int64]::TryParse($raw, [ref]$parsed) -and $parsed -ge 0) {
+        $script:beaconMinInterval = $parsed
+    }
 }
 
 # $HOME backs up USERPROFILE so this path also resolves when the file is
@@ -72,8 +91,17 @@ function Test-BeaconThrottled {
 }
 
 function Get-UnixSeconds {
-    return [int64][Math]::Floor((Get-Date).ToUniversalTime().Subtract(
-        [datetime]'1970-01-01T00:00:00Z').TotalSeconds)
+    # The epoch is CONSTRUCTED with DateTimeKind::Utc, never parsed from a string.
+    # `[datetime]'1970-01-01T00:00:00Z'` looks equivalent and is not: .NET reads the Z
+    # as UTC and then CONVERTS TO LOCAL, yielding Kind=Local (1970-01-01T02:00+02:00
+    # on a UTC+2 box). Subtracting a Local from a Utc does naive tick arithmetic, so
+    # this returned epoch MINUS the machine's UTC offset. The throttle still worked -
+    # the same function writes and reads the stamp, so the delta was right - but the
+    # number on disk was wrong by hours, disagreeing with the true epoch that
+    # heartbeat.sh writes to the same path with `date -u +%s` and with
+    # ship-logs.ps1's Get-EpochSeconds, which already does it this way.
+    $epoch = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    return [int64][Math]::Floor(((Get-Date).ToUniversalTime() - $epoch).TotalSeconds)
 }
 
 # The param() lands in the caller's scope when this file is dot-sourced, so the
@@ -138,9 +166,16 @@ foreach ($f in @((Join-Path $pluginRoot 'env'), 'C:\ProgramData\rogue\env', (Joi
         }
     }
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL') {
+# ROGUE_HEARTBEAT_MIN_INTERVAL rides this list so a process-env value still beats
+# the files, which is what makes the resolved precedence identical to hook.ps1's.
+foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL',
+               'ROGUE_HEARTBEAT_MIN_INTERVAL') {
     $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $creds[$k] = $val }
 }
+
+# Resolved HERE - after the env files are parsed so they can set it, and before the
+# API-key check below so the ordering cannot regress into reading it too early again.
+Initialize-BeaconThrottle $creds
 
 $apiKey = $creds['ROGUE_API_KEY']
 if (-not $apiKey) { Dbg 'not configured -> no-op'; exit 0 }
