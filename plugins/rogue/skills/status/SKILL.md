@@ -58,11 +58,18 @@ plugin version exists. The plugin version is read from the manifest without
 . /tmp/rogue-source-env.sh
 PJ=$(find "$HOME/.claude/plugins" -path '*rogue*/.claude-plugin/plugin.json' 2>/dev/null | head -1)
 VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-  *cowork*)  AGENT="Claude Cowork" ;;
-  *desktop*) AGENT="Claude Code - Desktop" ;;
-  *)         AGENT="Claude Code - CLI" ;;
-esac
+# CLAUDE_CODE_IS_COWORK first: Cowork spawns Claude Code with
+# CLAUDE_CODE_ENTRYPOINT=local-agent, so the entrypoint cases alone would label a
+# Cowork install "Claude Code - CLI" (mirrors scripts/heartbeat.sh).
+if [ -n "${CLAUDE_CODE_IS_COWORK:-}" ]; then
+  AGENT="Claude Cowork"
+else
+  case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
+    *cowork*)  AGENT="Claude Cowork" ;;
+    *desktop*) AGENT="Claude Code - Desktop" ;;
+    *)         AGENT="Claude Code - CLI" ;;
+  esac
+fi
 curl -s -w "\n%{http_code}" \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \

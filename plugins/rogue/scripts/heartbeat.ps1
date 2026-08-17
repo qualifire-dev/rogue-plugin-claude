@@ -122,10 +122,14 @@ if (Test-Path -LiteralPath $pj) {
 }
 
 # -- agent display label from entrypoint (family is the fixed enum "claude") -
+# CLAUDE_CODE_IS_COWORK is checked FIRST (mirrors heartbeat.sh): Cowork now
+# spawns Claude Code with CLAUDE_CODE_ENTRYPOINT=local-agent, so entrypoint
+# matching alone reported every Cowork install as "Claude Code - CLI".
 $ep = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
-if ($ep -like '*cowork*')      { $agent = 'Claude Cowork' }
-elseif ($ep -like '*desktop*') { $agent = 'Claude Code - Desktop' }
-else                           { $agent = 'Claude Code - CLI' }
+if ($env:CLAUDE_CODE_IS_COWORK)     { $agent = 'Claude Cowork' }
+elseif ($ep -like '*cowork*')       { $agent = 'Claude Cowork' }
+elseif ($ep -like '*desktop*')      { $agent = 'Claude Code - Desktop' }
+else                                { $agent = 'Claude Code - CLI' }
 
 $host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 

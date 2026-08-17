@@ -47,11 +47,20 @@ fi
 # x-rogue-agent header (free-form display label), derived from
 # CLAUDE_CODE_ENTRYPOINT (the same var hook.sh uses to tell GUI from cli).
 # Unknown → CLI.
-case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-  *cowork*)  AGENT="Claude Cowork" ;;
-  *desktop*) AGENT="Claude Code - Desktop" ;;
-  *)         AGENT="Claude Code - CLI" ;;
-esac
+#
+# CLAUDE_CODE_IS_COWORK is checked FIRST: Cowork now spawns Claude Code with
+# CLAUDE_CODE_ENTRYPOINT=local-agent (not a *cowork* value), so entrypoint
+# matching alone reported every Cowork install as "Claude Code - CLI". The
+# entrypoint cases stay for older/other hosts that do set a cowork entrypoint.
+if [ -n "${CLAUDE_CODE_IS_COWORK:-}" ]; then
+  AGENT="Claude Cowork"
+else
+  case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
+    *cowork*)  AGENT="Claude Cowork" ;;
+    *desktop*) AGENT="Claude Code - Desktop" ;;
+    *)         AGENT="Claude Code - CLI" ;;
+  esac
+fi
 
 # POST /api/v1/hooks/status (GET route is gone). The former x-rogue-agent-*
 # headers now ride the JSON body; x-rogue-api-key stays a header. Backslash- and
