@@ -2,10 +2,11 @@
 # Point THIS machine's Claude Code at the plugin WORKING TREE and a LOCAL Rogue API,
 # so you can exercise uncommitted plugin changes against a backend you control.
 #
-#   bash tests/manual/local_api.sh up [--url URL] [--key KEY] [--ship]
+#   bash tests/manual/local_api.sh up [--url URL] [--key KEY] [--ship] [--beacon-interval N]
 #   bash tests/manual/local_api.sh sync      # re-push working-tree edits, no reinstall
 #   bash tests/manual/local_api.sh status    # what is installed, where it points
 #   bash tests/manual/local_api.sh check     # assert the log looks like this branch
+#   bash tests/manual/local_api.sh ship [--reset]   # force a log upload NOW
 #   bash tests/manual/local_api.sh probe     # one headless session, no interactive restart
 #   bash tests/manual/local_api.sh down      # undo everything `up` did
 #
@@ -301,13 +302,35 @@ cmd_check() {
   rule "what your API answered"
   printf '%s\n' "$recent" | grep 'raw=' | tail -4 | sed 's/^/  /' || say "  (no raw= lines)"
 
-  # REPORTED, not asserted. Whether shipping should have run at all depends on flags
-  # this subcommand cannot see (a `up` without --ship, an env-file kill switch), so a
-  # zero here is not necessarily a failure - but it is the number you came to read.
+  # A SUCCESSFUL SHIP WRITES NOTHING. ship-logs.sh logs only notable outcomes - a
+  # fail, a skip, a stall - and deliberately never the happy path, because a line per
+  # run would mean every run has new bytes to ship and would destroy the "an idle
+  # machine makes no HTTP request at all" property the throttle depends on. So these
+  # lines are a FAILURE feed, not a progress feed: the count you want is ZERO, and the
+  # evidence of success is the offset, which advances only on a 2xx.
   rule "shipping and the Stop beacon"
   ships="$(grep -c 'event=ShipLogs' "$LOG" 2>/dev/null)"
-  say "  $ships ShipLogs line(s) in the whole log; last few:"
-  grep 'event=ShipLogs' "$LOG" 2>/dev/null | tail -3 | sed 's/^/    /' || say "    (none)"
+  if [ "${ships:-0}" = 0 ]; then
+    say "  no ShipLogs lines - nothing has FAILED to ship (success is silent)"
+  else
+    say "  $ships ShipLogs line(s) - these are failures/skips, not progress:"
+    grep 'event=ShipLogs' "$LOG" 2>/dev/null | tail -3 | sed 's/^/    /'
+  fi
+  SHIP_STATE="$HOME/.rogue/ship/claude.state"
+  if [ -r "$SHIP_STATE" ]; then
+    _off="$(sed -n 's/^offset=\([0-9]*\)$/\1/p' "$SHIP_STATE" | head -1)"
+    _size="$(wc -c < "$LOG" | tr -d ' ')"
+    if [ -n "$_off" ]; then
+      if [ "$_off" = "$_size" ]; then
+        say "  offset $_off == log size: every byte has been accepted (2xx)"
+      else
+        say "  offset $_off of $_size bytes accepted; $((_size - _off)) pending"
+        say "  Flush now with: bash tests/manual/local_api.sh ship"
+      fi
+    fi
+  else
+    say "  no ship state yet at $SHIP_STATE (shipping is OPT-IN; use \`up --ship\`)"
+  fi
   BEACON_STAMP="$HOME/.rogue/beacon/.last-claude"
   if [ -r "$BEACON_STAMP" ]; then
     _bs="$(head -n1 "$BEACON_STAMP" | tr -d '[:space:]')"
@@ -323,6 +346,58 @@ cmd_check() {
   say
   [ "$fails" = 0 ] && say "LOCAL API CHECK PASSED" || say "$fails failure(s)"
   return "$fails"
+}
+
+# Force one shipper run NOW, instead of waiting for the next Stop and guessing.
+# `--reset` first clears the offset state, so the whole log re-ships from byte 0 - the
+# only way to get a repeatable, observable POST at your API on demand.
+#
+# ROGUE_DEBUG is forced on: a successful run prints NOTHING (see the note in `check`),
+# so without it a working ship looks identical to one that did nothing at all.
+cmd_ship() {
+  RESET=0
+  [ "${1:-}" = "--reset" ] && RESET=1
+  MK="$MARKET_NAME"; export MK
+  IP="$(install_path)"
+  [ -n "$IP" ] || die "rogue@$MARKET_NAME is not installed - run \`up\` first"
+  [ -f "$IP/scripts/ship-logs.sh" ] || die "no shipper at $IP/scripts/ship-logs.sh"
+
+  SHIP_STATE="$HOME/.rogue/ship/claude.state"
+  rule "force a ship"
+  if [ "$RESET" = 1 ]; then
+    rm -f "$HOME"/.rogue/ship/*.state 2>/dev/null
+    say "  cleared the offset state - the whole log will re-ship from byte 0"
+  fi
+  before="$(sed -n 's/^offset=\([0-9]*\)$/\1/p' "$SHIP_STATE" 2>/dev/null | head -1)"
+  [ -n "$before" ] || before=0
+
+  # The actor is INHERITED, never re-resolved inside the shipper: the six plugins'
+  # cascades differ, so a second cascade would key the uploaded logs to a different
+  # identity for this same machine and they would join to nothing on the backend.
+  # shellcheck disable=SC1090
+  [ -r "$ENV_FILE" ] && . "$ENV_FILE"
+  [ -n "${ROGUE_ACTOR_EMAIL:-}" ] \
+    || die "no ROGUE_ACTOR_EMAIL to inherit - the shipper would skip with reason=no-actor"
+  export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
+  say "  running $IP/scripts/ship-logs.sh (slug=claude version=$(plugin_version) family=claude)"
+  ROGUE_DEBUG=1 sh "$IP/scripts/ship-logs.sh" "$IP" claude "$(plugin_version)" claude 2>&1 \
+    | sed 's/^/  ship: /'
+
+  after="$(sed -n 's/^offset=\([0-9]*\)$/\1/p' "$SHIP_STATE" 2>/dev/null | head -1)"
+  [ -n "$after" ] || after=0
+  say
+  if [ "$after" -gt "$before" ]; then
+    say "  OFFSET ADVANCED $before -> $after ($((after - before)) bytes accepted with a 2xx)"
+    say "  That is durable proof your API accepted them - the offset moves on 2xx only."
+  elif [ "$before" -gt 0 ]; then
+    say "  offset unchanged at $before. Tell the two cases apart by the ship: lines:"
+    say "    no POST line at all -> nothing new on disk (an idle run makes no request)"
+    say "    a POST line then outcome=fail http=NNN -> your API rejected the bytes"
+  else
+    say "  no offset recorded. Most likely ROGUE_SHIP_LOGS is not enabled (shipping is"
+    say "  OPT-IN), or an env file carries the ROGUE_SHIP_LOGS=0 kill switch, which"
+    say "  process env deliberately cannot override. Re-run \`up --ship\`."
+  fi
 }
 
 # A headless probe, for when you do not want to restart your editor to see whether
@@ -390,7 +465,10 @@ case "${1:-}" in
   sync)   cmd_sync ;;
   status) cmd_status ;;
   check)  cmd_check ;;
+  ship)   shift; cmd_ship "$@" ;;
   probe)  cmd_probe ;;
   down)   cmd_down ;;
-  *)      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' ; exit 1 ;;
+  # 2,11p: the usage block above, which grew a `ship` line. Keep this range in step
+  # with it - a stale range silently stops printing the last subcommand.
+  *)      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ; exit 1 ;;
 esac

@@ -5,8 +5,12 @@
 #   pwsh -File tests\manual\local_api.ps1 sync      # re-push working-tree edits, no reinstall
 #   pwsh -File tests\manual\local_api.ps1 status    # what is installed, where it points
 #   pwsh -File tests\manual\local_api.ps1 check     # assert the log looks like this branch
+#   pwsh -File tests\manual\local_api.ps1 ship [-Reset]   # force a log upload NOW
 #   pwsh -File tests\manual\local_api.ps1 probe     # one headless session, no restart
 #   pwsh -File tests\manual\local_api.ps1 down      # undo everything `up` did
+#
+# Every command also runs under Windows PowerShell 5.1 (`powershell -File ...`); this
+# file is kept 5.1-clean, so a box without pwsh 7 needs nothing extra installed.
 #
 # WHY THIS FILE EXISTS AT ALL, given tests/manual/local_api.sh already does this.
 # Two reasons, and neither is cosmetic:
@@ -64,7 +68,9 @@ param(
     # beacon on every turn. Written to the env FILE, which heartbeat.ps1 honors only
     # because it now resolves the knob from the credential map; reading $env: at file
     # scope, as it once did, ignored every env file on Windows.
-    [string]$BeaconInterval = ''
+    [string]$BeaconInterval = '',
+    # `ship -Reset`: clear the offset state so the whole log re-ships from byte 0.
+    [switch]$Reset
 )
 
 $ErrorActionPreference = 'Stop'
@@ -455,25 +461,42 @@ function Invoke-Check {
     }
 
     # ---- shipping ----------------------------------------------------------
-    # REPORTED, not asserted: whether shipping should have run depends on flags this
-    # subcommand cannot see (an `up` without -Ship, an env-file kill switch), so a
-    # zero is not necessarily a failure. It is the number you came to read.
+    # A SUCCESSFUL SHIP WRITES NOTHING. ship-logs.* logs only notable outcomes - a
+    # fail, a skip, a stall - and deliberately never the happy path, because a line
+    # per run would mean every run has new bytes to ship and would destroy the "an
+    # idle machine makes no HTTP request at all" property the throttle depends on.
+    # So `event=ShipLogs` lines are a FAILURE feed, not a progress feed: the count you
+    # want here is ZERO, and the durable evidence of success is the offset below.
     Rule 'shipping'
     # Reuses the text decoded above rather than re-reading the file.
     $ships = @($logText -split "`n" | Where-Object { $_ -match 'event=ShipLogs' })
-    Say "  $($ships.Count) ShipLogs line(s) in the whole log; last few:"
-    if ($ships.Count) { Indent ($ships | Select-Object -Last 3) '    ' } else { Say '    (none)' }
+    if ($ships.Count -eq 0) {
+        Say '  no ShipLogs lines - nothing has FAILED to ship (success is silent)'
+    } else {
+        Say "  $($ships.Count) ShipLogs line(s) - these are failures/skips, not progress:"
+        Indent ($ships | Select-Object -Last 3) '    '
+    }
     if (Test-Path -LiteralPath $shipDir) {
-        foreach ($st in @(Get-ChildItem -LiteralPath $shipDir -Filter '*.state' -ErrorAction SilentlyContinue)) {
+        $states = @(Get-ChildItem -LiteralPath $shipDir -Filter '*.state' -ErrorAction SilentlyContinue)
+        if ($states.Count -eq 0) { Say "  no .state files yet in $shipDir" }
+        foreach ($st in $states) {
             $body = (Get-Content -Raw -LiteralPath $st.FullName) -replace '\r?\n', ' '
             Say "  $($st.Name): $body"
-            # The offset must never exceed the file it tracks: past the end, every
-            # later read is a fragment and the log silently stops shipping.
+            # The offset IS the success signal: it advances ONLY on a 2xx, so a value
+            # equal to the log size means every byte on disk has been accepted by your
+            # API. It must also never EXCEED the file - past the end, every later read
+            # is a fragment and the log silently stops shipping.
             $m = [regex]::Match($body, 'offset=([0-9]+)')
             if ($m.Success) {
                 $off = [int64]$m.Groups[1].Value
-                if ($off -le $bytes.Length) { Ok "offset $off is within the $($bytes.Length)-byte log" }
-                else { Bad "offset $off is PAST the end of the $($bytes.Length)-byte log" }
+                if ($off -gt $bytes.Length) {
+                    Bad "offset $off is PAST the end of the $($bytes.Length)-byte log"
+                } elseif ($off -eq $bytes.Length) {
+                    Ok "offset $off == log size: every byte has been accepted (2xx)"
+                } else {
+                    Ok ("offset $off of $($bytes.Length) bytes accepted; " +
+                        "$($bytes.Length - $off) still pending - run ``ship`` to flush now")
+                }
             }
         }
     } else { Say "  no state directory yet at $shipDir" }
@@ -481,6 +504,113 @@ function Invoke-Check {
     Say ''
     if ($script:checkFails -eq 0) { Say 'LOCAL API CHECK PASSED' } else { Say "$($script:checkFails) failure(s)" }
     return $script:checkFails
+}
+
+# Force one shipper run NOW, instead of waiting for the next Stop and guessing.
+# `-Reset` first deletes the offset state, so the whole log re-ships from byte 0 - the
+# only way to get a repeatable, observable POST at your API on demand.
+#
+# A CHILD PROCESS, never in-process. ship-logs.ps1 ends in `exit 0`, which dot-sourced
+# or invoked as a scriptblock here would terminate THIS script, and its `$script:`
+# writes would land on this file's variables. Same -EncodedCommand shape heartbeat.ps1
+# uses to spawn it: every value travels as an environment variable and the command
+# itself is a constant, so a plugin path containing a quote cannot alter it, and there
+# is no -ArgumentList quoting to get wrong on Windows PowerShell 5.1.
+function Invoke-Ship {
+    $ip = Get-InstallPath
+    if (-not $ip) { Fail "rogue@$marketName is not installed - run ``up`` first" }
+    $shipScript = Join-Path $ip 'scripts\ship-logs.ps1'
+    if (-not (Test-Path -LiteralPath $shipScript)) { Fail "no shipper at $shipScript" }
+
+    # ship-logs.ps1 stands down on non-Windows (ship-logs.sh owns macOS/Linux/WSL, so
+    # exactly one of the pair ever runs). Without this the child would exit silently
+    # having done nothing, and the "offset unchanged" branch below would report it as
+    # "nothing new on disk" - a wrong diagnosis of a correct stand-down.
+    if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) {
+        Fail @'
+ship-logs.ps1 stands down on non-Windows, so this subcommand is a no-op here.
+Use the sh sibling instead:  bash tests/manual/local_api.sh ship
+'@
+    }
+
+    Rule 'force a ship'
+    if ($Reset) {
+        if (Test-Path -LiteralPath $shipDir) {
+            Remove-Item -Force -Path (Join-Path $shipDir '*.state') -ErrorAction SilentlyContinue
+            Say '  cleared the offset state - the whole log will re-ship from byte 0'
+        }
+    }
+    $before = 0
+    $stateFileForLog = Join-Path $shipDir 'claude.state'
+    if (Test-Path -LiteralPath $stateFileForLog) {
+        $m = [regex]::Match((Get-Content -Raw -LiteralPath $stateFileForLog), 'offset=([0-9]+)')
+        if ($m.Success) { $before = [int64]$m.Groups[1].Value }
+    }
+
+    $version = 'unknown'
+    $pj = Join-Path $ip '.claude-plugin\plugin.json'
+    if (Test-Path -LiteralPath $pj) {
+        $m = [regex]::Match((Get-Content -Raw -LiteralPath $pj), '"version"\s*:\s*"([^"]+)"')
+        if ($m.Success) { $version = $m.Groups[1].Value }
+    }
+
+    # The actor is PASSED IN, exactly as heartbeat.ps1 passes it: the shipper must
+    # never run a cascade of its own, or the uploaded logs key to a second identity for
+    # this machine and join to nothing on the backend.
+    $actorEmail = $env:ROGUE_ACTOR_EMAIL
+    $actorName  = $env:ROGUE_ACTOR_NAME
+    if (-not $actorEmail -or -not $actorName) {
+        foreach ($line in (Get-Content -LiteralPath $envFile -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*(?:export\s+)?ROGUE_ACTOR_EMAIL=(.+)$' -and -not $actorEmail) {
+                $actorEmail = $Matches[1].Trim().Trim("'").Trim('"')
+            }
+            if ($line -match '^\s*(?:export\s+)?ROGUE_ACTOR_NAME=(.+)$' -and -not $actorName) {
+                $actorName = $Matches[1].Trim().Trim("'").Trim('"')
+            }
+        }
+    }
+    if (-not $actorEmail) { Fail 'no ROGUE_ACTOR_EMAIL to inherit - the shipper would skip with reason=no-actor' }
+
+    $env:ROGUE_ACTOR_EMAIL     = $actorEmail
+    $env:ROGUE_ACTOR_NAME      = $actorName
+    $env:ROGUE_SHIPPER_SCRIPT  = $shipScript
+    $env:ROGUE_SHIPPER_ROOT    = $ip
+    $env:ROGUE_SHIPPER_SLUG    = 'claude'
+    $env:ROGUE_SHIPPER_VERSION = $version
+    $env:ROGUE_SHIPPER_FAMILY  = 'claude'
+    # ROGUE_DEBUG on, so every outcome also goes to stderr. Without it a successful run
+    # prints nothing at all and looks identical to a run that did nothing.
+    $env:ROGUE_DEBUG = '1'
+    $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))' +
+             ' $env:ROGUE_SHIPPER_ROOT $env:ROGUE_SHIPPER_SLUG' +
+             ' $env:ROGUE_SHIPPER_VERSION $env:ROGUE_SHIPPER_FAMILY'
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+    $psExe = 'powershell'
+    try { if ((Get-Process -Id $PID).Path) { $psExe = (Get-Process -Id $PID).Path } } catch {}
+    Say "  running $shipScript (slug=claude version=$version family=claude)"
+    # -Wait and inherited streams, unlike the heartbeat's detached spawn: here you want
+    # to see the outcome, not fire and forget.
+    & $psExe -NoProfile -NonInteractive -EncodedCommand $encoded 2>&1 |
+        ForEach-Object { Say "  ship: $_" }
+
+    $after = 0
+    if (Test-Path -LiteralPath $stateFileForLog) {
+        $m = [regex]::Match((Get-Content -Raw -LiteralPath $stateFileForLog), 'offset=([0-9]+)')
+        if ($m.Success) { $after = [int64]$m.Groups[1].Value }
+    }
+    Say ''
+    if ($after -gt $before) {
+        Say "  OFFSET ADVANCED $before -> $after ($($after - $before) bytes accepted with a 2xx)"
+        Say '  That is the durable proof your API accepted them - the offset moves on 2xx only.'
+    } elseif ($after -eq $before -and $before -gt 0) {
+        Say "  offset unchanged at $before. Tell the two cases apart by the ship: lines:"
+        Say '    no POST line at all -> nothing new on disk (an idle run makes no request)'
+        Say '    a POST line then outcome=fail http=NNN -> your API rejected the bytes'
+    } else {
+        Say '  no offset recorded. Most likely ROGUE_SHIP_LOGS is not enabled (shipping is'
+        Say '  OPT-IN), or an env file carries the ROGUE_SHIP_LOGS=0 kill switch, which'
+        Say '  process env deliberately cannot override. Re-run `up` with -Ship.'
+    }
 }
 
 # A headless probe, for when you do not want to restart your editor to see whether the
@@ -496,9 +626,11 @@ function Invoke-Probe {
 
     $hooksRaw = Get-Content -Raw -LiteralPath (Join-Path $ip 'hooks\hooks.json')
     # The only edit: expand ${CLAUDE_PLUGIN_ROOT}, which Claude Code substitutes for a
-    # plugin hook but not for a settings hook. Done on the TEXT, so the command strings
-    # survive byte for byte - re-serializing them through ConvertTo-Json would re-escape
-    # the nested quoting the polyglot depends on.
+    # plugin hook but not for a settings hook. Substituted on the RAW TEXT, so the
+    # backslashes in the Windows path must be JSON-escaped by hand before they go in -
+    # the round-trip through ConvertFrom-Json/ConvertTo-Json below then re-escapes the
+    # polyglot's nested quoting correctly, exactly as the sh sibling's JSON.parse /
+    # JSON.stringify pair does.
     $expanded = $hooksRaw.Replace('${CLAUDE_PLUGIN_ROOT}', $ip.Replace('\', '\\'))
     $hooks = ($expanded | ConvertFrom-Json).hooks
     Write-TextNoBom $settings (@{ hooks = $hooks } | ConvertTo-Json -Depth 100)
@@ -559,11 +691,13 @@ switch ($Command) {
     'sync'   { Invoke-Sync; exit 0 }
     'status' { Invoke-Status; exit 0 }
     'check'  { exit (Invoke-Check) }
+    'ship'   { Invoke-Ship; exit 0 }
     'probe'  { exit (Invoke-Probe) }
     'down'   { Invoke-Down; exit 0 }
     default  {
-        # The usage block at the top of this file, so there is one copy of it.
-        foreach ($l in (Get-Content -LiteralPath $PSCommandPath -TotalCount 12)) {
+        # The usage block at the top of this file, so there is one copy of it. Keep the
+        # count in step with that block - a stale one silently truncates the help.
+        foreach ($l in (Get-Content -LiteralPath $PSCommandPath -TotalCount 13)) {
             Write-Host ($l -replace '^# ?', '')
         }
         exit 1
