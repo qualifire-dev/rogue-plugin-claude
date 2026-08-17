@@ -197,9 +197,23 @@ if os.path.exists(pp):
 PY
 
 # Bake the API key + config into ${CLAUDE_PLUGIN_ROOT}/env. Actor identity is
-# derived per-user at hook-fire time (git config / $USER) so the same compiled
-# zip works for every end user. ~/.rogue-env on the end-user's machine still
-# overrides anything here because it's sourced after this file.
+# derived per-user at hook-fire time by plugins/rogue/scripts/actor.sh (and its
+# hook.ps1 twin), so the same compiled zip works for every end user.
+# ~/.rogue-env on the end-user's machine still overrides anything here because
+# it's sourced after this file.
+#
+# Deliberately NO actor pre-seed here. This file used to emit
+#   : "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email)}"
+# whose $( ) runs at hook-fire time and short-circuits the dispatcher's cascade.
+# The comment that justified it ("hooks empirically run on the host, so hostname
+# is a stable per-machine identifier") is exactly the assumption that broke:
+# inside Claude Cowork the hook runs in a sandbox as unix user `claude`, with
+# git configured as Anthropic's synthetic "Claude <noreply@anthropic.com>", so
+# every Cowork user was reported as Claude while the real
+# CLAUDE_CODE_USER_EMAIL sat unread. actor.sh now ranks CLAUDE_CODE_USER_EMAIL
+# above git config and rejects synthetic identities (including any arriving via
+# ROGUE_ACTOR_*, which is what lets a plugin update repair bundles already in
+# the field that carry the old pre-seed). Don't add it back.
 {
   echo "# Compiled by compile-customer-plugin.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "# Source release: ${FROM}"
@@ -208,18 +222,6 @@ PY
   [ -n "$BASE_URL" ] && printf 'export ROGUE_BASE_URL=%q\n' "$BASE_URL"
   # The bundled version is the truth — don't let auto-update clobber it.
   echo 'export ROGUE_AUTO_UPDATE=0'
-  cat <<'ACTOR'
-
-# Best-effort actor identity from git config — useful on developer machines.
-# If still empty at hook-fire time, the hooks themselves fall back to
-# hostname/whoami (see hooks.json). The earlier "no hostname fallback" rule
-# assumed hooks ran inside the Cowork/build-VM guest where hostname is
-# random — empirically they run on the host, so hostname is a stable
-# per-machine identifier and safe to use as a last resort.
-: "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email 2>/dev/null)}"
-: "${ROGUE_ACTOR_NAME:=$(git config --global user.name 2>/dev/null)}"
-export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
-ACTOR
 } > "$STAGE/env"
 chmod 600 "$STAGE/env"
 

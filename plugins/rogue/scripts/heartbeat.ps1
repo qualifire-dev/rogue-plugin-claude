@@ -39,6 +39,24 @@ function ConvertFrom-ShellQuoted {
     return $sb.ToString()
 }
 
+function Test-SyntheticActor {
+    # Duplicated from hook.ps1 (heartbeat.ps1 is standalone, like its copy of
+    # ConvertFrom-ShellQuoted). Keep in lockstep with actor.sh's
+    # _rogue_is_synthetic: empty/whitespace, "claude", "claude code" and
+    # "noreply@anthropic.com" are the sandbox identity, never a human.
+    param([string]$Value)
+    if ($null -eq $Value) { return $true }
+    $v = ($Value -replace '\s+', ' ').Trim().ToLowerInvariant()
+    return ($v -eq '' -or $v -eq 'claude' -or $v -eq 'claude code' -or $v -eq 'noreply@anthropic.com')
+}
+
+function Select-ActorValue {
+    param([string[]]$Candidates)
+    if ($null -eq $Candidates) { return '' }
+    foreach ($c in $Candidates) { if (-not (Test-SyntheticActor $c)) { return $c } }
+    return ''
+}
+
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -72,18 +90,27 @@ if (-not $apiKey) { Dbg 'not configured -> no-op'; exit 0 }
 $baseUrl = $creds['ROGUE_BASE_URL']; if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
 $baseUrl = $baseUrl.TrimEnd('/')
 
-# -- actor resolution (mirrors actor.sh) ------------------------------------
-$actorName = $creds['ROGUE_ACTOR_NAME']
-if (-not $actorName) { try { $actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorName -and $env:CLAUDE_CODE_USER_EMAIL) { $actorName = ($env:CLAUDE_CODE_USER_EMAIL -split '@')[0] }
-if (-not $actorName) { $actorName = $env:USERNAME }
+# -- actor resolution (mirrors actor.sh / hook.ps1: first non-synthetic wins) -
+$actorName = Select-ActorValue @(
+    $creds['ROGUE_ACTOR_NAME'],
+    (($env:CLAUDE_CODE_USER_EMAIL -split '@')[0])
+)
+if (-not $actorName) {
+    $gitName = ''
+    try { $gitName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {}
+    $actorName = Select-ActorValue @($gitName, $env:USERNAME)
+}
+if (-not $actorName) { $actorName = 'unknown' }
 
-$actorEmail = $creds['ROGUE_ACTOR_EMAIL']
-if (-not $actorEmail) { try { $actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorEmail -and $env:CLAUDE_CODE_USER_EMAIL) { $actorEmail = $env:CLAUDE_CODE_USER_EMAIL }
+$actorEmail = Select-ActorValue @($creds['ROGUE_ACTOR_EMAIL'], $env:CLAUDE_CODE_USER_EMAIL)
 if (-not $actorEmail) {
-    if ($env:USERNAME -and $env:COMPUTERNAME) { $actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
-    elseif ($env:USERNAME) { $actorEmail = $env:USERNAME } else { $actorEmail = $env:COMPUTERNAME }
+    $gitEmail = ''
+    try { $gitEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {}
+    $actorEmail = Select-ActorValue @($gitEmail)
+}
+if (-not $actorEmail) {
+    $hostForActor = Select-ActorValue @($env:COMPUTERNAME)
+    if ($hostForActor) { $actorEmail = "unknown@$hostForActor" } else { $actorEmail = 'unknown' }
 }
 
 # -- plugin version (regex from manifest, no python) ------------------------

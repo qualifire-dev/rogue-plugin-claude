@@ -72,6 +72,13 @@ jobs:
           done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh')
           [ "$fail" = 0 ] || exit 1
 
+      - name: Shell unit tests
+        # Only the dependency-free ones run here (the dispatcher end-to-end tests
+        # need a mock server + nc). dash is Ubuntu's /bin/sh, i.e. what Claude Code
+        # invokes the hook with, so the actor cascade is exercised under strict
+        # POSIX. Its PowerShell twin is covered by the unit tests below.
+        run: TEST_SH=dash bash tests/test_actor_sh.sh
+
       - name: PowerShell scripts parse
         # The .ps1 dispatchers are the Windows half of every plugin and cannot be
         # run on a dev Mac (no pwsh) — this is the only gate that ever parses

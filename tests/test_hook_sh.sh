@@ -113,5 +113,28 @@ out=$(PATH="$STUB:$PATH" "$SH" "$HOOK" PreToolUse <<< '{}')
 rm -rf "$STUB"
 assert_eq "$out" "{}" "Git Bash stand-down emits {}"
 
+# ── Case 6: a poisoned actor identity in an env file is rejected ────────────
+# End-to-end guard for the Cowork fix: compiled bundles already in the field bake
+# `: "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email)}"` into an env file
+# that hook.sh sources BEFORE actor.sh, and inside the sandbox that git identity
+# is Anthropic's synthetic one. The dispatcher must distrust it and fall through
+# to CLAUDE_CODE_USER_EMAIL. (Cascade unit coverage lives in test_actor_sh.sh.)
+restart_mock '{}'
+TMP_HOME="$(mktemp -d)"
+cat > "$TMP_HOME/.rogue-env" <<EOF
+export ROGUE_API_KEY=test-key
+export ROGUE_ACTOR_EMAIL=noreply@anthropic.com
+export ROGUE_ACTOR_NAME=Claude
+export ROGUE_BASE_URL=http://127.0.0.1:${PORT}
+EOF
+out=$(HOME="$TMP_HOME" CLAUDE_CODE_ENTRYPOINT=cli CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+  CLAUDE_CODE_USER_EMAIL='real.user@corp.com' \
+  ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
+  "$SH" "$HOOK" PreToolUse <<< '{}')
+rm -rf "$TMP_HOME"
+assert_eq "$out" "{}" "poisoned-actor run still relays the response"
+assert_header "x-rogue-actor-email" "real.user@corp.com" "synthetic ROGUE_ACTOR_EMAIL replaced by CLAUDE_CODE_USER_EMAIL"
+assert_header "x-rogue-actor-name"  "real.user"          "synthetic ROGUE_ACTOR_NAME replaced by its local-part"
+
 echo
 echo "All hook.sh tests passed (SH=$SH)."

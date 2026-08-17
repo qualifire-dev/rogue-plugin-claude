@@ -25,9 +25,10 @@ esac
 # Not configured → no-op (mirrors hook.sh fail-open on missing key).
 [ -n "${ROGUE_API_KEY:-}" ] || exit 0
 
-# Actor identity via the shared cascade (env → git → CLAUDE_CODE_USER_EMAIL → host/whoami).
-# actor.sh uses ${CLAUDE_CODE_USER_EMAIL%@*} with no default — that aborts under
-# `set -u` on bash >=4.4 when the var is unset, so relax nounset across the source.
+# Actor identity via the shared cascade (env → CLAUDE_CODE_USER_EMAIL → git →
+# host/whoami marker), with synthetic sandbox identities screened out — see
+# actor.sh. It is written `set -u`-safe, but nounset is relaxed across the source
+# anyway so a future unguarded expansion there can never kill the heartbeat.
 set +u
 [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/actor.sh" ] && . "${CLAUDE_PLUGIN_ROOT}/scripts/actor.sh"
 set -u

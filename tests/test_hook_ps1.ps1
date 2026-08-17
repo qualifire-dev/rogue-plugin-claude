@@ -88,10 +88,56 @@ Assert-Decode ($DQ + 'O' + $SQ + 'Brien' + $DQ) ('O' + $SQ + 'Brien') 'single qu
 # ── trailing backslash: no following char to escape, kept literal ──────────
 Assert-Decode ('a' + $BS)             ('a' + $BS)            'trailing lone backslash kept literal'
 
+# ── actor identity screening (Test-SyntheticActor / Select-ActorValue) ─────
+# In Claude Cowork the hook runs in a sandbox as unix user `claude` whose git
+# identity is Anthropic's synthetic "Claude <noreply@anthropic.com>", so those
+# values must never be reported as the acting human — from ANY source, including
+# an explicit ROGUE_ACTOR_* baked into a compiled bundle's env file. The sh twin
+# of this screen is actor.sh's _rogue_is_synthetic (see tests/test_actor_sh.sh).
+function Assert-Synthetic {
+    param([string]$Value, [bool]$Expected, [string]$Label)
+    $script:count++
+    $got = [bool](Test-SyntheticActor $Value)
+    if ($got -eq $Expected) {
+        Write-Host "  ok: $Label"
+    } else {
+        Write-Host "FAIL [$Label]: Test-SyntheticActor <$Value> = $got, expected $Expected"
+        $script:fails++
+    }
+}
+function Assert-Selected {
+    param([string[]]$Candidates, [string]$Expected, [string]$Label)
+    $script:count++
+    $got = Select-ActorValue $Candidates
+    if ($got -ceq $Expected) {
+        Write-Host "  ok: $Label"
+    } else {
+        Write-Host "FAIL [$Label]: Select-ActorValue = <$got>, expected <$Expected>"
+        $script:fails++
+    }
+}
+
+Assert-Synthetic ''                      $true  'empty value is synthetic'
+Assert-Synthetic '   '                   $true  'whitespace-only value is synthetic'
+Assert-Synthetic 'Claude'                $true  'Claude is synthetic'
+Assert-Synthetic 'claude'                $true  'claude (lowercase) is synthetic'
+Assert-Synthetic 'Claude Code'           $true  'Claude Code is synthetic'
+Assert-Synthetic '  CLAUDE   code  '     $true  'case + repeated whitespace still matches'
+Assert-Synthetic 'noreply@anthropic.com' $true  'sandbox git email is synthetic'
+Assert-Synthetic 'NoReply@Anthropic.COM' $true  'sandbox git email match is case-insensitive'
+Assert-Synthetic 'Jane Dev'              $false 'a real name is not synthetic'
+Assert-Synthetic 'Claudia Claude-Smith'  $false 'a name merely containing claude is not synthetic'
+Assert-Synthetic 'claude.dubois@corp.com' $false 'a real email at a real domain is not synthetic'
+
+Assert-Selected @('noreply@anthropic.com', 'real.user@corp.com') 'real.user@corp.com' 'poisoned first candidate skipped'
+Assert-Selected @('Claude', '', 'Jane Dev')                      'Jane Dev'           'synthetic + empty candidates skipped'
+Assert-Selected @('mdm@corp.com', 'real.user@corp.com')          'mdm@corp.com'       'first legitimate candidate wins'
+Assert-Selected @('Claude', 'claude code', '  ')                 ''                   'all-synthetic yields empty (caller emits the unknown marker)'
+
 if ($fails -gt 0) {
     Write-Host ""
-    Write-Host "$fails of $count PowerShell parser test(s) FAILED."
+    Write-Host "$fails of $count PowerShell unit test(s) FAILED."
     exit 1
 }
 Write-Host ""
-Write-Host "All $count hook.ps1 parser tests passed."
+Write-Host "All $count hook.ps1 unit tests passed."
