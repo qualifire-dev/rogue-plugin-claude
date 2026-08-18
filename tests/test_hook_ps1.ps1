@@ -194,6 +194,16 @@ if ($skill -match [regex]::Escape('$env:ROGUE_PS_LIB_ONLY') -and $skill -match '
     $script:fails++
 }
 $script:count++
+if ($skill -match [regex]::Escape('$hostName = $env:COMPUTERNAME') -and
+    $skill -match [regex]::Escape('[System.Net.Dns]::GetHostName()') -and
+    $skill -notmatch [regex]::Escape('host=$env:COMPUTERNAME')) {
+    Write-Host "  ok: status skill resolves the roster host with the COMPUTERNAME -> DNS -> unknown cascade"
+} else {
+    Write-Host "FAIL: status skill posts a bare COMPUTERNAME as the roster host"
+    $script:fails++
+}
+
+$script:count++
 if ($skill -notmatch [regex]::Escape("actor_email=[string]`$creds['ROGUE_ACTOR_EMAIL']")) {
     Write-Host "  ok: status skill does not post raw env-file actor values"
 } else {

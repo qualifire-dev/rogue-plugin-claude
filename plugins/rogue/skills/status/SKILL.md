@@ -208,6 +208,15 @@ if ($pj) {
 # "Claude <noreply@anthropic.com>"; posting that raw registers a roster row under
 # the wrong actor, and the row is fingerprinted on host|actor|family|agent.
 # ROGUE_PS_LIB_ONLY loads hook.ps1's helpers without running its dispatcher.
+# Host for the roster row, resolved exactly as hook.ps1 and heartbeat.ps1 do.
+# COMPUTERNAME is unset in some service contexts, and the row is fingerprinted on
+# host|actor|family|agent — so posting a bare (empty) host here while ordinary
+# hook traffic posts the DNS name would open a SECOND row for this install.
+$dnsHost = ''
+try { $dnsHost = [System.Net.Dns]::GetHostName() } catch {}
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { $hostName = $dnsHost }
+if (-not $hostName) { $hostName = 'unknown' }
 $hookPs1 = Get-ChildItem "$env:USERPROFILE\.claude\plugins" -Recurse -Filter hook.ps1 -File -ErrorAction SilentlyContinue |
   Where-Object { $_.FullName -like '*rogue*' } | Select-Object -First 1
 $actorEmail = [string]$creds['ROGUE_ACTOR_EMAIL']; $actorName = [string]$creds['ROGUE_ACTOR_NAME']
@@ -227,14 +236,13 @@ if ($hookPs1) {
     $actorEmail = Select-ActorValue @($ge)
   }
   if (-not $actorEmail) {
-    $dns = ''; try { $dns = [System.Net.Dns]::GetHostName() } catch {}
-    $h = Select-ActorValue @($env:COMPUTERNAME, $dns)
+    $h = Select-ActorValue @($env:COMPUTERNAME, $dnsHost)
     if ($h) { $actorEmail = "unknown@$h" } else { $actorEmail = 'unknown' }
   }
 } else {
   'WARNING: hook.ps1 not found - reporting raw env values, which may be a sandbox identity'
 }
-$body = @{ agent_family='claude'; agent=$agent; version=$ver; host=$env:COMPUTERNAME; actor_email=$actorEmail; actor_name=$actorName } | ConvertTo-Json -Compress
+$body = @{ agent_family='claude'; agent=$agent; version=$ver; host=$hostName; actor_email=$actorEmail; actor_name=$actorName } | ConvertTo-Json -Compress
 try {
   $r = Invoke-WebRequest -Uri "$base/api/v1/hooks/status" -Method Post -Headers @{ 'x-rogue-api-key'=$key } -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -UseBasicParsing -TimeoutSec 10
   "Connected (HTTP $($r.StatusCode)): $($r.Content)"

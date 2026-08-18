@@ -79,6 +79,19 @@ assert_has '"version":"9.9.9"'                   "$out" "version read from the p
 assert_has '"agent":"claude_cowork"'             "$out" "Cowork surface id, matching install-id.sh"
 assert_lacks 'x-rogue-agent-family'              "$out" "no pre-JSON x-rogue-agent-* headers"
 
+# ── the roster host must never go out blank ───────────────────────────────
+# The row is fingerprinted on host|actor|family|agent, so a status run that
+# posts an empty host opens a second row for an install whose hooks post a real
+# one. Same property the Windows half gets from its COMPUTERNAME -> DNS cascade.
+cat > "$STAGE/bin/hostname" <<'STUB'
+#!/bin/sh
+exit 1
+STUB
+chmod +x "$STAGE/bin/hostname"
+out=$(run CLAUDE_CODE_USER_EMAIL=real.user@corp.com)
+assert_has '"host":"unknown"' "$out" "unresolvable hostname posts the unknown marker, not an empty host"
+rm -f "$STAGE/bin/hostname"
+
 # ── same block outside Cowork ──────────────────────────────────────────────
 out=$(run CLAUDE_CODE_ENTRYPOINT=cli)
 assert_has '"agent":"claude_code"'               "$out" "CLI surface id when not in Cowork"
