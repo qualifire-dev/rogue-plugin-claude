@@ -229,10 +229,10 @@ if (-not $actorEmail) {
 # hook traffic. Resolved exactly as heartbeat.ps1 does (its sh sibling shares
 # scripts/install-id.sh instead; PowerShell has no such seam here). Any drift
 # between the two is a duplicate roster row.
-$installWarn = @()
+$installError = @()
 $hostName = $env:COMPUTERNAME
 if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
-if (-not $hostName) { $hostName = 'unknown'; $installWarn += 'host-unresolved' }
+if (-not $hostName) { $hostName = 'unknown'; $installError += 'host-unresolved' }
 
 $pluginVersion = 'unknown'
 $pluginJson = Join-Path $pluginRoot '.claude-plugin\plugin.json'
@@ -240,9 +240,9 @@ if (Test-Path -LiteralPath $pluginJson) {
     $m = [regex]::Match((Get-Content -Raw -LiteralPath $pluginJson), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
     if ($m.Success) { $pluginVersion = $m.Groups[1].Value }
     # Manifest is there but carries no semver: schema drift, not a bad install.
-    else { $installWarn += "version-unparsed:$pluginJson" }
+    else { $installError += "version-unparsed:$pluginJson" }
 } else {
-    $installWarn += "manifest-missing:$pluginJson"
+    $installError += "manifest-missing:$pluginJson"
 }
 
 # Family is the fixed enum "claude"; the surface is this free-form display label.
@@ -254,8 +254,8 @@ else                                   { $installAgent = 'Claude Code - CLI' }
 # A degraded value is still SENT rather than failing the hook: it identifies the
 # install well enough to keep the roster fresh, and no liveness bookkeeping is
 # worth breaking a session over. But "unknown" in the roster is a real symptom,
-# so say so once per event.
-if ($installWarn.Count) { Log "warn=install-id $($installWarn -join ',')" }
+# so it is reported as an error once per event.
+if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
 
 # -- payload from stdin -----------------------------------------------------
 $payload = [Console]::In.ReadToEnd()

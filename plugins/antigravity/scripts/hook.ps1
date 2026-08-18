@@ -650,22 +650,22 @@ function Resolve-InstallId {
     # A degraded value is still SENT rather than failing the hook: it identifies
     # the install well enough to keep the roster fresh, and no liveness
     # bookkeeping is worth breaking a session over. But "unknown" in the roster is
-    # a real symptom, so each miss is logged.
-    $warn = @()
+    # a real symptom, so each miss is logged as an error.
+    $installError = @()
     $h = $env:COMPUTERNAME
     if (-not $h) { try { $h = [System.Net.Dns]::GetHostName() } catch { $h = '' } }
-    if (-not $h) { $h = 'unknown'; $warn += 'host-unresolved' }
+    if (-not $h) { $h = 'unknown'; $installError += 'host-unresolved' }
     $v = 'unknown'
     $versionFile = Join-Path $PluginRoot 'VERSION'
     if (Test-Path -LiteralPath $versionFile) {
         try {
             $first = Get-Content -LiteralPath $versionFile -TotalCount 1
-            if ($first) { $v = $first.Trim() } else { $warn += "version-file-empty:$versionFile" }
-        } catch { $warn += "version-file-unreadable:$versionFile" }
+            if ($first) { $v = $first.Trim() } else { $installError += "version-file-empty:$versionFile" }
+        } catch { $installError += "version-file-unreadable:$versionFile" }
     } else {
-        $warn += "version-file-missing:$versionFile"
+        $installError += "version-file-missing:$versionFile"
     }
-    if ($warn.Count) { Log "warn=install-id $($warn -join ',')" }
+    if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
     # Unattributable payload: default to the 2.0 app, the same guess the backend's
     # parser makes, so the roster row matches the events it stores.
     $a = Get-AntigravitySurface $script:payloadTp

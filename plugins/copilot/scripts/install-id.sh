@@ -25,16 +25,16 @@
 # Resolution NEVER fails the hook. A degraded value still identifies the install
 # well enough to keep the roster fresh, and no liveness bookkeeping is worth
 # breaking a developer's session over.
-ROGUE_INSTALL_ID_WARN=""
+ROGUE_INSTALL_ID_ERROR=""
 
-rogue_install_id_warn() {
-  ROGUE_INSTALL_ID_WARN="${ROGUE_INSTALL_ID_WARN:+$ROGUE_INSTALL_ID_WARN,}$1"
+rogue_install_id_error() {
+  ROGUE_INSTALL_ID_ERROR="${ROGUE_INSTALL_ID_ERROR:+$ROGUE_INSTALL_ID_ERROR,}$1"
 }
 
 ROGUE_INSTALL_HOST="$(hostname 2>/dev/null)"
 if [ -z "$ROGUE_INSTALL_HOST" ]; then
   ROGUE_INSTALL_HOST="unknown"
-  rogue_install_id_warn "host-unresolved"
+  rogue_install_id_error "host-unresolved"
 fi
 
 # Version from the manifest WITHOUT python3 (the /usr/bin/python3 stub fails
@@ -48,10 +48,10 @@ if [ -r "$_rogue_pj" ]; then
     ROGUE_INSTALL_VERSION="$_rogue_v"
   else
     # Manifest is there but carries no semver: schema drift, not a bad install.
-    rogue_install_id_warn "version-unparsed:$_rogue_pj"
+    rogue_install_id_error "version-unparsed:$_rogue_pj"
   fi
 else
-  rogue_install_id_warn "manifest-missing:$_rogue_pj"
+  rogue_install_id_error "manifest-missing:$_rogue_pj"
 fi
 unset _rogue_pj _rogue_v
 
@@ -59,4 +59,4 @@ unset _rogue_pj _rogue_v
 # It is also the PLUGIN_REPOS key the backend keys its latest-version lookup on.
 ROGUE_INSTALL_AGENT="github_copilot"
 
-export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_AGENT ROGUE_INSTALL_ID_WARN
+export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_AGENT ROGUE_INSTALL_ID_ERROR

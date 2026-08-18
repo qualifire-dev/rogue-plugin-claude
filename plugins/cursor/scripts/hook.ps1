@@ -50,11 +50,11 @@ function Write-Raw {
 }
 function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.WriteLine("[rogue] $Msg"); [Console]::Error.Flush() } }
 
-# Abnormal-but-survivable conditions, NOT gated on ROGUE_DEBUG (mirrors hook.sh's
-# warn): this dispatcher keeps no log file, so a debug-gated message would mean
-# nobody ever learns the install reports itself imprecisely. stderr only — stdout
-# is the hook's JSON channel.
-function Warn { param([string]$Msg) [Console]::Error.WriteLine("[rogue] warn: $Msg"); [Console]::Error.Flush() }
+# Errors the hook survives, NOT gated on ROGUE_DEBUG (mirrors hook.sh's err):
+# this dispatcher keeps no log file, so a debug-gated message would mean nobody
+# ever learns the install reports itself imprecisely. stderr only — stdout is the
+# hook's JSON channel.
+function Err { param([string]$Msg) [Console]::Error.WriteLine("[rogue] error: $Msg"); [Console]::Error.Flush() }
 
 function Emit-Json {
     param([string]$Data)
@@ -382,13 +382,13 @@ if (-not $actorEmail) {
 #
 # Neither lookup can fail the hook: a degraded value still identifies the install
 # well enough to keep the roster fresh, and no liveness bookkeeping is worth
-# breaking a session over. Both warn, because "unknown" in the roster is a real
+# breaking a session over. Both log an error, because "unknown" in the roster is a real
 # symptom worth chasing.
 $hostName = $env:COMPUTERNAME
 if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
 if (-not $hostName) {
     $hostName = 'unknown'
-    Warn 'hostname unresolved; reporting host=unknown to the fleet roster'
+    Err 'hostname unresolved; reporting host=unknown to the fleet roster'
 }
 
 # Plugin version from the manifest.
@@ -399,12 +399,12 @@ if (Test-Path -LiteralPath $pluginJson) {
         $v = (Get-Content -Raw -LiteralPath $pluginJson | ConvertFrom-Json).version
         if ($v -match '^[0-9]+\.[0-9]+\.[0-9]+') { $pluginVersion = $Matches[0] }
         # Manifest is there but carries no semver: schema drift, not a bad install.
-        else { Warn "no version in $pluginJson; reporting version=unknown to the fleet roster" }
+        else { Err "no version in $pluginJson; reporting version=unknown to the fleet roster" }
     } catch {
-        Warn "plugin.json parse failed ($($_.Exception.Message)); reporting version=unknown"
+        Err "plugin.json parse failed ($($_.Exception.Message)); reporting version=unknown"
     }
 } else {
-    Warn "plugin manifest not found at $pluginJson; reporting version=unknown"
+    Err "plugin manifest not found at $pluginJson; reporting version=unknown"
 }
 
 # ── payload from stdin ─────────────────────────────────────────────────────

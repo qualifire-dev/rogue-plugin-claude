@@ -373,7 +373,7 @@ fi
 # A degraded value is still sent (never a hard failure — see install-id.sh), but
 # it is worth knowing about: an "unknown" host or version means this install
 # reports itself imprecisely to the fleet roster.
-[ -n "${ROGUE_INSTALL_ID_WARN:-}" ] && log "warn=install-id $ROGUE_INSTALL_ID_WARN"
+[ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/copilot}"
 

@@ -155,7 +155,7 @@ async function main() {
   // Still sent when degraded (never a hard failure — see installId), but an
   // "unknown" host or version means this install reports itself imprecisely to
   // the fleet roster, which is worth seeing in the hook log.
-  if (install.warn) log(`warn=install-id ${install.warn}`);
+  if (install.error) log(`error=install-id ${install.error}`);
 
   let bodyText = "{}";
   try {

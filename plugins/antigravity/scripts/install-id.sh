@@ -29,16 +29,16 @@
 # Resolution NEVER fails the hook. A degraded value still identifies the install
 # well enough to keep the roster fresh, and no liveness bookkeeping is worth
 # breaking a developer's session over.
-ROGUE_INSTALL_ID_WARN=""
+ROGUE_INSTALL_ID_ERROR=""
 
-rogue_install_id_warn() {
-  ROGUE_INSTALL_ID_WARN="${ROGUE_INSTALL_ID_WARN:+$ROGUE_INSTALL_ID_WARN,}$1"
+rogue_install_id_error() {
+  ROGUE_INSTALL_ID_ERROR="${ROGUE_INSTALL_ID_ERROR:+$ROGUE_INSTALL_ID_ERROR,}$1"
 }
 
 ROGUE_INSTALL_HOST="$(hostname 2>/dev/null)"
 if [ -z "$ROGUE_INSTALL_HOST" ]; then
   ROGUE_INSTALL_HOST="unknown"
-  rogue_install_id_warn "host-unresolved"
+  rogue_install_id_error "host-unresolved"
 fi
 
 # Version from the bundled VERSION file (NOT plugin.json — the Antigravity
@@ -47,7 +47,7 @@ fi
 ROGUE_INSTALL_VERSION="$(head -n1 "${PLUGIN_ROOT:-}/VERSION" 2>/dev/null | tr -d ' \r\n')"
 if [ -z "$ROGUE_INSTALL_VERSION" ]; then
   ROGUE_INSTALL_VERSION="unknown"
-  rogue_install_id_warn "version-file-unreadable:${PLUGIN_ROOT:-}/VERSION"
+  rogue_install_id_error "version-file-unreadable:${PLUGIN_ROOT:-}/VERSION"
 fi
 
-export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_ID_WARN
+export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_ID_ERROR

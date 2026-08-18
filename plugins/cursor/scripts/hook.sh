@@ -50,12 +50,12 @@ emit() {
 # Diagnostics to stderr when ROGUE_DEBUG is set (Cursor logs stderr separately).
 dbg() { [ -n "${ROGUE_DEBUG:-}" ] && printf '[rogue] %s\n' "$*" >&2; return 0; }
 
-# Abnormal-but-survivable conditions, NOT gated on ROGUE_DEBUG: this dispatcher
-# keeps no log file (unlike the claude/codex/copilot/antigravity ones), so a
-# debug-gated message would mean nobody ever learns the install is reporting
-# itself imprecisely. stderr only — stdout is the hook's JSON channel, and Cursor
+# Errors that the hook survives, NOT gated on ROGUE_DEBUG: this dispatcher keeps
+# no log file (unlike the claude/codex/copilot/antigravity ones), so a debug-gated
+# message would mean nobody ever learns the install is reporting itself
+# imprecisely. stderr only — stdout is the hook's JSON channel, and Cursor
 # captures stderr separately.
-warn() { printf '[rogue] warn: %s\n' "$*" >&2; return 0; }
+err() { printf '[rogue] error: %s\n' "$*" >&2; return 0; }
 
 # ── Git Bash stand-down: let hook.ps1 own native Windows ───────────────────
 case "$(uname -s 2>/dev/null)" in
@@ -130,12 +130,12 @@ fi
 #
 # Neither lookup can fail the hook: a degraded value still identifies the install
 # well enough to keep the roster fresh, and no liveness bookkeeping is worth
-# breaking a session over. Both warn, because "unknown" in the roster is a real
+# breaking a session over. Both log an error, because "unknown" in the roster is a real
 # symptom worth chasing.
 host="$(hostname 2>/dev/null)" || host=unknown
 if [ -z "$host" ]; then
   host=unknown
-  warn "hostname unresolved; reporting host=unknown to the fleet roster"
+  err "hostname unresolved; reporting host=unknown to the fleet roster"
 fi
 
 # Plugin version from the manifest, without python/jq.
@@ -148,10 +148,10 @@ if [ -r "$_pj" ]; then
     plugin_version="$_v"
   else
     # Manifest is there but carries no semver: schema drift, not a bad install.
-    warn "no version in $_pj; reporting version=unknown to the fleet roster"
+    err "no version in $_pj; reporting version=unknown to the fleet roster"
   fi
 else
-  warn "plugin manifest not readable at $_pj; reporting version=unknown"
+  err "plugin manifest not readable at $_pj; reporting version=unknown"
 fi
 
 # ── payload from stdin ─────────────────────────────────────────────────────
