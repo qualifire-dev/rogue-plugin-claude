@@ -43,22 +43,15 @@ PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
 [ -n "${ROGUE_API_KEY:-}" ] || exit 0
 
 [ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
-
-# Plugin version from the manifest WITHOUT python3 (the /usr/bin/python3 stub
-# fails silently on a fresh macOS). grep/sed are always present.
-VER="unknown"
-PJ="${PLUGIN_ROOT}/plugin.json"
-if [ -r "$PJ" ]; then
-  v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" \
-        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-  [ -n "$v" ] && VER="$v"
-fi
+# Host + version + surface. Shared with hook.sh, which sends the same three as
+# headers on every event: same values, same roster row. See install-id.sh.
+[ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
 
 # Family is the fixed enum "copilot"; surface rides the agent field.
-HOST=$(hostname 2>/dev/null || echo unknown)
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-BODY=$(printf '{"agent_family":"copilot","agent":"github_copilot","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-  "$(esc "$VER")" "$(esc "$HOST")" \
+BODY=$(printf '{"agent_family":"copilot","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
+  "$(esc "${ROGUE_INSTALL_AGENT:-github_copilot}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
+  "$(esc "${ROGUE_INSTALL_HOST:-unknown}")" \
   "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 
 # ── beacon throttle ────────────────────────────────────────────────────────
@@ -104,7 +97,7 @@ fi
 if [ -r "${PLUGIN_ROOT}/scripts/ship-logs.sh" ]; then
   ROGUE_ACTOR_EMAIL="${ROGUE_ACTOR_EMAIL:-}" ROGUE_ACTOR_NAME="${ROGUE_ACTOR_NAME:-}" \
     sh "${PLUGIN_ROOT}/scripts/ship-logs.sh" \
-      "${PLUGIN_ROOT}" copilot "$VER" copilot >/dev/null 2>&1 || true
+      "${PLUGIN_ROOT}" copilot "${ROGUE_INSTALL_VERSION:-unknown}" copilot >/dev/null 2>&1 || true
 fi
 
 exit 0

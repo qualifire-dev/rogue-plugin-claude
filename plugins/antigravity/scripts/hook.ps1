@@ -375,14 +375,15 @@ function Invoke-Heartbeat {
     if (-not $hbTrigger) { return }
     try {
         $hbPath = Join-Path $PluginRoot 'scripts/heartbeat.ps1'
-        # Pass the surface along: only the hook can know it (three products share
-        # one install, and the event's transcriptPath names which state dir it
-        # lives in). Mirrors hook.sh's `heartbeat.sh "$SURFACE" "$_hb_trigger"`.
-        # Resolve-Surface already did this, off the same transcriptPath, so reuse it
-        # rather than re-matching: one resolution feeds the roster agent, the log
-        # token and the IDE-only enrichment branch, and they cannot disagree.
-        $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath)
-        if ($script:surface) { $hbArgs += @('-Agent', $script:surface) }
+        # Pass the SAME surface the event headers carry ($install.agent, resolved
+        # first off the same transcriptPath), never a freshly-derived one and never
+        # the possibly empty log token. An unattributable payload yields an empty
+        # surface, and heartbeat.ps1's own fallback then sniffs the filesystem and
+        # picks antigravity_cli whenever `agy` is installed, so this event would
+        # report `antigravity` while its heartbeat reported `antigravity_cli`, and one
+        # install would own two roster rows. One resolution, one row. Mirrors
+        # hook.sh's `heartbeat.sh "$ROGUE_INSTALL_AGENT" "$_hb_trigger"`.
+        $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath,'-Agent',$install.agent)
         $hbArgs += @('-Trigger', $hbTrigger)
         Start-Process -FilePath 'powershell' `
             -ArgumentList $hbArgs `
@@ -742,13 +743,55 @@ function Add-StoreRead {
 }
 
 # Resolved once and shared by the three IDE-gated behaviors below (store read,
-# Stop-only tail, capability flag) so they can never disagree about the surface.
+# Stop-only tail, capability flag) plus Resolve-InstallId, so nothing can
+# disagree about the surface. Called early in Invoke-Main, before the heartbeat
+# is launched with it.
 function Resolve-Surface {
     $script:payloadTp = Get-PayloadTranscriptPath $payload
     $script:isIdeSurface = $script:payloadTp -like '*/antigravity-ide/*'
     # Same path, same table: the log token, the heartbeat's roster agent and the
     # IDE-only enrichment branch all come from this one resolution.
     $script:surface = [string](Get-AntigravitySurface $script:payloadTp)
+}
+
+# This install's fleet identity: host + version (from the bundled VERSION file,
+# NOT plugin.json — the Antigravity manifest schema is additionalProperties:false
+# with no version field) + the surface off this event's transcriptPath. Mirrors
+# heartbeat.ps1's Resolve-Version / Resolve-Surface, and must keep mirroring them:
+# the roster keys a row on host + actor + family + agent, so any drift between the
+# two senders is a duplicate row for one install.
+#
+# Resolved ONCE, before the heartbeat launches, and used by both senders — the
+# per-event headers in Invoke-Post and the -Agent handed to heartbeat.ps1.
+function Resolve-InstallId {
+    # A degraded value is still SENT rather than failing the hook: it identifies
+    # the install well enough to keep the roster fresh, and no liveness
+    # bookkeeping is worth breaking a session over. But "unknown" in the roster is
+    # a real symptom, so each miss is logged as an error.
+    $installError = @()
+    $h = $env:COMPUTERNAME
+    if (-not $h) { try { $h = [System.Net.Dns]::GetHostName() } catch { $h = '' } }
+    if (-not $h) { $h = 'unknown'; $installError += 'host-unresolved' }
+    $v = 'unknown'
+    $versionFile = Join-Path $PluginRoot 'VERSION'
+    if (Test-Path -LiteralPath $versionFile) {
+        try {
+            $first = Get-Content -LiteralPath $versionFile -TotalCount 1
+            if ($first) { $v = $first.Trim() } else { $installError += "version-file-empty:$versionFile" }
+        } catch { $installError += "version-file-unreadable:$versionFile" }
+    } else {
+        $installError += "version-file-missing:$versionFile"
+    }
+    if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
+    # The surface comes from Resolve-Surface, which ran first off the same
+    # transcriptPath - reused, never re-derived, so the log token and this header
+    # cannot name different surfaces for one event. Unattributable payload: default
+    # to the 2.0 app, the same guess the backend's parser makes, so the roster row
+    # matches the events it stores. (The log token stays empty in that case and the
+    # line then carries no surface= at all; only the required fields default.)
+    $a = $script:surface
+    if (-not $a) { $a = 'antigravity' }
+    $script:install = @{ host = $h; version = $v; agent = $a }
 }
 
 function Add-StoreReadForEvent {
@@ -838,6 +881,9 @@ function Invoke-Post {
         'x-rogue-event'       = $EventName
         'x-rogue-actor-email' = $actorEmail
         'x-rogue-actor-name'  = $actorName
+        'x-rogue-host'        = $install.host
+        'x-rogue-version'     = $install.version
+        'x-rogue-agent'       = $install.agent
     }
     # The agent tag rides in HEADERS, never in the body: the POSTed event must stay
     # byte-identical to what Antigravity handed us, so the stored raw payload is the
@@ -901,10 +947,15 @@ function Invoke-Main {
     Resolve-Url
     Resolve-Actor
     Read-Payload
-    # Immediately after the payload, and BEFORE anything that logs - the same
-    # position hook.sh resolves it in. Every log line written from here on carries
-    # the surface, so the two dispatchers emit the same token for the same event.
+    # Immediately after the payload, and BEFORE anything that logs or sends - the
+    # same position hook.sh resolves it in. Every log line from here on carries the
+    # surface, so the two dispatchers emit the same token for the same event; and
+    # Resolve-InstallId reuses this answer for the header, so the heartbeat body
+    # and this event's headers can never name different surfaces for one install.
+    # Re-attribution below rewrites conversationId, never transcriptPath, so
+    # reading the surface this early is the same answer it would give later.
     Resolve-Surface
+    Resolve-InstallId
 
     Invoke-Heartbeat
     Initialize-SubagentDirs

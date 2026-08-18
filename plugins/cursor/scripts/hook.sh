@@ -52,6 +52,13 @@ emit() {
 # Diagnostics to stderr when ROGUE_DEBUG is set (Cursor logs stderr separately).
 dbg() { [ -n "${ROGUE_DEBUG:-}" ] && printf '[rogue] %s\n' "$*" >&2; return 0; }
 
+# Errors that the hook survives, NOT gated on ROGUE_DEBUG: this dispatcher keeps
+# no log file (unlike the claude/codex/copilot/antigravity ones), so a debug-gated
+# message would mean nobody ever learns the install is reporting itself
+# imprecisely. stderr only — stdout is the hook's JSON channel, and Cursor
+# captures stderr separately.
+err() { printf '[rogue] error: %s\n' "$*" >&2; return 0; }
+
 # ── Git Bash stand-down: let hook.ps1 own native Windows ───────────────────
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*) dbg "Git Bash (uname) -> stand down"; printf '{}'; exit 0 ;;
@@ -186,6 +193,40 @@ if [ -z "$actor_email" ]; then
   _h="$(hostname 2>/dev/null)"
   if [ -n "$_u" ] && [ -n "$_h" ]; then actor_email="$_u@$_h"
   else actor_email="${_u:-$_h}"; fi
+fi
+
+# ── install identity: host + plugin version ────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only the heartbeat below ever sent those — once, at session start. A
+# session still working a day later therefore aged out as disconnected. Sending
+# the same values as headers on EVERY event lets the backend refresh this exact
+# row from ordinary hook traffic. They must match the heartbeat body's values
+# byte for byte, or the two writers create two rows for one install.
+#
+# Neither lookup can fail the hook: a degraded value still identifies the install
+# well enough to keep the roster fresh, and no liveness bookkeeping is worth
+# breaking a session over. Both log an error, because "unknown" in the roster is a real
+# symptom worth chasing.
+host="$(hostname 2>/dev/null)" || host=unknown
+if [ -z "$host" ]; then
+  host=unknown
+  err "hostname unresolved; reporting host=unknown to the fleet roster"
+fi
+
+# Plugin version from the manifest, without python/jq.
+plugin_version="unknown"
+_pj="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
+if [ -r "$_pj" ]; then
+  _v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$_pj" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  if [ -n "$_v" ]; then
+    plugin_version="$_v"
+  else
+    # Manifest is there but carries no semver: schema drift, not a bad install.
+    err "no version in $_pj; reporting version=unknown to the fleet roster"
+  fi
+else
+  err "plugin manifest not readable at $_pj; reporting version=unknown"
 fi
 
 # ── payload from stdin ─────────────────────────────────────────────────────
@@ -352,6 +393,9 @@ RESP="$(printf '%s' "$PAYLOAD" | curl -fsS --max-time 10 -X POST \
   -H "x-rogue-actor-email: $actor_email" \
   -H "x-rogue-actor-name: $actor_name" \
   -H 'x-rogue-source: cursor' \
+  -H "x-rogue-host: $host" \
+  -H "x-rogue-version: $plugin_version" \
+  -H 'x-rogue-agent: cursor' \
   --data-binary @- "$URL" 2>/dev/null)"; _rc=$?
 dbg "curl rc=$_rc resp_len=${#RESP}"
 # Always log the raw response head so a relay/decision bug is diagnosable from
@@ -387,21 +431,13 @@ case "$event" in
   *)            hb_unthrottled="" ;;
 esac
 if [ -n "$hb_unthrottled" ]; then
-  # Plugin version from the manifest, without python/jq.
-  HB_VER="unknown"
-  HB_PJ="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
-  if [ -r "$HB_PJ" ]; then
-    _v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$HB_PJ" 2>/dev/null \
-          | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    [ -n "$_v" ] && HB_VER="$_v"
-  fi
-  HB_HOST=$(hostname 2>/dev/null) || HB_HOST=unknown
-  [ -n "$HB_HOST" ] || HB_HOST=unknown
   # `agent` is "cursor" (not a display label): the server keys its latest-version
   # lookup (PLUGIN_REPOS) on this value, so the roster can flag outdated installs.
+  # host/version come from the shared block above so this body and the per-event
+  # headers describe the same install (same fingerprint, one row).
   hb_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   HB_BODY=$(printf '{"agent_family":"cursor","agent":"cursor","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-    "$(hb_esc "$HB_VER")" "$(hb_esc "$HB_HOST")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
+    "$(hb_esc "$plugin_version")" "$(hb_esc "$host")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
   # ── beacon throttle ──────────────────────────────────────────────────────
   # `-r` guarded so a partial or older install degrades to an unthrottled beacon -
   # today's behaviour - rather than failing the hook. The knob
@@ -414,13 +450,13 @@ if [ -n "$hb_unthrottled" ]; then
     rogue_beacon_claim() { return 0; }
   fi
 
-  dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$HB_VER host=$HB_HOST"
+  dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$plugin_version host=$host"
   # rogue_beacon_claim writes the stamp itself, BEFORE the request - deciding and
   # stamping are one call so a caller cannot leave the window permanently open by
   # forgetting the second half.
   if rogue_beacon_claim cursor "$hb_unthrottled"; then
     # Detached, so its HTTP outcome is unobservable — record only that it fired.
-    log "heartbeat=fired ver=$HB_VER"
+    log "heartbeat=fired ver=$plugin_version"
     ( curl -fsS --max-time 10 -X POST \
         -H 'Content-Type: application/json' \
         -H "x-rogue-api-key: $API_KEY" \
@@ -432,7 +468,7 @@ if [ -n "$hb_unthrottled" ]; then
     # Logged, unlike the other plugins' silent throttle, because this is the only
     # plugin whose beacon decision happens in the dispatcher - so the hook log is
     # where an operator can see it at all.
-    log "heartbeat=throttled ver=$HB_VER"
+    log "heartbeat=throttled ver=$plugin_version"
   fi
 
   # ── ship the hook log ────────────────────────────────────────────────────
@@ -460,7 +496,7 @@ if [ -n "$hb_unthrottled" ]; then
   if [ -r "$PLUGIN_ROOT/scripts/ship-logs.sh" ]; then
     ( ROGUE_ACTOR_EMAIL="$actor_email" ROGUE_ACTOR_NAME="$actor_name" \
         sh "$PLUGIN_ROOT/scripts/ship-logs.sh" \
-          "$PLUGIN_ROOT" cursor "$HB_VER" cursor \
+          "$PLUGIN_ROOT" cursor "$plugin_version" cursor \
         </dev/null >/dev/null 2>&1 & )
   fi
 fi

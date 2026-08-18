@@ -28,8 +28,9 @@
 set -u
 
 PLUGIN_ROOT=""
-AGENT=""      # which of the three surfaces this install is reporting for
-VER="unknown" # plugin version, from the bundled VERSION file
+AGENT=""               # which of the three surfaces this install is reporting for
+VER="unknown"          # plugin version, from the bundled VERSION file
+HOST="unknown"         # hostname; both set by resolve_version via install-id.sh
 TRIGGER="SessionStart" # which hook fired us; anything else is rate-limited
 
 # Self-locate the plugin root from $0 (<root>/scripts/heartbeat.sh).
@@ -61,12 +62,13 @@ load_actor() {
   return 0
 }
 
-# Plugin version from the bundled VERSION file (NOT plugin.json — the
-# Antigravity manifest schema is additionalProperties:false with no version
-# field, so the version lives in its own file at the plugin root).
+# Host + plugin version, shared with hook.sh so its per-event headers and this
+# body describe the same install (same fingerprint, one roster row).
+# See install-id.sh.
 resolve_version() {
-  _v="$(head -n1 "${PLUGIN_ROOT}/VERSION" 2>/dev/null | tr -d ' \r\n')"
-  [ -n "$_v" ] && VER="$_v"
+  [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+  VER="${ROGUE_INSTALL_VERSION:-unknown}"
+  HOST="${ROGUE_INSTALL_HOST:-unknown}"
   return 0
 }
 
@@ -124,10 +126,8 @@ post_heartbeat() {
   _unthrottled=0
   [ "$TRIGGER" = "SessionStart" ] && _unthrottled=1
   rogue_beacon_claim antigravity "$_unthrottled" || return 0
-
-  _host=$(hostname 2>/dev/null || echo unknown)
   _body=$(printf '{"agent_family":"antigravity","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-    "$(esc "$AGENT")" "$(esc "$VER")" "$(esc "$_host")" \
+    "$(esc "$AGENT")" "$(esc "$VER")" "$(esc "$HOST")" \
     "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 
   curl -sS --max-time 10 -X POST \

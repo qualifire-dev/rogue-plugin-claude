@@ -103,15 +103,24 @@ test("every line carries surface=gemini_cli, between provider= and event=", asyn
 });
 
 test("the surface slug is what heartbeat.mjs reports as the roster agent", async () => {
-  // Two files, one vocabulary. If these drift, a log line and the roster row for
-  // the same install name different surfaces - worse than the line naming none.
-  const heartbeat = fs.readFileSync(
-    path.join(path.dirname(HOOK), "heartbeat.mjs"),
-    "utf8",
-  );
-  assert.match(heartbeat, /agent:\s*"gemini_cli"/);
+  // Three consumers, one vocabulary. If these drift, a log line and the roster row
+  // for the same install name different surfaces - worse than the line naming none.
+  // The literal lives in shared.mjs and nowhere else: installId() sends it as
+  // x-rogue-agent, hook.mjs stamps it on each log line, heartbeat.mjs sends it as
+  // the roster agent. A re-declaration in either consumer is the drift this guards.
+  const dir = path.dirname(HOOK);
+  const shared = fs.readFileSync(path.join(dir, "shared.mjs"), "utf8");
+  assert.match(shared, /export const SURFACE = "gemini_cli";/);
+  assert.match(shared, /agent: SURFACE/);
+
+  const heartbeat = fs.readFileSync(path.join(dir, "heartbeat.mjs"), "utf8");
+  assert.match(heartbeat, /agent: install\.agent/);
+  // Prose may name the surface; a second assignment of it is the drift.
+  assert.doesNotMatch(heartbeat, /agent:\s*"gemini_cli"/);
+
   const hook = fs.readFileSync(HOOK, "utf8");
-  assert.match(hook, /const SURFACE = "gemini_cli";/);
+  assert.match(hook, /\bSURFACE,/);
+  assert.doesNotMatch(hook, /const SURFACE =/);
 });
 
 test("the token is emitted through the optional form, never as a placeholder", async () => {
@@ -153,6 +162,14 @@ test("relays server body verbatim and sends the right headers", async () => {
     assert.equal(seen.headers["x-rogue-api-key"], "rsk_test");
     assert.equal(seen.headers["x-rogue-actor-email"], "dev@example.com");
     assert.equal(seen.headers["x-rogue-actor-name"], "Dev");
+    // Fleet-liveness trio: the same host/version/agent the heartbeat sends, on
+    // EVERY event, so the roster row is refreshed by ordinary traffic and not
+    // only at SessionStart. `agent` must stay the PLUGIN_REPOS key, or the
+    // backend stops resolving a latest version for these rows. Host and version
+    // are machine-specific, so they are only asserted non-empty (see installId).
+    assert.equal(seen.headers["x-rogue-agent"], "gemini_cli");
+    assert.ok(seen.headers["x-rogue-host"], "x-rogue-host sent on every event");
+    assert.ok(seen.headers["x-rogue-version"], "x-rogue-version sent on every event");
     assert.equal(seen.body, '{"tool_name":"run_shell_command"}');
   } finally {
     server.close();
