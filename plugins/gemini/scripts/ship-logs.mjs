@@ -33,7 +33,6 @@ import { shellUnquote, IS_WIN } from "./shared.mjs";
 
 // ── constants ──────────────────────────────────────────────────────────────
 const SHIP_ENDPOINT_PATH = "/api/v1/hooks/logs";
-const SHIP_DISABLED_BY_FILE = Symbol("rogueShipDisabledByFile");
 const KNOWN_LOG_SLUGS = ["claude", "codex", "cursor", "gemini", "copilot", "antigravity"];
 // Bytes scanned when fingerprinting a log's first line. NOT 200: a real log line is
 // timestamp + provider + event + up to 400 chars of `raw=`, i.e. commonly 500-700
@@ -50,14 +49,6 @@ const HTTP_TIMEOUT_MS = 15000;
 
 const HOME = os.homedir() || process.env.HOME || process.env.USERPROFILE || ".";
 
-// An EXPLICIT numeric zero, including a zero-padded one. Absent and non-numeric are
-// both "said nothing", which is what separates a kill switch (see loadEnv) from a
-// default (see flagIsEnabled).
-function valueIsZero(value) {
-  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
-  return Number(value) === 0;
-}
-
 // ── env files ──────────────────────────────────────────────────────────────
 // Same platform-aware chain as every dispatcher (later file wins; process env wins
 // over all files). Takes the root as an argument rather than using shared.mjs's
@@ -70,7 +61,6 @@ function loadEnv(pluginRoot) {
     IS_WIN ? "C:\\ProgramData\\rogue\\env" : "/etc/rogue/env",
     path.join(HOME, ".rogue-env"),
   ];
-  let shipDisabledByFile = false;
   for (const envFile of envFiles) {
     if (!envFile) continue;
     let text;
@@ -83,20 +73,10 @@ function loadEnv(pluginRoot) {
       const assignment = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
       if (assignment) merged[assignment[1]] = shellUnquote(assignment[2]);
     }
-    // OFF WINS. Every other knob here follows "process env beats the files", but an
-    // explicit ROGUE_SHIP_LOGS=0 in a CONFIG FILE is a kill switch, and a kill switch a
-    // process variable can defeat is not one: the documented support one-liner sets
-    // ROGUE_SHIP_LOGS=1 inline, so under plain precedence it would silently re-enable
-    // uploading on a machine whose MDM profile or whose user had turned it off.
-    // Recorded per file, because the process-env pass below is about to overwrite it.
-    if (valueIsZero(merged.ROGUE_SHIP_LOGS)) shipDisabledByFile = true;
   }
   for (const varName of Object.keys(process.env)) {
     if (varName.startsWith("ROGUE_") && process.env[varName]) merged[varName] = process.env[varName];
   }
-  // A non-enumerable marker rather than another ROGUE_* key: `merged` is the credential
-  // map, and anything enumerable in it would be read as a knob by name elsewhere.
-  Object.defineProperty(merged, SHIP_DISABLED_BY_FILE, { value: shipDisabledByFile });
   return merged;
 }
 
@@ -117,25 +97,19 @@ function numberOrDefault(value, fallback, allowZero) {
   return parsed;
 }
 
-// SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
-// turns it on. That is the reverse of every other knob here, and deliberate - the
-// receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
-// would have every configured install POST into a permanent 404 on each session
-// start: no offset ever advances, and each failure appends an `outcome=fail http=404`
-// line to the very file being shipped, so the backlog only grows. Flipping the
-// default (here, in ship-logs.sh and in ship-logs.ps1, one line each) is the last
-// step of the rollout, once the route answers 2xx *after* a durable write - see
-// docs/log-shipping-backend.md. Until then `ROGUE_SHIP_LOGS=1` in any env file opts
-// a machine in, which is also how the support invocation and the e2e suite run it.
+// SHIPPING IS UNCONDITIONAL. There is no ROGUE_SHIP_LOGS flag: a configured install
+// uploads its hook log, and the only things that stop a given run are the ones that
+// were always able to - no API key, no resolvable actor, the self-throttle, or simply
+// no new bytes on disk. It was opt-in while /api/v1/hooks/logs was undeployed, since a
+// default-on client would have POSTed into a permanent 404 and appended an
+// `outcome=fail http=404` line to the very file it was draining. The route now exists
+// (an empty body is answered 422 with a body-schema validation error, where a genuinely
+// unknown hooks path is answered a bare 404), so the gate is gone rather than flipped.
 //
-// A non-numeric value ("yes", "true", a typo) is NOT an opt-in: it falls back to the
-// default, matching every other knob's "a typo must never change behaviour" rule.
-// Numeric zero, including a zero-padded "00" (phase 1's rotation-cap precedent),
-// is an explicit off and stays off after the default flips.
-function flagIsEnabled(value) {
-  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
-  return Number(value) !== 0;
-}
+// What the 2xx contract still requires of the server is unchanged and load-bearing:
+// the offset advances only on 2xx and the client then forgets those bytes, so a 2xx
+// sent before a durable write is a permanent, silent gap. See
+// docs/log-shipping-backend.md.
 
 // ── low-level file reads ───────────────────────────────────────────────────
 function fileSize(filePath) {
@@ -776,16 +750,6 @@ class Shipper {
   async run() {
     this.env = loadEnv(this.pluginRoot);
     this.resolveKnobs();
-    if (this.env[SHIP_DISABLED_BY_FILE]) {
-      this.debug("ROGUE_SHIP_LOGS=0 in an env file -> no-op (a config kill switch is not overridable)");
-      return;
-    }
-    if (!flagIsEnabled(this.env.ROGUE_SHIP_LOGS)) {
-      this.debug(
-        `ROGUE_SHIP_LOGS=${this.env.ROGUE_SHIP_LOGS || "<unset>"} -> no-op (shipping is opt-in)`,
-      );
-      return;
-    }
     if (!this.apiKey) {
       this.debug("not configured -> no-op");
       return;

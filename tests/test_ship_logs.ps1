@@ -54,7 +54,7 @@ Write-Host ''
 Write-Host '== the seam loads the helpers without running the shipper'
 foreach ($fn in @('Get-TrailingFragmentLength', 'Get-FirstLineFingerprint', 'Find-LineEnd',
                   'Read-Range', 'Get-NormalizedPath', 'Get-NumberOrDefault',
-                  'Test-FlagEnabled', 'Get-StateKeyForPath', 'ConvertFrom-ShellQuoted',
+                  'Get-StateKeyForPath', 'ConvertFrom-ShellQuoted',
                   'Read-ShipState', 'Write-ShipState')) {
     Check "$fn is defined" 'True' ([string](Test-Path "function:$fn"))
 }
@@ -129,38 +129,25 @@ Check 'a real value is kept'            '42'  ([string](Get-NumberOrDefault '42'
 # this file runs under SilentlyContinue, so the value would land $null and
 # compare as smaller than every byte count it gates.
 Check 'unrepresentable -> default'      '1024' ([string](Get-NumberOrDefault ('9' * 400) 1024 0))
-# SHIPPING IS OPT-IN until /api/v1/hooks/logs is deployed, so the flag reads the
-# other way round from every knob above: unset is OFF, and only a numeric non-zero
-# value turns it on. Zero-padding counts as zero, matching phase 1's rotation cap,
-# where '00' read as positive once and rotated the log on every single write.
-Check 'ROGUE_SHIP_LOGS=1 opts in'      'True'  ([string](Test-FlagEnabled '1'))
-Check 'unset does NOT ship'            'False' ([string](Test-FlagEnabled ''))
-Check 'a typo is not an opt-in'        'False' ([string](Test-FlagEnabled 'yes'))
-Check 'ROGUE_SHIP_LOGS=0 stays off'    'False' ([string](Test-FlagEnabled '0'))
-Check 'a zero-padded 00 stays off'     'False' ([string](Test-FlagEnabled '00'))
-# An env file's explicit 0 is a KILL SWITCH that an inline ROGUE_SHIP_LOGS=1 must not
-# defeat - the one deliberate exception to "process env beats the files", because the
-# documented support one-liner passes =1 inline and would otherwise re-enable uploading
-# on a machine whose MDM profile or whose user had turned it off. Absent and
-# non-numeric are "said nothing", or a typo in one line would disable it everywhere.
-Check 'an explicit 0 is a kill switch'      'True'  ([string](Test-ValueIsZero '0'))
-Check 'a zero-padded 00 is too'             'True'  ([string](Test-ValueIsZero '00'))
-Check 'unset is not a kill switch'          'False' ([string](Test-ValueIsZero ''))
-Check 'a typo is not a kill switch'         'False' ([string](Test-ValueIsZero 'yes'))
-Check '1 is not a kill switch'              'False' ([string](Test-ValueIsZero '1'))
-# The wiring, since Invoke-Main cannot run here: the flag has to be set per file while
-# the files are read (the process-env pass overwrites the value), and checked before
-# the opt-in test.
+# THE FLAG IS GONE. Shipping is unconditional, so what has to be asserted here is the
+# absence of a gate rather than its polarity: no ROGUE_SHIP_LOGS in the env-var list a
+# run resolves, no helper left over to consult it, and nothing in Invoke-Main that can
+# return before the API-key check. A leftover value on an upgraded machine - inline or
+# in an MDM /etc/rogue/env - must not be able to silence a fleet with no knob left to
+# explain it, and the sh half asserts the same thing behaviourally in test_ship_logs.sh.
 $psShipSource = Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/ship-logs.ps1')
-# Index comparison rather than one big regex: the assertion is about ORDER (the flag
-# must be recorded while the files are read, BEFORE the process-env pass overwrites the
-# value), and a windowed `[\s\S]{0,600}` match silently depends on comment length.
-$zeroTestAt = $psShipSource.IndexOf("Test-ValueIsZero ([string]`$resolved['ROGUE_SHIP_LOGS'])")
-$processPassAt = $psShipSource.IndexOf('$processValue = [Environment]::GetEnvironmentVariable($varName)')
-Check 'Import-ShipEnv records the kill switch while reading the files' 'True' `
-    ([string]($zeroTestAt -gt 0 -and $processPassAt -gt 0 -and $zeroTestAt -lt $processPassAt))
-Check 'Invoke-Main checks it before the opt-in flag' 'True' ([string](
-    $psShipSource -match '\$script:shipDisabledByFile\)\s*\{[\s\S]{0,400}?Test-FlagEnabled'))
+Check 'no ROGUE_SHIP_LOGS in SHIP_ENV_VARS'   'False' ([string]($psShipSource -match "'ROGUE_SHIP_LOGS'"))
+Check 'Test-FlagEnabled is gone'              'False' ([string]($psShipSource -match 'function Test-FlagEnabled'))
+Check 'Test-ValueIsZero is gone'              'False' ([string]($psShipSource -match 'function Test-ValueIsZero'))
+Check 'no shipDisabledByFile plumbing'        'False' ([string]($psShipSource -match 'shipDisabledByFile'))
+# The first thing that may still stop a run is the API key, and it must come after the
+# knobs are resolved - if an early `exit 0` crept back in above it, this ordering check
+# is what notices.
+$knobsAt  = $psShipSource.IndexOf('    Resolve-Knobs')
+$apiKeyAt = $psShipSource.IndexOf('if (-not $script:apiKey) { Write-ShipDebug ''not configured -> no-op''; exit 0 }')
+Check 'Invoke-Main gates only on the API key, after the knobs' 'True' `
+    ([string]($knobsAt -gt 0 -and $apiKeyAt -gt $knobsAt -and
+              -not ($psShipSource.Substring($knobsAt, $apiKeyAt - $knobsAt) -match 'exit 0')))
 
 # ── state key ──────────────────────────────────────────────────────────────
 Write-Host ''

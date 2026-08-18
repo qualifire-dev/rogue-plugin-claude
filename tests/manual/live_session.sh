@@ -189,9 +189,8 @@ console.log(`  ${events.length} events, ${n} hook entries: ${events.join(", ")}`
 # Every ROGUE_* knob rides the process env, which beats every env file (see the
 # header). CLAUDE_PLUGIN_ROOT is exported because the detached SessionStart entries
 # read it from the environment inside their single-quoted `sh -c`, where a
-# placeholder would not expand. ROGUE_SHIP_LOGS=1 because shipping is opt-in until
-# /hooks/logs is deployed; ROGUE_SHIP_MIN_INTERVAL=0 so the second session is not
-# skipped by the 15-minute throttle.
+# placeholder would not expand. ROGUE_SHIP_MIN_INTERVAL=0 so the second session is not
+# skipped by the shipper's 15-minute throttle; shipping itself needs no opt-in.
 run_session() { # <prompt>
   ( cd "$PROJECT" || exit 1
     env CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
@@ -200,7 +199,6 @@ run_session() { # <prompt>
         ROGUE_ACTOR_EMAIL="$ACTOR_EMAIL" \
         ROGUE_ACTOR_NAME="$ACTOR_NAME" \
         ROGUE_LOG_DIR="$LOGS" \
-        ROGUE_SHIP_LOGS=1 \
         ROGUE_SHIP_MIN_INTERVAL=0 \
         claude --settings "$SETTINGS" -p "$1" --output-format text 2>&1 | sed 's/^/  claude: /' )
 }

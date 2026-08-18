@@ -372,8 +372,10 @@ function Invoke-Up {
     $lines.Add("export ROGUE_BASE_URL=$Url")
     $lines.Add("export ROGUE_ACTOR_EMAIL=$actorEmail")
     $lines.Add("export ROGUE_ACTOR_NAME=$actorName")
+    # Shipping itself is unconditional now - there is no ROGUE_SHIP_LOGS. What -Ship
+    # buys is OBSERVABILITY: without this the 15-minute self-throttle means only the
+    # first turn of a run uploads, and "nothing arrived" reads as a bug.
     if ($Ship) {
-        $lines.Add('export ROGUE_SHIP_LOGS=1')
         $lines.Add('export ROGUE_SHIP_MIN_INTERVAL=0')
     }
     if ($BeaconInterval -ne '') {
@@ -392,7 +394,8 @@ function Invoke-Up {
     } catch {}
 
     Say "  wrote $envFile (owner-only) -> $Url"
-    if ($Ship) { Say '  log shipping ON (your API must serve POST /api/v1/hooks/logs)' }
+    Say '  log shipping is always on - your API must serve POST /api/v1/hooks/logs'
+    if ($Ship) { Say '  -Ship: upload throttle disabled, so every turn ships' }
     if ($BeaconInterval -ne '' -and $cfg.HasBeacon) {
         Say "  beacon throttle ${BeaconInterval}s (0 = a beacon on every Stop)"
     }
@@ -763,9 +766,9 @@ Use the sh sibling instead:  bash tests/manual/local_api.sh ship
         Say '    no POST line at all -> nothing new on disk (an idle run makes no request)'
         Say '    a POST line then outcome=fail http=NNN -> your API rejected the bytes'
     } else {
-        Say '  no offset recorded. Most likely ROGUE_SHIP_LOGS is not enabled (shipping is'
-        Say '  OPT-IN), or an env file carries the ROGUE_SHIP_LOGS=0 kill switch, which'
-        Say '  process env deliberately cannot override. Re-run `up` with -Ship.'
+        Say '  no offset recorded, and shipping is unconditional - so this is not a flag.'
+        Say '  Check the ship: lines above for a reason (no actor, no curl), and that your'
+        Say '  API answers POST /api/v1/hooks/logs with a 2xx.'
     }
 }
 

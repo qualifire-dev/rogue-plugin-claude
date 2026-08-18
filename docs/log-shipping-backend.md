@@ -21,12 +21,13 @@ the plugin:
 > pin down. Anyone implementing this has the internal locations already; anyone who
 > does not have them should not be learning them from here.
 
-> **The plugin ships nothing until #1 is live.** `ROGUE_SHIP_LOGS` defaults to off in
-> all three client implementations precisely because the route does not exist: prod
-> answers an unknown hooks path with `404 NOT_FOUND` before auth, so a default-on
-> client would have every configured install POST into a permanent 404 once per
-> session start. See **Rollout** in [plugin-log-shipper.md](plugin-log-shipper.md)
-> for the three-line flip and its preconditions.
+> **The plugin now ships unconditionally.** The `ROGUE_SHIP_LOGS` opt-in and its `=0`
+> kill switch were removed once the route was confirmed deployed (probed 2026-08-18: an
+> empty body is answered `422` with a body-schema validation error, where an unknown
+> hooks path still answers a bare `404 NOT_FOUND`). Every configured install therefore
+> uploads, with no client-side way to opt a machine out — so #1 below is no longer a
+> precondition to a rollout, it is a live requirement. See **Rollout** in
+> [plugin-log-shipper.md](plugin-log-shipper.md).
 
 ---
 

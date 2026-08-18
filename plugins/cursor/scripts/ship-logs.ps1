@@ -87,7 +87,6 @@ $script:maxChunkBytes = 1048576
 $script:maxRunBytes = 10485760
 $script:maxLineBytes = 4194304
 $script:creds = @{}
-$script:shipDisabledByFile = $false   # an env file said ROGUE_SHIP_LOGS=0 - see Import-ShipEnv
 $script:targetBaseName = ''
 $script:targetFamily = ''
 $script:stateKey = ''
@@ -325,7 +324,7 @@ function Initialize-Args {
 #   <plugin-root>\env  ->  C:\ProgramData\rogue\env (MDM)  ->  %USERPROFILE%\.rogue-env
 $SHIP_ENV_VARS = @(
     'ROGUE_API_KEY', 'ROGUE_BASE_URL', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME',
-    'ROGUE_LOG_FILE', 'ROGUE_LOG_DIR', 'ROGUE_SHIP_LOGS', 'ROGUE_SHIP_MIN_INTERVAL',
+    'ROGUE_LOG_FILE', 'ROGUE_LOG_DIR', 'ROGUE_SHIP_MIN_INTERVAL',
     'ROGUE_SHIP_MAX_BYTES', 'ROGUE_SHIP_MAX_RUN_BYTES', 'ROGUE_SHIP_MAX_LINE_BYTES',
     'ROGUE_SHIP_ALL')
 
@@ -341,16 +340,6 @@ function Import-ShipEnv {
             if ($line -match '^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
                 $resolved[$Matches[1]] = ConvertFrom-ShellQuoted ($Matches[2].Trim())
             }
-        }
-        # OFF WINS. Every other knob here follows "process env beats the files", but an
-        # explicit ROGUE_SHIP_LOGS=0 in a CONFIG FILE is a kill switch, and a kill
-        # switch a process variable can defeat is not one: the documented support
-        # one-liner sets ROGUE_SHIP_LOGS=1 inline, so under plain precedence it would
-        # silently re-enable uploading on a machine whose MDM profile or whose user had
-        # turned it off. Recorded per file, because the process-env pass below is about
-        # to overwrite the value.
-        if (Test-ValueIsZero ([string]$resolved['ROGUE_SHIP_LOGS'])) {
-            $script:shipDisabledByFile = $true
         }
     }
     foreach ($varName in $SHIP_ENV_VARS) {
@@ -380,36 +369,19 @@ function Get-NumberOrDefault {
     return $parsed
 }
 
-# Numeric zero (including a zero-padded '00', matching phase 1's rotation cap)
-# means off; a non-numeric value means the default.
-# SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
-# turns it on. That is the reverse of every other knob here, and deliberate - the
-# receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
-# would have every configured install POST into a permanent 404 on each session
-# start: no offset ever advances, and each failure appends an `outcome=fail http=404`
-# line to the very file being shipped, so the backlog only grows. Flipping the
-# default (here, in ship-logs.sh and in ship-logs.mjs, one line each) is the last
-# step of the rollout, once the route answers 2xx *after* a durable write - see
-# docs/log-shipping-backend.md. Until then `ROGUE_SHIP_LOGS=1` in any env file opts
-# a machine in, which is also how the support invocation and the e2e suite run it.
+# SHIPPING IS UNCONDITIONAL. There is no ROGUE_SHIP_LOGS flag: a configured install
+# uploads its hook log, and the only things that stop a given run are the ones that
+# were always able to - no API key, no resolvable actor, the self-throttle, or simply
+# no new bytes on disk. It was opt-in while /api/v1/hooks/logs was undeployed, since a
+# default-on client would have POSTed into a permanent 404 and appended an
+# `outcome=fail http=404` line to the very file it was draining. The route now exists
+# (an empty body is answered 422 with a body-schema validation error, where a genuinely
+# unknown hooks path is answered a bare 404), so the gate is gone rather than flipped.
 #
-# A non-numeric value ("yes", "true", a typo) is NOT an opt-in: it falls back to the
-# default, matching every other knob's "a typo must never change behaviour" rule.
-# Numeric zero, including a zero-padded "00" (phase 1's rotation-cap precedent),
-# is an explicit off and stays off after the default flips.
-function Test-FlagEnabled {
-    param([string]$Value)
-    if ($Value -notmatch '^[0-9]+$') { return $false }
-    return ([int64]$Value -ne 0)
-}
-
-# An EXPLICIT numeric zero, including a zero-padded one. Absent and non-numeric are
-# both "said nothing", which is what separates a kill switch from a default.
-function Test-ValueIsZero {
-    param([string]$Value)
-    if ($Value -notmatch '^[0-9]+$') { return $false }
-    return ([int64]$Value -eq 0)
-}
+# What the 2xx contract still requires of the server is unchanged and load-bearing:
+# the offset advances only on 2xx and the client then forgets those bytes, so a 2xx
+# sent before a durable write is a permanent, silent gap. See
+# docs/log-shipping-backend.md.
 
 function Resolve-Knobs {
     $script:minIntervalSeconds = Get-NumberOrDefault $script:creds['ROGUE_SHIP_MIN_INTERVAL'] 900 1
@@ -942,16 +914,6 @@ function Invoke-Main {
     Initialize-Args
     Import-ShipEnv
     Resolve-Knobs
-    if ($script:shipDisabledByFile) {
-        Write-ShipDebug 'ROGUE_SHIP_LOGS=0 in an env file -> no-op (a config kill switch is not overridable)'
-        exit 0
-    }
-    if (-not (Test-FlagEnabled ([string]$script:creds['ROGUE_SHIP_LOGS']))) {
-        $flagValue = [string]$script:creds['ROGUE_SHIP_LOGS']
-        if (-not $flagValue) { $flagValue = '<unset>' }
-        Write-ShipDebug "ROGUE_SHIP_LOGS=$flagValue -> no-op (shipping is opt-in)"
-        exit 0
-    }
     if (-not $script:apiKey) { Write-ShipDebug 'not configured -> no-op'; exit 0 }
     if (-not (Resolve-ShipActor)) {
         # Do NOT invent an identity. A wrong one creates an orphaned log_source row,

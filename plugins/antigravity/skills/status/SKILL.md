@@ -173,10 +173,9 @@ first model invocation of a turn, at most once every 15 minutes per file, resumi
 from wherever the last upload finished. Run it by hand only to push the newest
 lines *now*.
 
-**Uploading is off by default right now.** The receiving route is not deployed yet,
-so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
-is why every command below sets it explicitly. Once the route is live the default
-flips and the paragraph above applies unchanged.
+**Uploading needs no opt-in.** A configured install uploads its log on its own; the
+commands below only make one run happen *now*, with its output visible. There is no
+`ROGUE_SHIP_LOGS` flag any more — nothing here switches uploading on or off.
 
 - macOS / Linux:
 ```bash
@@ -194,7 +193,7 @@ if [ -z "$ship" ]; then
   echo "ship-logs.sh not found - list ~/.gemini/config/plugins and ~/.gemini/antigravity-cli/plugins and report what is there"
 else
   echo "using $ship"
-  ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$ship"
+  ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$ship"
 fi
 ```
 - Windows (PowerShell):
@@ -209,7 +208,7 @@ foreach ($r in @((Join-Path $env:USERPROFILE '.gemini\config\plugins\rogue'),
 if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.gemini\config\plugins and %USERPROFILE%\.gemini\antigravity-cli\plugins and report what is there' }
 else {
   "using $ship"
-  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
   $env:ROGUE_SHIPPER_SCRIPT = $ship
   # PASS THE ROOT. On a no-argument run the shipper self-locates its plugin root to
   # read <root>\env, the FIRST file in the credential chain - and $PSCommandPath is
@@ -227,7 +226,7 @@ else {
   # One run only. The bash form scopes these to a single command; setting them as
   # session variables would leave later runs from this session with the 15-minute
   # throttle waived and debug output on.
-  Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT, Env:ROGUE_SHIPPER_ROOT -ErrorAction SilentlyContinue
+  Remove-Item Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT, Env:ROGUE_SHIPPER_ROOT -ErrorAction SilentlyContinue
 }
 ```
 
@@ -247,7 +246,6 @@ Run with **no arguments**, which is the support form: it uploads *every* agent's
 log in the log directory, not just `antigravity.log`. Each line is attributed by
 its own `provider=` token, so a mixed upload is still filed per agent.
 
-`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
 `ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
 `ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
 output at all** when everything already shipped — that is success. Nothing is
@@ -256,9 +254,7 @@ on a confirmed 2xx.
 
 Report failures as-is rather than retrying: `http=401` is a bad API key
 (`/setup`), `http=000` is a network or proxy problem, and
-`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
-in any env file keeps uploading off even with the flag above,
-and stays off after the default flips.
+`outcome=skip reason=no-actor` means identity is unresolved.
 
 ## Step 5: Summary
 

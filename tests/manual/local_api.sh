@@ -169,13 +169,16 @@ cmd_up() {
       echo "export ROGUE_BASE_URL=$URL"
       echo "export ROGUE_ACTOR_EMAIL=${ROGUE_ACTOR_EMAIL:-localdev@rogue.security}"
       echo "export ROGUE_ACTOR_NAME=${ROGUE_ACTOR_NAME:-Local Dev}"
-      [ "$SHIP" = 1 ] && echo "export ROGUE_SHIP_LOGS=1"
+      # Shipping itself is unconditional now - there is no ROGUE_SHIP_LOGS. What
+      # --ship buys is OBSERVABILITY: without this the 15-minute self-throttle means
+      # only the first turn of a run uploads, and "nothing arrived" reads as a bug.
       [ "$SHIP" = 1 ] && echo "export ROGUE_SHIP_MIN_INTERVAL=0"
       [ -n "$BEACON" ] && echo "export ROGUE_HEARTBEAT_MIN_INTERVAL=$BEACON"
     } > "$ENV_FILE"
   )
   say "  wrote $ENV_FILE (mode 600) -> $URL"
-  [ "$SHIP" = 1 ] && say "  log shipping ON (your API must serve POST /api/v1/hooks/logs)"
+  say "  log shipping is always on - your API must serve POST /api/v1/hooks/logs"
+  [ "$SHIP" = 1 ] && say "  --ship: upload throttle disabled, so every turn ships"
   [ -n "$BEACON" ] && say "  beacon throttle ${BEACON}s (0 = a beacon on every Stop)"
 
   rule "next"
@@ -329,7 +332,9 @@ cmd_check() {
       fi
     fi
   else
-    say "  no ship state yet at $SHIP_STATE (shipping is OPT-IN; use \`up --ship\`)"
+    say "  no ship state yet at $SHIP_STATE - nothing has been uploaded yet. Shipping is"
+    say "  unconditional, so this means no turn has run, or every run was throttled;"
+    say "  \`up --ship\` disables the throttle and \`ship\` forces one upload now."
   fi
   BEACON_STAMP="$HOME/.rogue/beacon/.last-claude"
   if [ -r "$BEACON_STAMP" ]; then
@@ -394,9 +399,9 @@ cmd_ship() {
     say "    no POST line at all -> nothing new on disk (an idle run makes no request)"
     say "    a POST line then outcome=fail http=NNN -> your API rejected the bytes"
   else
-    say "  no offset recorded. Most likely ROGUE_SHIP_LOGS is not enabled (shipping is"
-    say "  OPT-IN), or an env file carries the ROGUE_SHIP_LOGS=0 kill switch, which"
-    say "  process env deliberately cannot override. Re-run \`up --ship\`."
+    say "  no offset recorded, and shipping is unconditional - so this is not a flag."
+    say "  Check the ship: lines above for a reason (no actor, no curl), and that your"
+    say "  API answers POST /api/v1/hooks/logs with a 2xx."
   fi
 }
 

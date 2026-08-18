@@ -49,7 +49,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 # authenticate to the local receiver with real credentials. The sh suite learned this
 # the hard way; same reasoning, same fix.
 $shipperKnobs = @('ROGUE_API_KEY', 'ROGUE_BASE_URL', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME',
-                  'ROGUE_LOG_FILE', 'ROGUE_LOG_DIR', 'ROGUE_LOG_MAX_BYTES', 'ROGUE_SHIP_LOGS',
+                  'ROGUE_LOG_FILE', 'ROGUE_LOG_DIR', 'ROGUE_LOG_MAX_BYTES',
                   'ROGUE_SHIP_MIN_INTERVAL', 'ROGUE_SHIP_MAX_BYTES', 'ROGUE_SHIP_MAX_RUN_BYTES',
                   'ROGUE_SHIP_MAX_LINE_BYTES', 'ROGUE_SHIP_ALL', 'ROGUE_DEBUG')
 # Everything this file writes into the CALLER's session, snapshotted BEFORE the scrub
@@ -138,9 +138,9 @@ function Invoke-ProductScript {
         -NoNewWindow -PassThru -Wait
 }
 
-# ROGUE_SHIP_LOGS=1 on every run: shipping is OPT-IN until /api/v1/hooks/logs is
-# deployed, so without it every case here would pass vacuously against a shipper that
-# did nothing. The default itself is asserted once, on its own, below.
+# Nothing opts these runs in: shipping is unconditional, so a configured install with
+# new bytes uploads them. That default is asserted on its own below, because every case
+# here would pass vacuously against a shipper that did nothing.
 #
 # A CHILD PROCESS, never in-process, for the same reason the heartbeats spawn one:
 # ship-logs.ps1's Invoke-Main ends in `exit 0`, which in-process terminates the
@@ -154,7 +154,6 @@ function Invoke-Shipper {
     param([hashtable]$Extra = @{})
     $env:ROGUE_BASE_URL = $baseUrl
     $env:ROGUE_SHIP_MIN_INTERVAL = '0'
-    $env:ROGUE_SHIP_LOGS = '1'
     foreach ($k in $Extra.Keys) { Set-Item "Env:$k" $Extra[$k] }
     # Waited on, unlike the heartbeat's detached spawn: every assertion below is about
     # what the run produced, so the run has to be over.
@@ -259,19 +258,26 @@ if ($after -lt $rotatedBefore + 2) {
     Check 'the live chunk starts at 0' '0' (LastEnvelopeField 'offset')
 }
 
-# ── shipping is OPT-IN ─────────────────────────────────────────────────────
+# ── shipping is unconditional ──────────────────────────────────────────────
 Write-Host ''
-Write-Host '== shipping is OPT-IN: no ROGUE_SHIP_LOGS uploads nothing'
+Write-Host '== shipping is unconditional, and a retired ROGUE_SHIP_LOGS cannot stop it'
 Add-LogLines 2
-$optInBefore = Envelopes
+$defaultBefore = Envelopes
 $env:ROGUE_BASE_URL = $baseUrl
 $env:ROGUE_SHIP_MIN_INTERVAL = '0'
 Remove-Item Env:ROGUE_SHIP_LOGS -ErrorAction SilentlyContinue
 $env:ROGUE_E2E_ROOT = Join-Path $repo 'plugins/rogue'
 Invoke-ProductScript 'plugins/rogue/scripts/ship-logs.ps1' '$env:ROGUE_E2E_ROOT claude 9.9.9 claude' | Out-Null
-Check 'an opt-out install uploads nothing' ([string]$optInBefore) ([string](Envelopes))
-Invoke-Shipper
-Check 'and the same lines upload once opted in' ([string]($optInBefore + 1)) ([string](Envelopes))
+Check 'a configured install uploads with no flag set' ([string]($defaultBefore + 1)) ([string](Envelopes))
+# A value left behind on a machine that once set it must not silence that machine: an
+# upgrade would otherwise leave a fleet half-off with no knob left to explain it. Set
+# inline AND in the env file, since the file used to be the non-overridable half.
+Add-LogLines 2
+$staleBefore = Envelopes
+Add-Content -LiteralPath (Join-Path $sandboxHome '.rogue-env') -Value 'export ROGUE_SHIP_LOGS=0'
+Invoke-Shipper @{ ROGUE_SHIP_LOGS = '0' }
+Check 'a stale ROGUE_SHIP_LOGS=0 no longer disables' ([string]($staleBefore + 1)) ([string](Envelopes))
+Remove-Item Env:ROGUE_SHIP_LOGS -ErrorAction SilentlyContinue
 
 # ── the REAL caller: heartbeat.ps1 spawns the shipper as a child process ───
 Write-Host ''
@@ -292,7 +298,6 @@ $env:CLAUDE_PLUGIN_ROOT = (Join-Path $repo 'plugins/rogue')
 $env:CLAUDE_CODE_ENTRYPOINT = 'cli'
 $env:ROGUE_BASE_URL = $baseUrl
 $env:ROGUE_SHIP_MIN_INTERVAL = '0'
-$env:ROGUE_SHIP_LOGS = '1'
 Invoke-ProductScript 'plugins/rogue/scripts/heartbeat.ps1' | Out-Null
 # The shipper is DETACHED by design, so poll for its upload instead of assuming it
 # has finished by the time the heartbeat returns.
