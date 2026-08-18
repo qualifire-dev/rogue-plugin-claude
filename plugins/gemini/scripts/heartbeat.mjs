@@ -10,22 +10,8 @@
 // always send a stable host + actor-email. Family is the fixed enum "gemini";
 // the surface rides `agent` as "gemini_cli" (drives the dashboard version badge).
 
-import fs from "node:fs";
 import os from "node:os";
-import path from "node:path";
-import { EXT_ROOT, loadEnvFiles, gitConfig } from "./shared.mjs";
-
-// Read the extension version from the manifest (source of truth).
-function readVersion() {
-  try {
-    const m = JSON.parse(
-      fs.readFileSync(path.join(EXT_ROOT, "gemini-extension.json"), "utf8"),
-    );
-    return typeof m.version === "string" ? m.version : "unknown";
-  } catch {
-    return "unknown";
-  }
-}
+import { EXT_ROOT, loadEnvFiles, gitConfig, installId } from "./shared.mjs";
 
 async function main() {
   const env = loadEnvFiles();
@@ -47,12 +33,14 @@ async function main() {
     /\/+$/,
     "",
   );
-  const version = readVersion();
+  // Same three values hook.mjs sends as headers on every event, so both writers
+  // land on one roster row (see installId).
+  const install = installId();
   const body = JSON.stringify({
     agent_family: "gemini",
-    agent: "gemini_cli",
-    version,
-    host: os.hostname() || "unknown",
+    agent: install.agent,
+    version: install.version,
+    host: install.host,
     actor_email: email,
     actor_name: name || "",
   });
@@ -95,7 +83,7 @@ async function main() {
     process.env.ROGUE_ACTOR_EMAIL = email;
     process.env.ROGUE_ACTOR_NAME = name || "";
     const shipper = await import("./ship-logs.mjs");
-    await shipper.main([EXT_ROOT, "gemini", version, "gemini"]);
+    await shipper.main([EXT_ROOT, "gemini", install.version, "gemini"]);
   } catch {
     /* a missing or broken shipper must never affect the heartbeat */
   }
