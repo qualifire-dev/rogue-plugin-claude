@@ -91,6 +91,13 @@ function ConvertFrom-ShellQuoted {
 # reading a script variable from a function is implicit, but ASSIGNING one needs
 # the `$script:` prefix or the write lands in a function-local copy and silently
 # vanishes. Every write to shared state below is therefore `$script:`-qualified.
+# Which SURFACE of Antigravity wrote each line - antigravity, antigravity_ide or
+# antigravity_cli. Resolved from the payload's transcriptPath, the ONLY reliable
+# signal (three products share one install, so a filesystem probe cannot tell which
+# is running), and the same value the heartbeat reports. Empty for an event whose
+# payload carries no transcriptPath, and for every line written before the payload
+# is read: the token is then OMITTED, never `surface=` and never `surface=unknown`.
+$script:surface     = ''
 $script:logFile     = ''       # resolved in Initialize-Logging
 $script:logMaxBytes = 10485760  # ditto; the default stands until then
 $creds      = @{}  # credential files + process env, by Import-Credentials
@@ -226,9 +233,12 @@ function Log {
         # produced by a rotation) would start with EF BB BF and fail any parser
         # that anchors on the timestamp. "`n" keeps the line ending identical to
         # what the sh dispatchers write, so one log format covers both platforms.
+        # Empty slug -> empty string, so the line is byte-identical to what an
+        # older version wrote. Optional means optional.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
         [System.IO.File]::AppendAllText(
             $logFile,
-            "$stamp provider=antigravity event=$EventName $Msg`n",
+            "$stamp provider=antigravity$surfaceToken event=$EventName $Msg`n",
             (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
@@ -708,6 +718,9 @@ function Add-StoreRead {
 function Resolve-Surface {
     $script:payloadTp = Get-PayloadTranscriptPath $payload
     $script:isIdeSurface = $script:payloadTp -like '*/antigravity-ide/*'
+    # Same path, same table: the log token, the heartbeat's roster agent and the
+    # IDE-only enrichment branch all come from this one resolution.
+    $script:surface = [string](Get-AntigravitySurface $script:payloadTp)
 }
 
 # This install's fleet identity: host + version (from the bundled VERSION file,
@@ -739,9 +752,13 @@ function Resolve-InstallId {
         $installError += "version-file-missing:$versionFile"
     }
     if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
-    # Unattributable payload: default to the 2.0 app, the same guess the backend's
-    # parser makes, so the roster row matches the events it stores.
-    $a = Get-AntigravitySurface $script:payloadTp
+    # The surface comes from Resolve-Surface, which ran first off the same
+    # transcriptPath - reused, never re-derived, so the log token and this header
+    # cannot name different surfaces for one event. Unattributable payload: default
+    # to the 2.0 app, the same guess the backend's parser makes, so the roster row
+    # matches the events it stores. (The log token stays empty in that case and the
+    # line then carries no surface= at all; only the required fields default.)
+    $a = $script:surface
     if (-not $a) { $a = 'antigravity' }
     $script:install = @{ host = $h; version = $v; agent = $a }
 }
@@ -899,12 +916,13 @@ function Invoke-Main {
     Resolve-Url
     Resolve-Actor
     Read-Payload
-
-    # Before the heartbeat: it is handed the surface resolved here, so the
-    # heartbeat body and this event's headers can never name different surfaces
-    # for one install (see Resolve-InstallId). Re-attribution below rewrites
-    # conversationId, never transcriptPath, so reading the surface this early is
-    # the same answer it would give later.
+    # Immediately after the payload, and BEFORE anything that logs or sends - the
+    # same position hook.sh resolves it in. Every log line from here on carries the
+    # surface, so the two dispatchers emit the same token for the same event; and
+    # Resolve-InstallId reuses this answer for the header, so the heartbeat body
+    # and this event's headers can never name different surfaces for one install.
+    # Re-attribution below rewrites conversationId, never transcriptPath, so
+    # reading the surface this early is the same answer it would give later.
     Resolve-Surface
     Resolve-InstallId
 

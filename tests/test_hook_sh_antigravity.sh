@@ -212,14 +212,20 @@ EOF
 chmod +x "$STAGE/scripts/hook.sh" "$STAGE/scripts/heartbeat.sh"
 
 # Run the staged hook.sh (PLUGIN_ROOT resolves to $STAGE) and echo its exit code.
+# The hook log goes to a path OUTSIDE the per-run sandbox, so an assertion can read
+# the line back after the run (the sandbox is deleted below). Truncated per call so
+# each case reads only its own output.
+LAST_LOG="$(mktemp -d)/antigravity.log"
+
 run_staged() {
   local tmp_home rc
   tmp_home="$(mktemp -d)"
   cp "$ENV_FILE" "$tmp_home/.rogue-env"
+  : > "$LAST_LOG"
   set +e
   HOME="$tmp_home" \
     ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
-    ROGUE_LOG_FILE="$tmp_home/hook.log" \
+    ROGUE_LOG_FILE="$LAST_LOG" \
     "$SH" "$STAGE/scripts/hook.sh" "$1" <<< "$2" > "$OUT_FILE"
   rc=$?
   set -e
@@ -264,6 +270,14 @@ for surface in antigravity_cli antigravity_ide antigravity; do
   assert_eq "$rc" "0" "$surface heartbeat exits 0"
   for _ in $(seq 1 30); do [ -s "$MARKER" ] && break; sleep 0.1; done
   assert_eq "$(cat "$MARKER" 2>/dev/null)" "$surface" "heartbeat is told the $surface surface"
+  # The SAME resolution stamps the log line. One value, two consumers: if these
+  # ever disagree, a line and the roster row for one session name different
+  # surfaces - worse than the line naming none. (The unconfigured path has no
+  # payload to resolve from and correctly emits no token at all; that case is
+  # covered in tests/test_hook_logs.sh.)
+  logged=$(sed -n 's/.*provider=antigravity surface=\([a-z_]*\) event=.*/\1/p' \
+             "$LAST_LOG" 2>/dev/null | tail -1)
+  assert_eq "$logged" "$surface" "the log line is stamped surface=$surface"
 done
 rm -rf "$STAGE"
 

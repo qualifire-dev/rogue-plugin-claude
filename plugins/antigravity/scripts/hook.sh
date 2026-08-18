@@ -44,6 +44,7 @@
 EVENT=""          # hook event name, from $1
 PLUGIN_ROOT=""    # <root> of this plugin, derived from $0
 BODY=""           # the hook payload, as received then enriched
+SURFACE=""        # antigravity | antigravity_ide | antigravity_cli, or empty
 URL=""            # where to POST it
 SUBAGENT_ID=""    # set by reattribute_subagent when this event is a subagent's
 SUBAGENT_NAME=""
@@ -135,8 +136,13 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=antigravity event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # `${SURFACE:+ surface=$SURFACE}` expands to NOTHING when the slug is empty -
+    # which is the normal case for an event whose payload carries no transcriptPath,
+    # and for every line written before read_body. Never `surface=`, never
+    # `surface=unknown`.
+    printf '%s provider=antigravity%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 
@@ -626,10 +632,17 @@ load_install_id() {
   # it is worth knowing about: an "unknown" host or version means this install
   # reports itself imprecisely to the fleet roster.
   [ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
-  ROGUE_INSTALL_AGENT=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
-  # Unattributable payload: default to the 2.0 app, the same guess the backend's
-  # parser makes, so the roster row matches the events it stores.
-  [ -n "$ROGUE_INSTALL_AGENT" ] || ROGUE_INSTALL_AGENT="antigravity"
+  # ONE resolution, four consumers: the log token, the x-rogue-agent header, the
+  # heartbeat's roster agent and enrich_body's IDE-only branch. transcriptPath is
+  # the only reliable signal (three products share one install, so a filesystem
+  # probe cannot tell which is running), and it is absent from some events.
+  SURFACE=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  # Two variables off that one call, because the two consumers differ on what an
+  # unattributable payload means. The LOG token stays empty, and the line then
+  # carries no `surface=` at all rather than claiming one. The HEADER and the
+  # roster row are required fields, so they default to the 2.0 app - the same guess
+  # the backend's parser makes, so the row matches the events it stores.
+  ROGUE_INSTALL_AGENT="${SURFACE:-antigravity}"
   return 0
 }
 
@@ -673,7 +686,7 @@ maybe_heartbeat() {
 #     so the wait was pure latency on the event that blocks the developer. The
 #     prompt comes from the conversation store instead.
 enrich_body() {
-  _surface=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  _surface="$SURFACE"
   if [ "$_surface" = "antigravity_ide" ]; then
     case "$EVENT" in
       # The pending prompt, before the model call that would consume it.
@@ -763,7 +776,7 @@ main() {
   require_api_key        # exits before stdin is read when there is no key
   load_actor
   read_body
-  load_install_id
+  load_install_id        # host + version + the surface, resolved once from the payload
 
   maybe_heartbeat
   # Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON

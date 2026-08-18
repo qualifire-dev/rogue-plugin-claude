@@ -21,7 +21,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { HOME, SCRIPT_DIR, loadEnvFiles, gitConfig, installId } from "./shared.mjs";
+import {
+  HOME,
+  SCRIPT_DIR,
+  SURFACE,
+  loadEnvFiles,
+  gitConfig,
+  installId,
+} from "./shared.mjs";
 
 const EVENT = process.argv[2] || "unknown";
 
@@ -30,6 +37,15 @@ const EVENT = process.argv[2] || "unknown";
 // ("gemini_cli", which the server keys its version lookup on) — see
 // heartbeat.mjs. Keep the two independent.
 const PROVIDER = "gemini";
+// The one surface this extension has - Gemini CLI. A closed-vocabulary slug,
+// lowercase, no space and no "=", so a reader finds the value by scanning to the
+// next "key=" token, and it matches what heartbeat.mjs reports as the roster agent.
+// A constant here: there is nothing to detect and nothing that can fail. It is
+// still emitted through the same conditional the multi-surface plugins use, so all
+// six dispatchers share one emit shape and an empty value omits the token entirely
+// rather than writing "surface=" or "surface=unknown". Imported from shared.mjs
+// because installId() sends the same value as x-rogue-agent and heartbeat.mjs sends
+// it as the roster agent - one literal, three consumers.
 
 // ── Emit + exit ────────────────────────────────────────────────────────────
 // stdout must be ONLY the final JSON object. Always exit 0 — a blocking verdict
@@ -111,7 +127,12 @@ function log(msg) {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true, mode: 0o700 });
     rotateLog();
     const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    fs.appendFileSync(LOG_FILE, `${ts} provider=${PROVIDER} event=${EVENT} ${msg}\n`, { mode: 0o600 });
+    const surfaceToken = SURFACE ? ` surface=${SURFACE}` : "";
+    fs.appendFileSync(
+      LOG_FILE,
+      `${ts} provider=${PROVIDER}${surfaceToken} event=${EVENT} ${msg}\n`,
+      { mode: 0o600 },
+    );
   } catch {
     /* logging is best-effort */
   }

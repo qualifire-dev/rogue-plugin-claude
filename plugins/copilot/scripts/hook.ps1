@@ -85,6 +85,10 @@ function ConvertFrom-ShellQuoted {
 # would make the log shipper and the dispatcher disagree on the path.
 # Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
 # dot-source the helpers, and so Log is safe to call before initialisation.
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no '=', so a reader finds the value by scanning to the next 'key=' token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+$script:surface = 'github_copilot'
 $script:logFile = $null
 $script:logMaxBytes = 10485760
 
@@ -158,9 +162,13 @@ function Log {
         # produced by a rotation) would start with EF BB BF and fail any parser
         # that anchors on the timestamp. "`n" keeps the line ending identical to
         # what the sh dispatchers write, so one log format covers both platforms.
+        # A constant: this plugin has exactly one surface, so there is nothing to
+        # detect and nothing that can fail. Written through the same conditional as
+        # the multi-surface plugins so all six dispatchers share one emit shape.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
         [System.IO.File]::AppendAllText(
             $logFile,
-            "$stamp provider=copilot event=$EventName $Msg`n",
+            "$stamp provider=copilot$surfaceToken event=$EventName $Msg`n",
             (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }

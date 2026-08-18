@@ -1,6 +1,6 @@
 {
   "name": "rogue",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Rogue Security AIDR — real-time AI agent detection and response for GitHub Copilot CLI",
   "author": {
     "name": "Rogue Security",

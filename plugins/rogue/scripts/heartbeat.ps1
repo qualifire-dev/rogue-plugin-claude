@@ -98,10 +98,20 @@ if (Test-Path -LiteralPath $pj) {
 }
 
 # -- agent display label from entrypoint (family is the fixed enum "claude") -
-$ep = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
-if ($ep -like '*cowork*')      { $agent = 'Claude Cowork' }
-elseif ($ep -like '*desktop*') { $agent = 'Claude Code - Desktop' }
-else                           { $agent = 'Claude Code - CLI' }
+# One table, in scripts/surface.ps1, shared with hook.ps1 - which stamps the
+# matching SLUG on each log line. Two copies of this mapping would eventually
+# drift, and a log line naming a different surface than the roster row for the same
+# session is worse than a line that names none. The literal below is a last-resort
+# guard for a damaged install, not a second copy of the mapping.
+$agent = ''
+try {
+    $surfaceLib = Join-Path $pluginRoot 'scripts\surface.ps1'
+    if (Test-Path -LiteralPath $surfaceLib) {
+        . $surfaceLib
+        $agent = [string](Get-RogueSurfaceLabel)
+    }
+} catch { $agent = '' }
+if (-not $agent) { $agent = 'Claude Code - CLI' }
 
 $host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 

@@ -70,6 +70,11 @@ function ConvertFrom-ShellQuoted {
 # would make the log shipper and the dispatcher disagree on the path.
 # Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
 # dot-source the helpers, and so Log is safe to call before initialisation.
+# Which SURFACE of Codex wrote each line - codex_app or codex_cli. Resolved from
+# the credential map (scripts/surface.ps1), the same table heartbeat.ps1 reads, so a
+# log line and the roster row for one session cannot name different surfaces. Empty
+# OMITS the token; it is never written as `surface=` or `surface=unknown`.
+$script:surface = ''
 $script:logFile = $null
 $script:logMaxBytes = 10485760
 
@@ -143,9 +148,12 @@ function Log {
         # produced by a rotation) would start with EF BB BF and fail any parser
         # that anchors on the timestamp. "`n" keeps the line ending identical to
         # what the sh dispatchers write, so one log format covers both platforms.
+        # Empty slug -> empty string, so the line is byte-identical to what an
+        # older version wrote. Optional means optional.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
         [System.IO.File]::AppendAllText(
             $logFile,
-            "$stamp provider=codex event=$EventName $Msg`n",
+            "$stamp provider=codex$surfaceToken event=$EventName $Msg`n",
             (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
@@ -190,6 +198,18 @@ foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BAS
 # Logging is initialised HERE - after the credential files are parsed, so they can
 # relocate the log - but BEFORE the API-key check below, so an unconfigured
 # install still records `outcome=unconfigured`.
+# Before the first Log call, so even an unconfigured install stamps the surface.
+# Guarded on both sides: a damaged install with no surface.ps1, or a resolver that
+# throws, leaves the slug empty and the token is omitted - logging must never change
+# the hook's outcome.
+try {
+    $surfaceLib = Join-Path $pluginRoot 'scripts\surface.ps1'
+    if (Test-Path -LiteralPath $surfaceLib) {
+        . $surfaceLib
+        $script:surface = [string](Get-CodexSurfaceSlug $creds)
+    }
+} catch { $script:surface = '' }
+
 Initialize-Logging $creds
 Dbg "logFile=$logFile cap=$logMaxBytes"
 
@@ -202,7 +222,12 @@ if (-not $apiKey) {
     exit 0
 }
 
-$surface = $creds['ROGUE_CODEX_SURFACE']; if (-not $surface) { $surface = 'codex_cli' }
+# Reuse the slug resolved above, so the header, the log token and the roster row are
+# one value. The fallback covers a damaged install where surface.ps1 was missing:
+# the header has always carried a surface and must keep carrying one, where the log
+# token is optional.
+$surface = $script:surface
+if (-not $surface) { $surface = 'codex_cli' }
 
 # URL: explicit ROGUE_API_URL wins, else base + path.
 $url = $creds['ROGUE_API_URL']

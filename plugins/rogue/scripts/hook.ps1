@@ -132,6 +132,13 @@ function Repair-DoubleEncodedUtf8 {
 # would make the log shipper and the dispatcher disagree on the path.
 # Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
 # dot-source the helpers, and so Log is safe to call before initialisation.
+# Which SURFACE of Claude wrote each line - cli, desktop or cowork. One file per
+# agent family means every surface on the machine appends to the same claude.log,
+# and nothing on the line said which one. The mapping is shared with heartbeat.ps1
+# (scripts/surface.ps1) so a line and the roster row for the same session can never
+# name different surfaces. An empty value OMITS the token; it is never written as
+# `surface=` or `surface=unknown`.
+$script:surface = ''
 $script:logFile = $null
 $script:logMaxBytes = 10485760
 
@@ -205,9 +212,12 @@ function Log {
         # produced by a rotation) would start with EF BB BF and fail any parser
         # that anchors on the timestamp. "`n" keeps the line ending identical to
         # what the sh dispatchers write, so one log format covers both platforms.
+        # Empty slug -> empty string, so the line is byte-identical to what an
+        # older version wrote. Optional means optional.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
         [System.IO.File]::AppendAllText(
             $logFile,
-            "$stamp provider=claude event=$EventName $Msg`n",
+            "$stamp provider=claude$surfaceToken event=$EventName $Msg`n",
             (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
@@ -241,6 +251,18 @@ Dbg "event=$EventName"
 $pluginRoot = $env:CLAUDE_PLUGIN_ROOT
 if (-not $pluginRoot) { try { $pluginRoot = (Get-Location).Path } catch { $pluginRoot = '.' } }
 Dbg "pluginRoot=$pluginRoot"
+
+# Resolve the surface before the first Log call. Guarded on both sides: a damaged
+# install with no surface.ps1, or a resolver that throws, leaves the slug empty and
+# the token is simply omitted - logging must never change the hook's outcome.
+try {
+    $surfaceLib = Join-Path $pluginRoot 'scripts\surface.ps1'
+    if (Test-Path -LiteralPath $surfaceLib) {
+        . $surfaceLib
+        $script:surface = [string](Get-RogueSurfaceSlug)
+    }
+} catch { $script:surface = '' }
+Dbg "surface=$($script:surface)"
 
 # -- credential resolution (later file wins; process env wins over all) -----
 $creds = @{}
@@ -335,10 +357,16 @@ if (Test-Path -LiteralPath $pluginJson) {
 }
 
 # Family is the fixed enum "claude"; the surface is this free-form display label.
-$entrypoint = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
-if ($entrypoint -like '*cowork*')      { $installAgent = 'Claude Cowork' }
-elseif ($entrypoint -like '*desktop*') { $installAgent = 'Claude Code - Desktop' }
-else                                   { $installAgent = 'Claude Code - CLI' }
+#
+# Taken from scripts\surface.ps1, ALREADY dot-sourced above for the log line's
+# `surface=` slug - the label and the slug are two columns of one table, and this
+# file must not hold a second copy of the mapping: a log line naming a different
+# surface than the roster row for the same session is worse than a line that names
+# none. The literal covers a damaged install where surface.ps1 was missing or its
+# resolver threw (the same case that leaves $script:surface empty).
+$installAgent = ''
+try { if (Get-Command Get-RogueSurfaceLabel -ErrorAction SilentlyContinue) { $installAgent = [string](Get-RogueSurfaceLabel) } } catch { $installAgent = '' }
+if (-not $installAgent) { $installAgent = 'Claude Code - CLI' }
 
 # A degraded value is still SENT rather than failing the hook: it identifies the
 # install well enough to keep the roster fresh, and no liveness bookkeeping is

@@ -68,10 +68,25 @@ log() {
   ( umask 077
     mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
     rotate_log
-    printf '%s provider=codex event=%s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+    # `${SURFACE:+ surface=$SURFACE}` expands to NOTHING when the slug is empty, so
+    # an undetermined surface leaves the line exactly as older versions wrote it -
+    # never `surface=` and never `surface=unknown`.
+    printf '%s provider=codex%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+
+# Which SURFACE of Codex wrote this - codex_app or codex_cli. Resolved HERE, above
+# the first log() call, so even an unconfigured install stamps it; the same value is
+# reused for the x-rogue-agent header below, and heartbeat.sh reads the same table
+# (scripts/surface.sh) so a log line and the roster row for one session cannot name
+# different surfaces. Guarded: no surface.sh, no token - never a broken hook.
+SURFACE=""
+if [ -r "${PLUGIN_ROOT}/scripts/surface.sh" ]; then
+  . "${PLUGIN_ROOT}/scripts/surface.sh"
+  SURFACE=$(codex_surface_slug 2>/dev/null)
+fi
 
 if [ -z "${ROGUE_API_KEY:-}" ]; then
   log "outcome=unconfigured"

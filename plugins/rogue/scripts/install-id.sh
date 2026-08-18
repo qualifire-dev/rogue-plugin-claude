@@ -55,13 +55,18 @@ else
 fi
 unset _rogue_pj _rogue_v
 
-# Family is the fixed enum "claude"; the surface is this free-form display label,
-# derived from CLAUDE_CODE_ENTRYPOINT (the same var hook.sh uses to tell GUI from
-# cli). Unknown maps to CLI.
-case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-  *cowork*)  ROGUE_INSTALL_AGENT="Claude Cowork" ;;
-  *desktop*) ROGUE_INSTALL_AGENT="Claude Code - Desktop" ;;
-  *)         ROGUE_INSTALL_AGENT="Claude Code - CLI" ;;
-esac
+# Family is the fixed enum "claude"; the surface is this free-form display label.
+#
+# The mapping is NOT repeated here. It lives in scripts/surface.sh, whose other
+# consumer is hook.sh's log line (the matching `surface=` slug). A `case` copied
+# into both would drift, and a log line naming a different surface than the roster
+# row for the same session is worse than a line that names none. The literal below
+# is the last-resort guard for a damaged install (surface.sh missing), not a second
+# copy of the table.
+if [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/surface.sh" ]; then
+  . "${CLAUDE_PLUGIN_ROOT}/scripts/surface.sh"
+  ROGUE_INSTALL_AGENT="$(rogue_surface_label 2>/dev/null)"
+fi
+[ -n "${ROGUE_INSTALL_AGENT:-}" ] || ROGUE_INSTALL_AGENT="Claude Code - CLI"
 
 export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_AGENT ROGUE_INSTALL_ID_ERROR

@@ -98,25 +98,93 @@ for slug in $SLUGS; do
   check "$slug writes only ~/.rogue/logs/$slug.log" "/.rogue/logs/$slug.log " "$(tree_of "$home")"
 done
 
+# The surface each dispatcher stamps on an UNCONFIGURED probe, i.e. with the
+# harness's own environment. Empty means "no token on that line", which is a real
+# expected value and not a gap:
+#   claude  - CLAUDE_CODE_ENTRYPOINT is set by `fire` below, as the real client does
+#   codex   - ROGUE_CODEX_SURFACE unset defaults to codex_cli, matching heartbeat.sh
+#   cursor / copilot / gemini - single-surface plugins, so a constant
+#   antigravity - resolved from the payload's transcriptPath, and the unconfigured
+#     path exits BEFORE stdin is read, so there is nothing to resolve from. The
+#     token is optional precisely so this line can simply omit it.
+surface_for() {
+  case "$1" in
+    claude)      echo cli ;;
+    codex)       echo codex_cli ;;
+    cursor)      echo cursor ;;
+    copilot)     echo github_copilot ;;
+    gemini)      echo gemini_cli ;;
+    antigravity) echo '' ;;
+  esac
+}
+
 echo
-echo "== line format: '<ts> provider=<slug> event=<Event> …'"
+echo "== line format: '<ts> provider=<slug> [surface=<slug>] event=<Event> …'"
 for slug in $SLUGS; do
   home="$TMPROOT/fmt-$slug"; mkdir -p "$home"
   ev=$(event_for "$slug")
+  sf=$(surface_for "$slug")
   fire "$slug" "$home"
   line=$(cat "$home/.rogue/logs/$slug.log" 2>/dev/null)
   # Timestamp must be a UTC ISO-8601 second-precision stamp, no fractional part:
-  # the shipper's line splitter and the backend's parser both key off it.
+  # the shipper's line splitter and the backend's parser both key off it. The
+  # surface token sits directly after provider= and before event=, so a reader
+  # scanning for the next `key=` finds the whole value.
   case "$line" in
-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z" provider=$slug event=$ev "*)
-      pass "$slug line is '<ts> provider=$slug event=$ev …'" ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z" provider=$slug${sf:+ surface=$sf} event=$ev "*)
+      pass "$slug line is '<ts> provider=$slug${sf:+ surface=$sf} event=$ev …'" ;;
     *)
       fail "$slug line shape [$line]" ;;
+  esac
+  # An undetermined surface omits the WHOLE token. `surface=` with nothing after
+  # it, or `surface=unknown`, would both be worse than saying nothing - a reader
+  # cannot tell either from a real value.
+  case "$line" in
+    *"surface="*)
+      if [ -n "$sf" ]; then pass "$slug stamped surface=$sf"
+      else fail "$slug emitted a surface token with no surface to report [$line]"; fi ;;
+    *)
+      if [ -n "$sf" ]; then fail "$slug lost its surface token [$line]"
+      else pass "$slug omits the token when the surface is unknown"; fi ;;
+  esac
+  case "$line" in
+    *surface=unknown*|*"surface= "*) fail "$slug wrote a placeholder surface [$line]" ;;
+    *) pass "$slug never writes a placeholder surface" ;;
   esac
   case "$line" in
     *outcome=unconfigured*) pass "$slug logs outcome=unconfigured with no API key" ;;
     *) fail "$slug missing outcome=unconfigured [$line]" ;;
   esac
+done
+
+echo
+echo "== the surface token tracks the SURFACE, not the plugin"
+# claude is the only plugin whose surface varies per session, and all three of its
+# surfaces write to the SAME claude.log - which is the entire reason the token
+# exists. The mapping is shared with heartbeat.sh (plugins/rogue/scripts/surface.sh),
+# so these slugs and the roster labels cannot drift apart.
+# Indexed, not named after the entrypoint: macOS is case-insensitive, so `cli` and
+# `CLI` would share one sandbox and the second case would read the first's line.
+_sfi=0
+for pair in 'cli:cli' 'desktop:desktop' 'cowork:cowork' 'vscode-extension:cli' 'CLI:cli'; do
+  ep=${pair%%:*}; want=${pair#*:}
+  _sfi=$((_sfi + 1))
+  home="$TMPROOT/sf-$_sfi"; mkdir -p "$home"
+  ( cd "$REPO" || exit 1
+    export HOME="$home" ROGUE_API_KEY='' ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_LOG_MAX_BYTES=''
+    export CLAUDE_CODE_ENTRYPOINT="$ep" CLAUDE_PLUGIN_ROOT="$REPO/plugins/rogue"
+    printf '{}' | "$SH" "$REPO/plugins/rogue/scripts/hook.sh" PreToolUse >/dev/null 2>&1 )
+  got=$(sed -n 's/.*provider=claude surface=\([a-z_]*\) event=.*/\1/p' "$home/.rogue/logs/claude.log" 2>/dev/null)
+  check "CLAUDE_CODE_ENTRYPOINT=$ep stamps surface=$want" "$want" "$got"
+done
+
+# The heartbeat's roster label for the same entrypoint, from the same table. If
+# these two ever disagree, a log line and the roster row for one session name
+# different surfaces - worse than the line naming none.
+for pair in 'cli:Claude Code - CLI' 'desktop:Claude Code - Desktop' 'cowork:Claude Cowork'; do
+  ep=${pair%%:*}; want=${pair#*:}
+  got=$(CLAUDE_CODE_ENTRYPOINT="$ep" "$SH" -c '. "$1"; rogue_surface_label' _ "$REPO/plugins/rogue/scripts/surface.sh" 2>/dev/null)
+  check "...and heartbeat reports \"$want\" for it" "$want" "$got"
 done
 
 echo
