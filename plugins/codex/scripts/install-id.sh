@@ -55,8 +55,19 @@ else
 fi
 unset _rogue_pj _rogue_v
 
-# Family is the fixed enum "openai"; the surface (codex_app|codex_cli) is the
-# agent. Installer pins ROGUE_CODEX_SURFACE; default codex_cli.
-ROGUE_INSTALL_AGENT="${ROGUE_CODEX_SURFACE:-codex_cli}"
+# Family is the fixed enum "openai"; the surface (codex_app|codex_cli) is the agent.
+#
+# Read through scripts/surface.sh rather than off ROGUE_CODEX_SURFACE directly, for
+# two reasons: hook.sh stamps the same value as its log line's `surface=` token, so
+# one table keeps the line and the roster row from disagreeing; and that function is
+# where the closed list is ENFORCED. ROGUE_CODEX_SURFACE comes from an env file, so
+# its value is whatever someone wrote there - a string with a space or an `=` would
+# both break the log line's key=value shape and put uncontrolled content in a roster
+# field. The literal below covers a damaged install (surface.sh missing).
+if [ -r "${PLUGIN_ROOT:-}/scripts/surface.sh" ]; then
+  . "${PLUGIN_ROOT}/scripts/surface.sh"
+  ROGUE_INSTALL_AGENT="$(codex_surface_slug 2>/dev/null)"
+fi
+[ -n "${ROGUE_INSTALL_AGENT:-}" ] || ROGUE_INSTALL_AGENT="codex_cli"
 
 export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_AGENT ROGUE_INSTALL_ID_ERROR

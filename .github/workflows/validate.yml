@@ -19,7 +19,18 @@ jobs:
   manifests:
     runs-on: ubuntu-latest
     steps:
+      # persist-credentials: false - checkout otherwise writes the job token into
+      # .git/config, and every step below runs product scripts out of the checked-out
+      # tree. They need the source, never the credential.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Pinned so the Gemini dispatcher is actually exercised: tests/test_hook_logs.sh
+      # SKIPS its gemini leg when `node` is missing, which would pass silently.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Validate JSON is well-formed
         run: |
@@ -69,7 +80,12 @@ jobs:
           while IFS= read -r f; do
             if head -1 "$f" | grep -q bash; then chk="bash -n"; else chk="dash -n"; fi
             if ! $chk "$f"; then echo "::error file=$f::$chk parse error"; fail=1; fi
-          done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh')
+          # tests/manual/*.sh is here because nothing else in CI reads it: those
+          # scripts are run by hand against a live CLI, so a parse error sits
+          # undiscovered until someone reaches for the harness - which is exactly
+          # when they are least able to debug it. The automated suites under tests/
+          # are covered by being executed.
+          done < <(git ls-files 'plugins/**/scripts/*.sh' 'install.sh' 'scripts/*.sh' 'scripts/shared/*.sh' 'tests/manual/*.sh')
           [ "$fail" = 0 ] || exit 1
 
       - name: Shell unit tests
@@ -83,6 +99,136 @@ jobs:
           TEST_SH=dash bash tests/test_install_id_sh.sh
           TEST_SH=dash bash tests/test_status_skill_sh.sh
           bash tests/test_gitignore_bundles.sh
+      - name: Command and skill snippets parse
+        # Every fenced sh/bash and powershell block in a /rogue:setup or /rogue:status
+        # document is RUN VERBATIM by the agent when a user invokes the command, so a
+        # syntax error there is a product bug in the only diagnostic path support has -
+        # and nothing else in this workflow reads these files. Parse-only (`sh -n`, the
+        # PowerShell parser), so a block that references a variable set by an earlier
+        # block is fine; what it catches is an unbalanced quote, paren or heredoc.
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          listing = subprocess.run(['git', 'ls-files', 'plugins/*/skills/*/SKILL.md',
+                                    'plugins/*/commands/*.md'],
+                                   capture_output=True, text=True)
+          files = listing.stdout.split()
+          # A failed `git` or a glob that stopped matching would leave this empty, and
+          # the step would pass having validated nothing - the silent green this whole
+          # workflow exists to avoid. There is always at least one status document.
+          if listing.returncode or not files:
+              print(f"::error::git ls-files found no command/skill documents "
+                    f"(rc={listing.returncode})")
+              sys.exit(1)
+          bad = 0
+          ps_blocks = []
+          for path in files:
+              text = open(path, encoding='utf-8').read()
+              for match in re.finditer(r'```(bash|sh|powershell)\n(.*?)```', text, re.S):
+                  line = text[:match.start()].count('\n') + 1
+                  if match.group(1) == 'powershell':
+                      ps_blocks.append((path, line, match.group(2)))
+                      continue
+                  result = subprocess.run(['sh', '-n'], input=match.group(2),
+                                          capture_output=True, text=True)
+                  if result.returncode:
+                      print(f"::error file={path},line={line}::sh -n: "
+                            f"{result.stderr.strip()}")
+                      bad = 1
+          # The PowerShell blocks go through the real parser in one pwsh start-up.
+          for index, (path, line, code) in enumerate(ps_blocks):
+              open(f'/tmp/ps_block_{index}.ps1', 'w', encoding='utf-8').write(code)
+          script = '\n'.join([
+              '$bad = 0',
+              'foreach ($f in (Get-ChildItem /tmp/ps_block_*.ps1 | Sort-Object Name)) {',
+              '  $errs = $null',
+              '  $null = [System.Management.Automation.Language.Parser]::ParseFile(',
+              '            $f.FullName, [ref]$null, [ref]$errs)',
+              '  if ($errs -and $errs.Count -gt 0) { $bad = 1',
+              '    Write-Host ($f.Name + " :: " + ($errs[0].Message)) }',
+              '}',
+              'exit $bad'])
+          open('/tmp/parse_ps_blocks.ps1', 'w', encoding='utf-8').write(script)
+          if ps_blocks:
+              result = subprocess.run(['pwsh', '-NoProfile', '-File',
+                                       '/tmp/parse_ps_blocks.ps1'],
+                                      capture_output=True, text=True)
+              reports = [r for r in result.stdout.splitlines() if 'ps_block_' in r]
+              for report in reports:
+                  index = int(re.search(r'ps_block_(\d+)', report).group(1))
+                  path, line, _ = ps_blocks[index]
+                  print(f"::error file={path},line={line}::PowerShell parse error: "
+                        f"{report.split(' :: ', 1)[-1]}")
+                  bad = 1
+              # A non-zero exit with no structured report means pwsh itself failed
+              # (missing binary, a runtime error writing only to stderr). Silence is
+              # not a pass: without this the whole PowerShell half would go green
+              # while checking nothing.
+              if result.returncode and not reports:
+                  print(f"::error::pwsh exited {result.returncode} without reporting "
+                        f"any block: {result.stderr.strip() or '(no stderr)'}")
+                  bad = 1
+          print(f"checked {len(files)} documents, {len(ps_blocks)} PowerShell blocks")
+          sys.exit(bad)
+          PY
+
+      - name: Shared plugin scripts are in sync
+        # scripts/shared/ holds the ONLY editable copy of ship-logs.sh / ship-logs.ps1;
+        # each plugin carries a committed byte-identical copy, because three plugins
+        # install straight from a git clone of this repo with no build step, so a
+        # generated-at-release file would simply be missing for them. Without this
+        # gate an edit to scripts/shared/ that was never propagated ships five stale
+        # copies, and an edit made directly to a plugin's copy is silently reverted by
+        # the next sync — neither is visible in review.
+        run: bash scripts/sync-shared-scripts.sh --check
+
+      - name: Hook-log contract (sh + mjs dispatchers)
+        # The per-agent log file, line format and rotation policy are duplicated
+        # across six dispatchers (no shared library), so drift in one of them is
+        # otherwise invisible. Runs on the unconfigured path — no mock server, no
+        # network. Run twice: `dash` is what Claude Code actually invokes hooks
+        # with, `bash` is what a developer runs locally.
+        run: |
+          set -euo pipefail
+          SH=dash sh tests/test_hook_logs.sh
+          SH=bash bash tests/test_hook_logs.sh
+
+      - name: Log-shipper contract (sh)
+        # The shipper is a byte-offset state machine over a file another process is
+        # appending to and rotating underneath it, so its failure modes are silent by
+        # construction: a one-byte error in the chunk-boundary arithmetic leaves the
+        # offset lagging one byte per run forever, and a skip that lands mid-line
+        # ships fragments that the server parser cannot reject. Both shells, for the
+        # same reason as the hook-log suite: `dash` is what Claude Code actually
+        # invokes hooks with, and the trailing-fragment maths goes through awk.
+        run: |
+          set -euo pipefail
+          SH=dash sh tests/test_ship_logs.sh
+          SH=bash bash tests/test_ship_logs.sh
+
+      - name: Beacon throttle contract (sh)
+        # The Stop trigger fires once per TURN, so this throttle is the only thing
+        # between it and a /hooks/status POST on every turn of every session in a
+        # fleet. Its failure modes are asymmetric and both bad: too loose floods the
+        # backend, too tight silences a machine's presence entirely - which on the
+        # roster is indistinguishable from an uninstalled plugin. Both shells, same
+        # reason as above: dash is what Claude Code actually invokes hooks with, and
+        # the int64 clamp exists precisely because dash answers `-lt` on an oversized
+        # value with "Illegal number" and a FALSE.
+        run: |
+          set -euo pipefail
+          SH=dash sh tests/test_heartbeat_sh.sh
+          SH=bash bash tests/test_heartbeat_sh.sh
+
+      - name: Log-shipper end to end (real HTTP)
+        # The contract suite above stubs `curl`, so it can only assert what the
+        # shipper WOULD send. This one runs the real pipeline - real dispatcher, real
+        # rotation in hook.sh, real curl, real server (tests/e2e_receiver.mjs) - and
+        # `cmp`s the file on disk against the file the server rebuilt from the wire.
+        # It covers the class of bug a stub cannot: a body curl refuses, an envelope
+        # that stops being valid JSON once a log line contains a quote, a base64
+        # wrap that survives `tr -d` in one shell but not another.
+        run: sh tests/e2e_ship_logs.sh
 
       - name: PowerShell scripts parse
         # The .ps1 dispatchers are the Windows half of every plugin and cannot be
@@ -103,10 +249,104 @@ jobs:
             }
             exit $bad'
 
+      - name: No dash or quote lookalikes in PowerShell code
+        # These characters inside a STRING are a Windows PowerShell 5.1 parse error,
+        # and the failure mode is total. 5.1 reads a BOM-less file as ANSI, so the
+        # trailing byte of an em dash (U+2014 -> 0x94), an en dash (0x93) or an arrow
+        # (U+2192 -> 0x92) decodes to a SMART QUOTE — which PowerShell honors as a
+        # string delimiter. The string ends early, the braces stop matching, and the
+        # file does not parse at all. In a dispatcher that means hooks.json's
+        # `catch { '{}' }` swallows it and every Windows user silently loses
+        # enforcement. pwsh 7 reads the very same file as UTF-8 and sees nothing
+        # wrong, which is exactly why a parse check cannot catch this and this step
+        # exists. Found by the new windows-latest job, on tests/test_hook_ps1_*.
+        #
+        # Only these characters, not all non-ASCII: `…` (U+2026 -> 0xA6) and `é`
+        # (0xA9) are harmless, and one test asserts non-ASCII passthrough on purpose.
+        # Comments are exempt — they are never parsed as code. `#`-stripping is a
+        # heuristic (a `#` inside a string hides the rest of that line), so this can
+        # miss a violation but never invents one.
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          DANGEROUS = '‐‑‒–—―‘’‚‛“”→←'
+          bad = 0
+          listing = subprocess.run(['git', 'ls-files', '*.ps1'],
+                                   capture_output=True, text=True)
+          paths = listing.stdout.split()
+          # Same silent-green guard as the snippet step: an empty list here would
+          # "check" nothing and report success. The repo always ships .ps1 files.
+          if listing.returncode or not paths:
+              print(f"::error::git ls-files found no .ps1 files (rc={listing.returncode})")
+              sys.exit(1)
+          for path in paths:
+              for number, line in enumerate(open(path, encoding='utf-8'), 1):
+                  code = re.sub(r'#.*', '', line)
+                  hits = sorted({c for c in code if c in DANGEROUS})
+                  if hits:
+                      print(f"::error file={path},line={number}::"
+                            f"{''.join(hits)} outside a comment - breaks Windows PowerShell 5.1"
+                            f" (BOM-less ANSI decode turns it into a string delimiter)")
+                      bad = 1
+          sys.exit(bad)
+          PY
+
       - name: PowerShell unit tests
-        # Both load their dispatcher through the ROGUE_PS_LIB_ONLY seam, so the
-        # functions run on Linux even though the main body stands down there.
+        # All of these load their dispatcher through the ROGUE_PS_LIB_ONLY seam, so
+        # the functions run on Linux even though the main body stands down there.
         run: |
           set -euo pipefail
           pwsh -NoProfile -File tests/test_hook_ps1.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1
+          pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
+          pwsh -NoProfile -File tests/test_hook_logs.ps1
+          pwsh -NoProfile -File tests/test_ship_logs.ps1
+          pwsh -NoProfile -File tests/test_heartbeat_ps1.ps1
+
+  windows:
+    # The job the seam CANNOT stand in for. Every PowerShell test in the job above
+    # runs on ubuntu-latest through ROGUE_PS_LIB_ONLY, which loads the helpers and
+    # skips the main body — so Invoke-WebRequest, the %USERPROFILE% state directory,
+    # Windows file sharing/locking and the -EncodedCommand child process the
+    # heartbeats spawn were executed NOWHERE in CI, on the half of the feature that
+    # cannot be run on a dev Mac. A Windows-only runtime failure there is invisible
+    # by construction: hooks.json swallows it into `catch { '{}' }` and every Windows
+    # user silently loses the feature.
+    runs-on: windows-latest
+    steps:
+      # persist-credentials: false - checkout otherwise writes the job token into
+      # .git/config, and this job runs product scripts and a Node receiver out of
+      # the checked-out tree. It only needs the source, never the credential.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The e2e receiver is Node; the shipper itself needs nothing but PowerShell.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Log-shipper end to end (real ship-logs.ps1, real HTTP)
+        run: pwsh -NoProfile -File tests/e2e_ship_logs.ps1
+
+      - name: PowerShell unit tests under Windows PowerShell 5.1
+        # NOT a duplicate of the pwsh run on ubuntu: Copilot and Claude both fall back
+        # to Windows PowerShell 5.1 when pwsh 7 is absent, and 5.1 is a different
+        # engine — `Add-Content -Encoding UTF8` emits a BOM there, `Start-Process
+        # -ArgumentList` quotes differently, and several 7-only APIs simply do not
+        # exist. pwsh 7's parser cannot catch any of that.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell -NoProfile -File tests/test_hook_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_ps1_copilot.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_ps1_antigravity.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_logs.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_ship_logs.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_heartbeat_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -12,6 +12,12 @@ set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SKILL="$REPO/plugins/rogue/skills/status/SKILL.md"
 ACTOR="$REPO/plugins/rogue/scripts/actor.sh"
+# The skill resolves the surface through the SHARED table (scripts/surface.sh), the
+# same one the hooks and the heartbeat read, rather than inlining a third copy of
+# the cascade — so the fake plugin root has to carry it exactly as a real install
+# does. Without it the skill falls back to its damaged-install literal and the
+# Cowork case silently reports claude_code.
+SURFACE="$REPO/plugins/rogue/scripts/surface.sh"
 SH="${TEST_SH:-sh}"
 fails=0
 
@@ -22,6 +28,7 @@ PLUGIN="$FAKE_HOME/.claude/plugins/rogue-marketplace/rogue"
 mkdir -p "$PLUGIN/.claude-plugin" "$PLUGIN/scripts" "$STAGE/bin"
 printf '{\n  "name": "rogue",\n  "version": "9.9.9"\n}\n' > "$PLUGIN/.claude-plugin/plugin.json"
 cp "$ACTOR" "$PLUGIN/scripts/actor.sh"
+cp "$SURFACE" "$PLUGIN/scripts/surface.sh"
 
 # The credential file a compiled bundle leaves behind, carrying the pre-seed that
 # poisons ROGUE_ACTOR_* with the sandbox's git identity.

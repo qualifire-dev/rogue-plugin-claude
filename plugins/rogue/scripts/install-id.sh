@@ -4,7 +4,7 @@
 #
 #   ROGUE_INSTALL_HOST     hostname
 #   ROGUE_INSTALL_VERSION  plugin version from the manifest ("unknown" if unreadable)
-#   ROGUE_INSTALL_AGENT    surface label, stored as the roster's `agent`
+#   ROGUE_INSTALL_AGENT    surface AGENT ID, stored as the roster's `agent`
 #
 # heartbeat.sh sends them in its /hooks/status body; hook.sh sends the same three
 # as x-rogue-host / x-rogue-version / x-rogue-agent on EVERY event. That second
@@ -55,29 +55,31 @@ else
 fi
 unset _rogue_pj _rogue_v
 
-# Family is the fixed enum "claude"; the surface is this id. The id is ALSO the
-# key the backend resolves the latest release from (PLUGIN_REPOS in
-# services/coding-agent-versions.ts), which is why it is a stable snake_case id
-# and not a display label: every sibling plugin sends one (github_copilot,
-# codex_cli, gemini_cli, antigravity_ide), and rendering a human label is the
-# dashboard's job. While this sent "Claude Code - CLI" it matched no key, so
-# EVERY Claude row carried latest_version=null / update_available=false no matter
-# how old the install was. claude_code_desktop and claude_cowork need their own
-# PLUGIN_REPOS entries, exactly as codex_app and antigravity_cli did.
+# Family is the fixed enum "claude"; the surface is a stable snake_case AGENT ID.
 #
-# CLAUDE_CODE_IS_COWORK is checked FIRST: Cowork spawns Claude Code with
-# CLAUDE_CODE_ENTRYPOINT=local-agent, not a *cowork* value, so entrypoint
-# matching alone filed every Cowork install under the CLI surface. hook.ps1 and
-# heartbeat.ps1 inline the same order — PowerShell has no seam to share; any
-# drift between the three is a duplicate roster row.
-if [ -n "${CLAUDE_CODE_IS_COWORK:-}" ]; then
-  ROGUE_INSTALL_AGENT="claude_cowork"
-else
-  case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-    *cowork*)  ROGUE_INSTALL_AGENT="claude_cowork" ;;
-    *desktop*) ROGUE_INSTALL_AGENT="claude_code_desktop" ;;
-    *)         ROGUE_INSTALL_AGENT="claude_code" ;;
-  esac
+# The id is ALSO the key the backend resolves the latest release from (PLUGIN_REPOS
+# in services/coding-agent-versions.ts), which is why it is an id and not a display
+# label: every sibling plugin sends one (github_copilot, codex_cli, gemini_cli,
+# antigravity_ide), and rendering a human label is the dashboard's job. While this
+# sent "Claude Code - CLI" it matched no key, so EVERY Claude row carried
+# latest_version=null / update_available=false no matter how old the install was.
+# claude_code_desktop and claude_cowork need their own PLUGIN_REPOS entries,
+# exactly as codex_app and antigravity_cli did.
+#
+# The mapping itself is NOT repeated here. It lives in scripts/surface.sh, whose
+# other consumer is hook.sh's log line (the matching `surface=` slug). A `case`
+# copied into both would drift, and a log line naming a different surface than the
+# roster row for the same session is worse than a line that names none. That table
+# is also where CLAUDE_CODE_IS_COWORK is checked ahead of the entrypoint — Cowork
+# spawns Claude Code with CLAUDE_CODE_ENTRYPOINT=local-agent, not a *cowork* value,
+# so entrypoint matching alone filed every LOCAL Cowork install under the CLI.
+#
+# The literal below is the last-resort guard for a damaged install (surface.sh
+# missing), not a second copy of the table.
+if [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/surface.sh" ]; then
+  . "${CLAUDE_PLUGIN_ROOT}/scripts/surface.sh"
+  ROGUE_INSTALL_AGENT="$(rogue_surface_agent_id 2>/dev/null)"
 fi
+[ -n "${ROGUE_INSTALL_AGENT:-}" ] || ROGUE_INSTALL_AGENT="claude_code"
 
 export ROGUE_INSTALL_HOST ROGUE_INSTALL_VERSION ROGUE_INSTALL_AGENT ROGUE_INSTALL_ID_ERROR
