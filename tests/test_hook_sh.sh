@@ -163,9 +163,10 @@ assert_header "x-rogue-actor-name"  "real.user"          "synthetic ROGUE_ACTOR_
 # dispatcher exits 0 — the modal must never become a substitute for the decision.
 #
 # Runs the dispatcher with a stubbed `osascript` on PATH and a per-case
-# ROGUE_LOG_FILE, then reads the gate's verdict out of the log: `alert_rc=` (the
-# alert ran) vs `alert_skipped=1` (the gate declined). The alert is backgrounded,
-# so alert_rc needs a short poll.
+# ROGUE_LOG_FILE, then reads the gate's verdict out of the log: `alert_rc=<status>`
+# (the alert ran, status propagated from osascript, with `alert_err` on failure)
+# vs `alert_skipped=1` (the gate declined). The alert is backgrounded, so alert_rc
+# needs a short poll.
 BLOCK_BODY='{"decision":"block","reason":"PII detected"}'
 
 # A minimal bin dir holding every external the dispatcher chain needs and NOTHING
@@ -192,7 +193,10 @@ run_alert_case() {
   LOG_FILE="$tmp_home/hook.log"
   case "$mode" in
     ok)   printf '#!/bin/sh\nexit 0\n'            > "$stub/osascript" ;;
-    fail) printf '#!/bin/sh\nexit 1\n'            > "$stub/osascript" ;;
+    # Emits on stderr and exits non-zero, the shape of a real failure (a TCC
+    # denial prints "Not authorized to send Apple events"). Two lines, so the
+    # fold-to-one-line before sanitizing is exercised too.
+    fail) printf '#!/bin/sh\nprintf "Not authorized to send Apple events\\nto System Events.\\n" >&2\nexit 1\n' > "$stub/osascript" ;;
     # Outlives the dispatcher on purpose: the regression test for the fd leak.
     hang) printf '#!/bin/sh\nsleep 30\n'          > "$stub/osascript" ;;
   esac
@@ -289,14 +293,29 @@ assert_eq "$OUT" "{}" "allow: relayed verbatim"
 assert_no_log 'alert_' "allow: neither fired nor skipped — the branch is untouched"
 cleanup_alert_case
 
-# ── Case 13: a failing osascript is still fail-open, and logged ────────────
+# ── Case 13: a failing osascript reports the REAL status, with the reason ──
+# alert_rc exists to make TCC denials / AppleScript errors / missing GUI sessions
+# visible in hook.log. security-alert.sh used to end both osascript branches with
+# `|| true` and `exit 0`, so EVERY such failure logged as alert_rc=0 and the log
+# line carried no signal at all. Assert the real code and the captured stderr —
+# `alert_rc=` alone passes against the broken version.
 restart_mock "$BLOCK_BODY"
 run_alert_case fail PreToolUse '{"tool_name":"Bash"}' CLAUDE_CODE_IS_COWORK=1
 assert_eq "$OUT" "$BLOCK_BODY" "osascript failure: block still relayed verbatim"
-# security-alert.sh swallows the osascript failure (`|| true`) and exits 0, so the
-# rc is 0; what matters is that the dispatcher relayed and did not hang.
 wait_for_log 'alert_rc=' || { echo "FAIL: alert never ran" >&2; cat "$LOG_FILE" >&2; exit 1; }
-assert_log 'alert_rc=' "osascript failure: alert_rc logged rather than lost"
+assert_log 'alert_rc=1 ' "osascript failure: the real non-zero status is logged, not 0"
+# A bare rc can't distinguish a TCC denial from a user cancel (both exit 1), so the
+# helper's stderr rides along.
+assert_log 'alert_err="Not authorized to send Apple events to System Events."' \
+  "osascript failure: stderr captured as alert_err, folded to one line"
+cleanup_alert_case
+
+# ── Case 13b: a SUCCESSFUL alert logs rc 0 and no spurious alert_err ───────
+restart_mock "$BLOCK_BODY"
+run_alert_case ok PreToolUse '{"tool_name":"Bash"}' CLAUDE_CODE_IS_COWORK=1
+wait_for_log 'alert_rc=' || { echo "FAIL: alert never ran" >&2; cat "$LOG_FILE" >&2; exit 1; }
+assert_log 'alert_rc=0 ' "osascript success: rc is 0"
+assert_no_log 'alert_err' "osascript success: no alert_err on a clean run"
 cleanup_alert_case
 
 # ── Case 14: a HANGING modal must not delay the dispatcher ─────────────────

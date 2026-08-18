@@ -100,21 +100,34 @@ if command -v osascript >/dev/null 2>&1; then
     ( afplay "$SOUND" >/dev/null 2>&1 & )
   fi
 
+  # PROPAGATE the real osascript status, and let its stderr through (only stdout
+  # — the dialog's result record — is discarded). The caller backgrounds this
+  # script in a subshell with its own fds and only LOGS the status, so a non-zero
+  # exit here can never fail the hook decision; what it can do is make a TCC
+  # denial, an AppleScript syntax error or a missing GUI session visible in
+  # ~/.rogue/hook.log. Before this, both branches ended `|| true` and the script
+  # ended `exit 0`, so every one of those failures logged as alert_rc=0 — the
+  # exact signal the log line exists to carry.
+  #
+  # A non-zero rc is not proof the alert was never seen: AppleScript also returns
+  # 1 for "User canceled" (-128). That is why stderr is preserved — the caller
+  # logs it as alert_err, which is what tells the two apart.
   if [ -n "$ICON_PATH" ] && [ -r "$ICON_PATH" ]; then
     I_ESC="$(esc "$ICON_PATH")"
     # `display dialog` supports custom icon files via POSIX file path.
-    osascript <<EOF >/dev/null 2>&1 || true
+    osascript <<EOF >/dev/null
 activate
 display dialog "$M_ESC" with title "$T_ESC" buttons {"Dismiss"} default button "Dismiss" with icon (POSIX file "$I_ESC") giving up after 30
 EOF
+    exit $?
   else
     # `display alert ... as critical` is the most attention-grabbing built-in.
-    osascript <<EOF >/dev/null 2>&1 || true
+    osascript <<EOF >/dev/null
 activate
 display alert "$T_ESC" message "$M_ESC" $AS_KIND buttons {"Dismiss"} default button "Dismiss" giving up after 30
 EOF
+    exit $?
   fi
-  exit 0
 fi
 
 # Linux fallback.
@@ -122,9 +135,16 @@ if command -v notify-send >/dev/null 2>&1; then
   URGENCY="critical"
   [ "$SEVERITY" = "warning" ] && URGENCY="normal"
   [ "$SEVERITY" = "info" ] && URGENCY="low"
-  notify-send -u "$URGENCY" "$TITLE" "$MSG" >/dev/null 2>&1 || true
-  exit 0
+  # Same as the osascript branch: real status out, stderr preserved.
+  notify-send -u "$URGENCY" "$TITLE" "$MSG" >/dev/null
+  exit $?
 fi
 
-# Last-resort: stderr.
+# Last-resort: stderr, and a non-zero exit. Reaching here means NO alert channel
+# exists on this machine, which is a failure to notify however well-behaved the
+# script was — reporting 0 would put an alert_rc=0 in the log for an alert nobody
+# saw. (Unreachable from hook.sh, whose gate already requires osascript; this
+# matters for a direct invocation.) 127 = "no channel found", matching the shell's
+# command-not-found convention.
 printf '[%s] %s: %s\n' "$SEVERITY" "$TITLE" "$MSG" >&2
+exit 127

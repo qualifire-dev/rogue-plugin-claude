@@ -170,7 +170,23 @@ To allow it: prepend \"rgx!\" to your prompt and resend (marks it a false positi
     #
     # Invoked with `bash`, not `sh`: security-alert.sh converts the literal "\n"
     # in API-relayed reasons to real newlines with a bash-only substitution.
-    ( bash "${CLAUDE_PLUGIN_ROOT}/scripts/security-alert.sh" "$ALERT_TITLE" "$ALERT_MSG" critical >/dev/null 2>&1; log "alert_rc=$? entrypoint=${CLAUDE_CODE_ENTRYPOINT:-unset}" ) >/dev/null 2>&1 </dev/null &
+    #
+    # `2>&1 >/dev/null` (in THAT order) keeps the helper's stderr — stderr goes to
+    # the substitution's pipe first, then stdout is discarded. A bare alert_rc is
+    # not self-explanatory: osascript returns 1 for a TCC denial, a syntax error, a
+    # missing GUI session AND for "User canceled" (-128). alert_err is what tells
+    # them apart, so a non-zero rc is actionable from the log alone.
+    ( ALERT_ERR=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/security-alert.sh" "$ALERT_TITLE" "$ALERT_MSG" critical 2>&1 >/dev/null)
+      ALERT_RC=$?
+      ALERT_LOG="alert_rc=$ALERT_RC entrypoint=${CLAUDE_CODE_ENTRYPOINT:-unset}"
+      if [ "$ALERT_RC" != "0" ] && [ -n "$ALERT_ERR" ]; then
+        # Fold to one line BEFORE sanitizing: sanitize deletes control characters
+        # outright, so newlines would run the words together instead of separating
+        # them. Bounded so a chatty failure can't flood the log.
+        ALERT_ERR=$(printf '%s' "$ALERT_ERR" | tr '\n\r\t' '   ' | head -c 200)
+        ALERT_LOG="$ALERT_LOG alert_err=\"$(sanitize "$ALERT_ERR")\""
+      fi
+      log "$ALERT_LOG" ) >/dev/null 2>&1 </dev/null &
   else
     # Logged with the three inputs to the gate so a future surface change is
     # diagnosable from hook.log alone, without re-instrumenting the dispatcher.

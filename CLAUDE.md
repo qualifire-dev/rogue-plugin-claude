@@ -75,7 +75,7 @@ The single one-line installer detects every supported agent (`have_cmd claude` /
 - `plugins/rogue/scripts/auto-update.sh` / `auto-update.ps1` — fire (detached) from `SessionStart`. Rate-limited once/24h. Re-invoke the matching one-line installer (`install.sh` / `install.ps1`) when a newer release tag exists.
 - `plugins/rogue/scripts/heartbeat.sh` / `heartbeat.ps1` — SessionStart presence beacon (detached). POST `/api/v1/hooks/status`.
 - `plugins/rogue/scripts/warn.sh` — SessionStart "not configured" nudge (sh path only; the ps1 path emits the hint inline from `hook.ps1`).
-- `plugins/rogue/scripts/security-alert.sh` / `security-alert.ps1` — the native block modal, fired by the dispatchers **on Claude Cowork local sessions ONLY** (see "The Cowork block modal" below). Restored from before `c31ee5a`, which deleted them. `security-alert.sh` must be invoked with **`bash`, not `sh`** — it converts the literal `\n` in API-relayed reasons to real newlines with a bash-only substitution. Its `osascript` is deliberately **not** wrapped in `tell application "System Events"` (the pre-`c31ee5a` version was); see the notify_block note in the Copilot section for why that wrapper is harmful.
+- `plugins/rogue/scripts/security-alert.sh` / `security-alert.ps1` — the native block modal, fired by the dispatchers **on Claude Cowork local sessions ONLY** (see "The Cowork block modal" below). Restored from before `c31ee5a`, which deleted them. `security-alert.sh` must be invoked with **`bash`, not `sh`** — it converts the literal `\n` in API-relayed reasons to real newlines with a bash-only substitution. Two deliberate departures from the pre-`c31ee5a` version: its `osascript` is **not** wrapped in `tell application "System Events"` (see the notify_block note in the Copilot section for why that wrapper is harmful), and it **propagates the real `osascript`/`notify-send` exit status** instead of `|| true`-ing it away (see "The Cowork block modal" — without this every failure logged as `alert_rc=0`).
 - `plugins/rogue/skills/{setup,status}/SKILL.md` — slash commands (`/rogue:setup`, `/rogue:status`) in the skills format. **Instructions to Claude**, not scripts — Claude runs the bash/PowerShell inside them step-by-step (each carries macOS/Linux and Windows variants). `setup` sets `disable-model-invocation: true` (it writes credentials, so user-invoke only); `status` is read-only and model-invocable. Auto-discovered from `skills/` — no manifest entry needed.
 - `install.sh` / `install.ps1` — one-line installers. Both add the marketplace via the Claude CLI (`claude plugin marketplace add` + `claude plugin install`) — they do NOT download the release tarball.
 - `scripts/build-release.sh` + `.github/workflows/release.yml` — tag-driven release pipeline. Pushing a `v*` tag builds a single cross-platform `dist/rogue-plugin-claude.tar.gz` (both `.sh` and `.ps1` scripts) and attaches it to the release. The artifact filename intentionally has **no version and no OS suffix** so `/latest/` URLs stay stable. (The tarball is consumed by `compile-customer-plugin.sh` for MDM bundles; the marketplace install clones the repo directly.)
@@ -200,10 +200,24 @@ first:
    uses a native `WScript.Shell` popup rather than an external binary, so
    `alert_launched` / `alert_error` logging is what catches a UI failure.)
 
-A declined alert logs `alert_skipped=1 entrypoint=… cowork=… remote=…` with all
-three gate inputs, so a future surface change is diagnosable from `~/.rogue/hook.log`
-alone. A fired one logs `alert_rc=<exit> entrypoint=…` (TCC denials and osascript
-failures are otherwise invisible).
+A declined alert logs `alert_skipped=1 entrypoint=… cowork=… remote=… agent=…`
+with every gate input, so a future surface change is diagnosable from
+`~/.rogue/hook.log` alone. A fired one logs `alert_rc=<status> entrypoint=…`, plus
+`alert_err="…"` when that status is non-zero.
+
+**`security-alert.sh` must propagate the real `osascript` status** — each branch
+ends `exit $?`, never `|| true` followed by `exit 0`. The whole point of `alert_rc`
+is to make TCC denials, AppleScript errors and missing GUI sessions visible, and
+the restored pre-`c31ee5a` script swallowed every one of them with `|| true` and
+reported 0, so the log line carried no signal at all. The caller can afford the
+real status because it backgrounds the helper in a subshell that only *logs* it —
+a non-zero exit there can never fail the hook decision. Its stderr is preserved
+for the same reason (`2>&1 >/dev/null`, in that order): osascript returns 1 for a
+TCC denial, a syntax error, a missing GUI session **and** for "User canceled"
+(-128), so `alert_err` is the only thing that tells them apart. Reaching the
+no-channel-at-all fallback exits **127**, not 0 — an alert nobody saw must not log
+as a success. `tests/test_hook_sh.sh` asserts the exact `alert_rc=1` and the
+captured text; a bare `alert_rc=` assertion passes against the broken version.
 
 **Two things must not be simplified.**
 
