@@ -8,3 +8,8 @@ dist/
 # Compiled customer plugins bake a customer ROGUE_API_KEY into env. NEVER commit
 # them — zip artifacts and the unpacked staging dir alike.
 rogue-aidr-compiled-*
+
+# Locally compiled plugin bundles (compile-local-dev.sh). Same hazard as the
+# compiled-* ones above: the bundle bakes ROGUE_API_KEY into its `env` file, so
+# committing one publishes a live key. One reached a PR before this rule existed.
+rogue-aidr-local-*

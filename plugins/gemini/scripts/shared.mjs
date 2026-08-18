@@ -65,6 +65,53 @@ export function loadEnvFiles() {
   return merged;
 }
 
+/**
+ * This install's fleet identity: { host, version, agent }.
+ *
+ * heartbeat.mjs sends these in its /hooks/status body; hook.mjs sends the same
+ * three as x-rogue-host / x-rogue-version / x-rogue-agent on EVERY event, which
+ * is what keeps the roster row fresh between session starts (the only time the
+ * heartbeat fires). Resolved in ONE place because the backend keys the row on
+ * host + actor + family + agent: any disagreement between the two senders is a
+ * duplicate row for one install.
+ *
+ * `agent` is the surface and also the PLUGIN_REPOS key the backend resolves the
+ * latest version from, so it stays "gemini_cli".
+ */
+export function installId() {
+  // `error` names whatever could not be resolved, or is null when all of it was.
+  // Returned rather than logged: this helper is shared with heartbeat.mjs, which
+  // is detached with its output discarded, so only hook.mjs has somewhere to put
+  // it. Nothing here fails the hook — a degraded value still identifies the
+  // install well enough to keep the roster fresh.
+  const manifestPath = path.join(EXT_ROOT, "gemini-extension.json");
+  let version = "unknown";
+  let error = null;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    if (typeof manifest.version === "string") {
+      version = manifest.version;
+    } else {
+      // Manifest is there but carries no version: schema drift, not a bad install.
+      error = `version-missing:${manifestPath}`;
+    }
+  } catch (cause) {
+    error = `manifest-unreadable:${manifestPath} (${cause.code ?? cause.message})`;
+  }
+
+  let host = "unknown";
+  try {
+    host = os.hostname() || "unknown";
+  } catch {
+    /* falls through to the error below */
+  }
+  if (host === "unknown") {
+    error = error ? `host-unresolved,${error}` : "host-unresolved";
+  }
+
+  return { host, version, agent: "gemini_cli", error };
+}
+
 export function gitConfig(key) {
   try {
     return execFileSync("git", ["config", "--global", key], {

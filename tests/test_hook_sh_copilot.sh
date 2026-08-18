@@ -158,6 +158,14 @@ assert_no_header() {
   assert_eq "$actual" "False" "$label"
 }
 
+# Presence-only: the value is this machine's hostname / installed version, so the
+# test can assert it is sent and non-empty but not what it says.
+assert_header_present() {
+  local key="$1" label="$2" actual
+  actual=$(python3 -c 'import json,sys; print(bool(json.load(open(sys.argv[1]))["headers"].get(sys.argv[2])))' "$HEADERS_FILE" "$key")
+  assert_eq "$actual" "True" "$label"
+}
+
 # ── Case 1: preToolUse deny relayed verbatim + headers + path + exit 0 ──────
 start_mock '{"permissionDecision":"deny","permissionDecisionReason":"blocked"}'
 set +e; run_dispatcher preToolUse '{"toolName":"bash","toolArgs":{"command":"rm -rf /"}}'; LAST_RC=$?; set -e
@@ -169,7 +177,13 @@ assert_header "x-rogue-api-key"     "test-key"         "x-rogue-api-key forwarde
 assert_header "x-rogue-actor-email" "test@example.com" "x-rogue-actor-email forwarded"
 assert_header "x-rogue-actor-name"  "Test User"        "x-rogue-actor-name forwarded (with space)"
 assert_no_header "x-rogue-source"   "no x-rogue-source header (cursor-only)"
-assert_no_header "x-rogue-agent"    "no x-rogue-agent header (codex-only)"
+# Fleet-liveness trio: the same host/version/agent the heartbeat sends, on EVERY
+# event, so the roster row is refreshed by ordinary traffic and not only at
+# session start. `agent` must stay the PLUGIN_REPOS key, or the backend stops
+# resolving a latest version for these rows. See scripts/install-id.sh.
+assert_header "x-rogue-agent"       "github_copilot"   "x-rogue-agent is the roster's agent value"
+assert_header_present "x-rogue-host"    "x-rogue-host sent on every event"
+assert_header_present "x-rogue-version" "x-rogue-version sent on every event"
 path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$HEADERS_FILE")
 assert_eq "$path" "/api/v1/hooks/copilot" "POST path is /api/v1/hooks/copilot"
 

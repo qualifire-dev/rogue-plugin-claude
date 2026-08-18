@@ -33,42 +33,18 @@ set +u
 [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/actor.sh" ] && . "${CLAUDE_PLUGIN_ROOT}/scripts/actor.sh"
 set -u
 
-# Plugin version from the manifest, WITHOUT python3 (the /usr/bin/python3 stub
-# fails silently on a fresh macOS — see hook.sh). grep/sed are always present.
-VER="unknown"
-PJ="${CLAUDE_PLUGIN_ROOT:-}/.claude-plugin/plugin.json"
-if [ -r "$PJ" ]; then
-  v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" \
-        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-  [ -n "$v" ] && VER="$v"
-fi
-
-# Family is the fixed enum value "claude". The surface rides the separate
-# x-rogue-agent header (free-form display label), derived from
-# CLAUDE_CODE_ENTRYPOINT (the same var hook.sh uses to tell GUI from cli).
-# Unknown → CLI.
-#
-# CLAUDE_CODE_IS_COWORK is checked FIRST: Cowork now spawns Claude Code with
-# CLAUDE_CODE_ENTRYPOINT=local-agent (not a *cowork* value), so entrypoint
-# matching alone reported every Cowork install as "Claude Code - CLI". The
-# entrypoint cases stay for older/other hosts that do set a cowork entrypoint.
-if [ -n "${CLAUDE_CODE_IS_COWORK:-}" ]; then
-  AGENT="Claude Cowork"
-else
-  case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-    *cowork*)  AGENT="Claude Cowork" ;;
-    *desktop*) AGENT="Claude Code - Desktop" ;;
-    *)         AGENT="Claude Code - CLI" ;;
-  esac
-fi
+# Host + version + surface label. Shared with hook.sh, which sends the same three
+# as headers on every event: same values, same roster row. See install-id.sh.
+[ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/install-id.sh" ] && . "${CLAUDE_PLUGIN_ROOT}/scripts/install-id.sh"
 
 # POST /api/v1/hooks/status (GET route is gone). The former x-rogue-agent-*
-# headers now ride the JSON body; x-rogue-api-key stays a header. Backslash- and
-# quote-escape each value so a name/host with a " or \ can't break the JSON.
-HOST=$(hostname 2>/dev/null || echo unknown)
+# headers now ride the JSON body; x-rogue-api-key stays a header. Family is the
+# fixed enum value "claude". Backslash- and quote-escape each value so a
+# name/host with a " or \ can't break the JSON.
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 BODY=$(printf '{"agent_family":"claude","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-  "$(esc "$AGENT")" "$(esc "$VER")" "$(esc "$HOST")" \
+  "$(esc "${ROGUE_INSTALL_AGENT:-Claude Code - CLI}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
+  "$(esc "${ROGUE_INSTALL_HOST:-unknown}")" \
   "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 
 curl -sS --max-time 10 -X POST \

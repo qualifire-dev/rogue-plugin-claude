@@ -260,6 +260,47 @@ if (-not $actorEmail) {
     if ($hostForActor) { $actorEmail = "unknown@$hostForActor" } else { $actorEmail = 'unknown' }
 }
 
+# -- install identity: host + version + surface label ------------------------
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only heartbeat.ps1 ever sent them, once, at session start. A session still
+# working a day later therefore aged out as disconnected. Sending the same three
+# as headers on EVERY event lets the backend refresh this exact row from ordinary
+# hook traffic. Resolved exactly as heartbeat.ps1 does (its sh sibling shares
+# scripts/install-id.sh instead; PowerShell has no such seam here). Any drift
+# between the two is a duplicate roster row.
+$installError = @()
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
+if (-not $hostName) { $hostName = 'unknown'; $installError += 'host-unresolved' }
+
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $pluginRoot '.claude-plugin\plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $pluginJson), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+    if ($m.Success) { $pluginVersion = $m.Groups[1].Value }
+    # Manifest is there but carries no semver: schema drift, not a bad install.
+    else { $installError += "version-unparsed:$pluginJson" }
+} else {
+    $installError += "manifest-missing:$pluginJson"
+}
+
+# Family is the fixed enum "claude"; the surface is this free-form display label.
+# CLAUDE_CODE_IS_COWORK is checked FIRST: Cowork spawns Claude Code with
+# CLAUDE_CODE_ENTRYPOINT=local-agent, not a *cowork* value, so entrypoint
+# matching alone filed every Cowork install under "Claude Code - CLI". Same
+# order as install-id.sh and heartbeat.ps1 — drift means a duplicate roster row.
+$entrypoint = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
+if ($env:CLAUDE_CODE_IS_COWORK)        { $installAgent = 'Claude Cowork' }
+elseif ($entrypoint -like '*cowork*')  { $installAgent = 'Claude Cowork' }
+elseif ($entrypoint -like '*desktop*') { $installAgent = 'Claude Code - Desktop' }
+else                                   { $installAgent = 'Claude Code - CLI' }
+
+# A degraded value is still SENT rather than failing the hook: it identifies the
+# install well enough to keep the roster fresh, and no liveness bookkeeping is
+# worth breaking a session over. But "unknown" in the roster is a real symptom,
+# so it is reported as an error once per event.
+if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
+
 # -- payload from stdin -----------------------------------------------------
 $payload = [Console]::In.ReadToEnd()
 if (-not $payload) { $payload = '{}' }
@@ -281,6 +322,9 @@ $headers = @{
     'x-rogue-event'       = $EventName
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
+    'x-rogue-agent'       = $installAgent
 }
 $url = "$baseUrl/api/v1/hooks/claude"
 Dbg "POST $url actor=$actorEmail"

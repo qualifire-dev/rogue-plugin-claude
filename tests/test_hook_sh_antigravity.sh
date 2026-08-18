@@ -11,6 +11,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$REPO/plugins/antigravity/scripts/hook.sh"
 ACTOR="$REPO/plugins/antigravity/scripts/actor.sh"
+INSTALL_ID="$REPO/plugins/antigravity/scripts/install-id.sh"
 SH="${TEST_SH:-sh}"
 
 PORT=$((RANDOM % 10000 + 30000))
@@ -113,6 +114,14 @@ assert_no_header() {
   assert_eq "$actual" "False" "$label"
 }
 
+# Presence-only: the value is this machine's hostname / installed version, so the
+# test can assert it is sent and non-empty but not what it says.
+assert_header_present() {
+  local key="$1" label="$2" actual
+  actual=$(python3 -c 'import json,sys; print(bool(json.load(open(sys.argv[1]))["headers"].get(sys.argv[2])))' "$HEADERS_FILE" "$key")
+  assert_eq "$actual" "True" "$label"
+}
+
 # ── Case 1: PreToolUse deny relayed verbatim + headers + path + exit 0 ─────
 start_mock '{"decision":"deny","reason":"x"}'
 set +e; run_dispatcher PreToolUse '{"toolName":"bash","toolArgs":{"command":"rm -rf /"}}'; LAST_RC=$?; set -e
@@ -124,7 +133,13 @@ assert_header "x-rogue-api-key"     "test-key"         "x-rogue-api-key forwarde
 assert_header "x-rogue-actor-email" "test@example.com" "x-rogue-actor-email forwarded"
 assert_header "x-rogue-actor-name"  "Test User"        "x-rogue-actor-name forwarded (with space)"
 assert_no_header "x-rogue-source"   "no x-rogue-source header (cursor-only)"
-assert_no_header "x-rogue-agent"    "no x-rogue-agent header (codex-only)"
+# Fleet-liveness trio: the same host/version/agent the heartbeat sends, on EVERY
+# event, so the roster row is refreshed by ordinary traffic and not only at the
+# session's first PreInvocation. This payload has no transcriptPath, so the
+# surface falls back to the 2.0 app, matching the backend's own default.
+assert_header "x-rogue-agent"       "antigravity"      "x-rogue-agent falls back to the 2.0 surface"
+assert_header_present "x-rogue-host"    "x-rogue-host sent on every event"
+assert_header_present "x-rogue-version" "x-rogue-version sent on every event"
 path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$HEADERS_FILE")
 assert_eq "$path" "/api/v1/hooks/antigravity" "POST path is /api/v1/hooks/antigravity"
 body=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE")
@@ -185,6 +200,7 @@ STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
+cp "$INSTALL_ID" "$STAGE/scripts/install-id.sh"
 MARKER="$STAGE/heartbeat-fired"
 # The stub records its first argument: the heartbeat is told which surface fired
 # it, because three products share one install and only the hook can tell them
@@ -225,7 +241,12 @@ else
   echo "FAIL [heartbeat launch]: marker file $MARKER was never created" >&2
   exit 1
 fi
-assert_eq "$(cat "$MARKER")" "" "no transcriptPath → no surface passed (heartbeat falls back)"
+# No transcriptPath: the launcher passes the SAME fallback the event headers
+# carry (the 2.0 app), never an empty surface. Handing the heartbeat nothing let
+# it sniff the filesystem and pick antigravity_cli whenever `agy` was installed,
+# so one first-PreInvocation wrote `antigravity` from the event and
+# `antigravity_cli` from the heartbeat: two roster rows for one install.
+assert_eq "$(cat "$MARKER")" "antigravity" "no transcriptPath → heartbeat gets the same fallback surface as the headers"
 
 # The surface rides the transcriptPath: without it every surface on a machine
 # with the CLI installed collapses into one antigravity_cli roster row.
@@ -252,6 +273,7 @@ STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
+cp "$INSTALL_ID" "$STAGE/scripts/install-id.sh"
 MARKER="$STAGE/heartbeat-fired"
 cat > "$STAGE/scripts/heartbeat.sh" <<EOF
 #!/bin/sh
