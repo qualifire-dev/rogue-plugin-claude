@@ -575,6 +575,10 @@ load_actor() {
 # the payload.
 load_install_id() {
   [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+  # A degraded value is still sent (never a hard failure — see install-id.sh), but
+  # it is worth knowing about: an "unknown" host or version means this install
+  # reports itself imprecisely to the fleet roster.
+  [ -n "${ROGUE_INSTALL_ID_WARN:-}" ] && log "warn=install-id $ROGUE_INSTALL_ID_WARN"
   ROGUE_INSTALL_AGENT=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
   # Unattributable payload: default to the 2.0 app, the same guess the backend's
   # parser makes, so the roster row matches the events it stores.

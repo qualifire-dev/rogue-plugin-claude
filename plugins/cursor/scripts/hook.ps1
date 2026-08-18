@@ -50,6 +50,12 @@ function Write-Raw {
 }
 function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.WriteLine("[rogue] $Msg"); [Console]::Error.Flush() } }
 
+# Abnormal-but-survivable conditions, NOT gated on ROGUE_DEBUG (mirrors hook.sh's
+# warn): this dispatcher keeps no log file, so a debug-gated message would mean
+# nobody ever learns the install reports itself imprecisely. stderr only — stdout
+# is the hook's JSON channel.
+function Warn { param([string]$Msg) [Console]::Error.WriteLine("[rogue] warn: $Msg"); [Console]::Error.Flush() }
+
 function Emit-Json {
     param([string]$Data)
     if (-not $Data) { Write-Raw '{}'; return }
@@ -373,8 +379,17 @@ if (-not $actorEmail) {
 # values as headers on EVERY event lets the backend refresh this exact row from
 # ordinary hook traffic. They must match the heartbeat body's values exactly, or
 # the two writers create two rows for one install.
+#
+# Neither lookup can fail the hook: a degraded value still identifies the install
+# well enough to keep the roster fresh, and no liveness bookkeeping is worth
+# breaking a session over. Both warn, because "unknown" in the roster is a real
+# symptom worth chasing.
 $hostName = $env:COMPUTERNAME
-if (-not $hostName) { $hostName = 'unknown' }
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
+if (-not $hostName) {
+    $hostName = 'unknown'
+    Warn 'hostname unresolved; reporting host=unknown to the fleet roster'
+}
 
 # Plugin version from the manifest.
 $pluginVersion = 'unknown'
@@ -383,7 +398,13 @@ if (Test-Path -LiteralPath $pluginJson) {
     try {
         $v = (Get-Content -Raw -LiteralPath $pluginJson | ConvertFrom-Json).version
         if ($v -match '^[0-9]+\.[0-9]+\.[0-9]+') { $pluginVersion = $Matches[0] }
-    } catch { Dbg "plugin.json parse failed: $($_.Exception.Message)" }
+        # Manifest is there but carries no semver: schema drift, not a bad install.
+        else { Warn "no version in $pluginJson; reporting version=unknown to the fleet roster" }
+    } catch {
+        Warn "plugin.json parse failed ($($_.Exception.Message)); reporting version=unknown"
+    }
+} else {
+    Warn "plugin manifest not found at $pluginJson; reporting version=unknown"
 }
 
 # ── payload from stdin ─────────────────────────────────────────────────────

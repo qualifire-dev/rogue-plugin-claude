@@ -370,6 +370,10 @@ fi
 # event so the fleet roster's row stays fresh between session starts, which are
 # the only moments the heartbeat runs. See install-id.sh.
 [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+# A degraded value is still sent (never a hard failure — see install-id.sh), but
+# it is worth knowing about: an "unknown" host or version means this install
+# reports itself imprecisely to the fleet roster.
+[ -n "${ROGUE_INSTALL_ID_WARN:-}" ] && log "warn=install-id $ROGUE_INSTALL_ID_WARN"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/copilot}"
 

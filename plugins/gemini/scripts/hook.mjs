@@ -152,6 +152,10 @@ async function main() {
   // every event so the fleet roster's row stays fresh between session starts,
   // which are the only moments the heartbeat runs. See installId.
   const install = installId();
+  // Still sent when degraded (never a hard failure — see installId), but an
+  // "unknown" host or version means this install reports itself imprecisely to
+  // the fleet roster, which is worth seeing in the hook log.
+  if (install.warn) log(`warn=install-id ${install.warn}`);
 
   let bodyText = "{}";
   try {

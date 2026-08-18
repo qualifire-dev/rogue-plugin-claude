@@ -36,6 +36,10 @@ fi
 # every event so the fleet roster's row stays fresh between session starts, which
 # are the only moments the heartbeat runs. See install-id.sh.
 . "${CLAUDE_PLUGIN_ROOT}/scripts/install-id.sh"
+# A degraded value is still sent (never a hard failure — see install-id.sh), but
+# it is worth knowing about: an "unknown" host or version means this install
+# reports itself imprecisely to the fleet roster.
+[ -n "${ROGUE_INSTALL_ID_WARN:-}" ] && log "warn=install-id $ROGUE_INSTALL_ID_WARN"
 
 RESP=$(curl -sS -X POST "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/claude" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
