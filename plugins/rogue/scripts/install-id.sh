@@ -55,23 +55,28 @@ else
 fi
 unset _rogue_pj _rogue_v
 
-# Family is the fixed enum "claude"; the surface is this free-form display label,
-# derived from CLAUDE_CODE_ENTRYPOINT (the same var hook.sh uses to tell GUI from
-# cli). Unknown maps to CLI.
+# Family is the fixed enum "claude"; the surface is this id. The id is ALSO the
+# key the backend resolves the latest release from (PLUGIN_REPOS in
+# services/coding-agent-versions.ts), which is why it is a stable snake_case id
+# and not a display label: every sibling plugin sends one (github_copilot,
+# codex_cli, gemini_cli, antigravity_ide), and rendering a human label is the
+# dashboard's job. While this sent "Claude Code - CLI" it matched no key, so
+# EVERY Claude row carried latest_version=null / update_available=false no matter
+# how old the install was. claude_code_desktop and claude_cowork need their own
+# PLUGIN_REPOS entries, exactly as codex_app and antigravity_cli did.
 #
 # CLAUDE_CODE_IS_COWORK is checked FIRST: Cowork spawns Claude Code with
 # CLAUDE_CODE_ENTRYPOINT=local-agent, not a *cowork* value, so entrypoint
-# matching alone filed every Cowork install under "Claude Code - CLI". The
-# entrypoint cases stay behind it for hosts that do set a cowork entrypoint.
-# hook.ps1 and heartbeat.ps1 inline the same order — PowerShell has no seam to
-# share; any drift between the three is a duplicate roster row.
+# matching alone filed every Cowork install under the CLI surface. hook.ps1 and
+# heartbeat.ps1 inline the same order — PowerShell has no seam to share; any
+# drift between the three is a duplicate roster row.
 if [ -n "${CLAUDE_CODE_IS_COWORK:-}" ]; then
-  ROGUE_INSTALL_AGENT="Claude Cowork"
+  ROGUE_INSTALL_AGENT="claude_cowork"
 else
   case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-    *cowork*)  ROGUE_INSTALL_AGENT="Claude Cowork" ;;
-    *desktop*) ROGUE_INSTALL_AGENT="Claude Code - Desktop" ;;
-    *)         ROGUE_INSTALL_AGENT="Claude Code - CLI" ;;
+    *cowork*)  ROGUE_INSTALL_AGENT="claude_cowork" ;;
+    *desktop*) ROGUE_INSTALL_AGENT="claude_code_desktop" ;;
+    *)         ROGUE_INSTALL_AGENT="claude_code" ;;
   esac
 fi
 

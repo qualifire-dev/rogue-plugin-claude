@@ -43,7 +43,7 @@ set -u
 # name/host with a " or \ can't break the JSON.
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 BODY=$(printf '{"agent_family":"claude","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-  "$(esc "${ROGUE_INSTALL_AGENT:-Claude Code - CLI}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
+  "$(esc "${ROGUE_INSTALL_AGENT:-claude_code}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
   "$(esc "${ROGUE_INSTALL_HOST:-unknown}")" \
   "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 

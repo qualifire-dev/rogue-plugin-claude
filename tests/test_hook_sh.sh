@@ -95,9 +95,11 @@ assert_header "x-rogue-actor-name"  "Test User"        "x-rogue-actor-name forwa
 assert_no_header "x-rogue-source"   "no x-rogue-source header (cursor-only)"
 # Fleet-liveness trio: the same host/version/agent the heartbeat sends, on EVERY
 # event, so the roster row is refreshed by ordinary traffic and not only at
-# session start. `agent` is the free-form surface label, and the test harness
-# sets CLAUDE_CODE_ENTRYPOINT=cli. See scripts/install-id.sh.
-assert_header "x-rogue-agent"       "Claude Code - CLI" "x-rogue-agent is the roster's surface label"
+# session start. `agent` is a stable snake_case surface id -- it doubles as the
+# backend's PLUGIN_REPOS key, so a display label here means the row never
+# resolves a latest version. The harness sets CLAUDE_CODE_ENTRYPOINT=cli.
+# See scripts/install-id.sh.
+assert_header "x-rogue-agent"       "claude_code"      "x-rogue-agent is the roster's surface id"
 assert_header_present "x-rogue-host"    "x-rogue-host sent on every event"
 assert_header_present "x-rogue-version" "x-rogue-version sent on every event"
 

@@ -284,16 +284,19 @@ if (Test-Path -LiteralPath $pluginJson) {
     $installError += "manifest-missing:$pluginJson"
 }
 
-# Family is the fixed enum "claude"; the surface is this free-form display label.
+# Family is the fixed enum "claude"; the surface is this stable snake_case id,
+# which is ALSO the key the backend resolves the latest release from — a display
+# label matched nothing there, so every Claude row read as up to date. See
+# install-id.sh, the sh sibling of this block.
 # CLAUDE_CODE_IS_COWORK is checked FIRST: Cowork spawns Claude Code with
 # CLAUDE_CODE_ENTRYPOINT=local-agent, not a *cowork* value, so entrypoint
 # matching alone filed every Cowork install under "Claude Code - CLI". Same
 # order as install-id.sh and heartbeat.ps1 — drift means a duplicate roster row.
 $entrypoint = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
-if ($env:CLAUDE_CODE_IS_COWORK)        { $installAgent = 'Claude Cowork' }
-elseif ($entrypoint -like '*cowork*')  { $installAgent = 'Claude Cowork' }
-elseif ($entrypoint -like '*desktop*') { $installAgent = 'Claude Code - Desktop' }
-else                                   { $installAgent = 'Claude Code - CLI' }
+if ($env:CLAUDE_CODE_IS_COWORK)        { $installAgent = 'claude_cowork' }
+elseif ($entrypoint -like '*cowork*')  { $installAgent = 'claude_cowork' }
+elseif ($entrypoint -like '*desktop*') { $installAgent = 'claude_code_desktop' }
+else                                   { $installAgent = 'claude_code' }
 
 # A degraded value is still SENT rather than failing the hook: it identifies the
 # install well enough to keep the roster fresh, and no liveness bookkeeping is

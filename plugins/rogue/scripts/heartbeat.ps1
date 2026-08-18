@@ -122,14 +122,16 @@ if (Test-Path -LiteralPath $pj) {
 }
 
 # -- agent display label from entrypoint (family is the fixed enum "claude") -
-# CLAUDE_CODE_IS_COWORK is checked FIRST (mirrors heartbeat.sh): Cowork now
+# Surface id, not a display label: it doubles as the backend's latest-version
+# key (see install-id.sh), which a label never matched.
+# CLAUDE_CODE_IS_COWORK is checked FIRST (mirrors install-id.sh): Cowork now
 # spawns Claude Code with CLAUDE_CODE_ENTRYPOINT=local-agent, so entrypoint
 # matching alone reported every Cowork install as "Claude Code - CLI".
 $ep = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
-if ($env:CLAUDE_CODE_IS_COWORK)     { $agent = 'Claude Cowork' }
-elseif ($ep -like '*cowork*')       { $agent = 'Claude Cowork' }
-elseif ($ep -like '*desktop*')      { $agent = 'Claude Code - Desktop' }
-else                                { $agent = 'Claude Code - CLI' }
+if ($env:CLAUDE_CODE_IS_COWORK)     { $agent = 'claude_cowork' }
+elseif ($ep -like '*cowork*')       { $agent = 'claude_cowork' }
+elseif ($ep -like '*desktop*')      { $agent = 'claude_code_desktop' }
+else                                { $agent = 'claude_code' }
 
 $host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 
