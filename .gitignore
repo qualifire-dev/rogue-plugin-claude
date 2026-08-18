@@ -5,11 +5,19 @@
 .idea/
 dist/
 
-# Compiled customer plugins bake a customer ROGUE_API_KEY into env. NEVER commit
-# them — zip artifacts and the unpacked staging dir alike.
-rogue-aidr-compiled-*
-
-# Locally compiled plugin bundles (compile-local-dev.sh). Same hazard as the
-# compiled-* ones above: the bundle bakes ROGUE_API_KEY into its `env` file, so
-# committing one publishes a live key. One reached a PR before this rule existed.
-rogue-aidr-local-*
+# Plugin bundles bake a live ROGUE_API_KEY into their `env` file, so committing
+# one publishes a working key — a customer's, when the bundle is a customer
+# build. Two of them reached PRs while the rule here only said
+# `rogue-aidr-compiled-*`, which matched neither `rogue-aidr-local-test.zip` nor
+# `rogue-aidr-1.0.22-sunbit.zip`. So the rules below are deliberately wider than
+# the names any one compile script emits today:
+#   *.zip                 every archive, whatever it is called (no zip is tracked
+#                         in this repo; `git add -f` if you ever need one)
+#   rogue-aidr-*          bundles AND their unpacked directories, which *.zip
+#                         cannot cover — a committed unpacked bundle leaks the
+#                         same env file
+#   rogue-security-*      the hybrid/customer bundle naming
+# tests/test_gitignore_bundles.sh keeps these honest.
+*.zip
+rogue-aidr-*
+rogue-security-*
