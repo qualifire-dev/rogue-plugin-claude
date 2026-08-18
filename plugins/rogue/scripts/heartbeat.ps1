@@ -91,9 +91,13 @@ $baseUrl = $creds['ROGUE_BASE_URL']; if (-not $baseUrl) { $baseUrl = 'https://ap
 $baseUrl = $baseUrl.TrimEnd('/')
 
 # -- actor resolution (mirrors actor.sh / hook.ps1: first non-synthetic wins) -
+# Screen the WHOLE address before splitting it. Taking the local-part first
+# smuggles the sandbox identity past the screen: noreply@anthropic.com is
+# rejected as an email, but its local-part "noreply" is not on the list.
+$hostMail = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)
 $actorName = Select-ActorValue @(
     $creds['ROGUE_ACTOR_NAME'],
-    (($env:CLAUDE_CODE_USER_EMAIL -split '@')[0])
+    (($hostMail -split '@')[0])
 )
 if (-not $actorName) {
     $gitName = ''

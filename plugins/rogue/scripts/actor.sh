@@ -68,8 +68,15 @@ _rogue_name="${ROGUE_ACTOR_NAME:-}"
 _rogue_is_synthetic "$_rogue_name" && _rogue_name=""
 
 if [ -z "$_rogue_name" ]; then
-  _rogue_name="${CLAUDE_CODE_USER_EMAIL:-}"
-  _rogue_name="${_rogue_name%%@*}"
+  # Screen the WHOLE address before splitting it. Taking the local-part first
+  # smuggles the sandbox identity past the screen: noreply@anthropic.com is
+  # rejected as an email but its local-part "noreply" is not on the list, so the
+  # hook would report actor unknown@<host> with the name "noreply".
+  _rogue_hostmail="${CLAUDE_CODE_USER_EMAIL:-}"
+  _rogue_is_synthetic "$_rogue_hostmail" && _rogue_hostmail=""
+  _rogue_name="${_rogue_hostmail%%@*}"
+  # Still screen the local-part itself: claude@corp.com is a real address whose
+  # local-part is not a usable actor name.
   _rogue_is_synthetic "$_rogue_name" && _rogue_name=""
 fi
 if [ -z "$_rogue_name" ]; then
@@ -86,4 +93,4 @@ ROGUE_ACTOR_EMAIL="$_rogue_email"
 ROGUE_ACTOR_NAME="$_rogue_name"
 export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
 
-unset _rogue_v _rogue_email _rogue_name _rogue_host
+unset _rogue_v _rogue_email _rogue_name _rogue_host _rogue_hostmail

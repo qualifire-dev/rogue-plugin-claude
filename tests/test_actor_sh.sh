@@ -142,5 +142,20 @@ scenario
 GIT_EMAIL=""; GIT_NAME=""; WHO="jane"; HOST_NAME="devbox"
 assert_actor "unknown@devbox|jane" "whoami used for name when git config is absent"
 
+# ── Case 13: the synthetic host email must not leak in through its local-part ─
+# Screening the full address but splitting it first would report the actor as
+# "noreply": that local-part is not itself on the screen list, so the whole
+# address has to be rejected BEFORE the split.
+scenario
+HOST_EMAIL="noreply@anthropic.com"
+GIT_EMAIL=""; GIT_NAME=""; WHO="claude"; HOST_NAME="sandbox-7f3a"
+assert_actor "unknown@sandbox-7f3a|unknown" "synthetic CLAUDE_CODE_USER_EMAIL yields no name at all"
+
+# ── Case 14: a real address whose local-part is itself synthetic ─────────────
+scenario
+HOST_EMAIL="claude@corp.com"
+GIT_EMAIL=""; GIT_NAME=""; WHO="jane"; HOST_NAME="devbox"
+assert_actor "claude@corp.com|jane" "real address kept as email, unusable local-part falls through"
+
 echo
 echo "All actor.sh cascade tests passed (SH=$SH)."

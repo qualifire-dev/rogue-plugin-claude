@@ -143,6 +143,15 @@ Assert-Selected @('Claude', 'claude code', '  ')                 ''             
 Assert-Selected @('', '', [Environment]::UserName) ([Environment]::UserName) 'token user answers when git name and USERNAME are both empty'
 Assert-Selected @('Jane Dev', [Environment]::UserName) 'Jane Dev'             'a real git name still outranks the token user'
 
+# ── the synthetic host email must not leak in through its local-part ───────
+# noreply@anthropic.com is screened as an email, but "noreply" is not itself on
+# the screen list, so splitting before screening would report it as the actor
+# name. Screen the whole address first, then split.
+$labMail = Select-ActorValue @('noreply@anthropic.com')
+Assert-Selected @('', (($labMail -split '@')[0])) ''          'synthetic host email contributes no name'
+$labMail = Select-ActorValue @('jane.doe@corp.com')
+Assert-Selected @('', (($labMail -split '@')[0])) 'jane.doe'  'real host email still yields its local-part'
+
 # The cascade itself lives below the ROGUE_PS_LIB_ONLY seam (its dispatcher body
 # only runs on Windows), so its wiring is asserted structurally here: a silent
 # drop of either fallback is exactly the regression this covers.
@@ -156,12 +165,40 @@ foreach ($f in @('hook.ps1', 'heartbeat.ps1')) {
         $script:fails++
     }
     $script:count++
+    if ($src -match [regex]::Escape('$hostMail = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)') -and
+        $src -notmatch [regex]::Escape("(($env:CLAUDE_CODE_USER_EMAIL -split '@')[0])")) {
+        Write-Host "  ok: $f screens the host email before taking its local-part"
+    } else {
+        Write-Host "FAIL [$f]: host email is split before it is screened"
+        $script:fails++
+    }
+    $script:count++
     if ($src -match [regex]::Escape('Select-ActorValue @($env:COMPUTERNAME, $dnsHost)')) {
         Write-Host "  ok: $f actor-email host falls back to the DNS host name"
     } else {
         Write-Host "FAIL [$f]: actor-email host marker does not fall back to GetHostName()"
         $script:fails++
     }
+}
+
+# ── the status skill's Windows block must use the same screen ──────────────
+# /rogue:status upserts a roster row, so posting $creds['ROGUE_ACTOR_*'] raw
+# would register the sandbox identity as a second, wrongly-attributed install.
+# It cannot run here (it reads $env:USERPROFILE and posts), so assert its shape.
+$skill = Get-Content -Raw -LiteralPath ([System.IO.Path]::Combine($here, '..', 'plugins', 'rogue', 'skills', 'status', 'SKILL.md'))
+$script:count++
+if ($skill -match [regex]::Escape('$env:ROGUE_PS_LIB_ONLY') -and $skill -match 'Select-ActorValue') {
+    Write-Host "  ok: status skill resolves the actor through hook.ps1's screen"
+} else {
+    Write-Host "FAIL: status skill does not load hook.ps1's actor screen"
+    $script:fails++
+}
+$script:count++
+if ($skill -notmatch [regex]::Escape("actor_email=[string]`$creds['ROGUE_ACTOR_EMAIL']")) {
+    Write-Host "  ok: status skill does not post raw env-file actor values"
+} else {
+    Write-Host "FAIL: status skill posts \$creds['ROGUE_ACTOR_EMAIL'] straight into the body"
+    $script:fails++
 }
 
 if ($fails -gt 0) {

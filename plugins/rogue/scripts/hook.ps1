@@ -239,9 +239,13 @@ $baseUrl = $baseUrl.TrimEnd('/')
 # The explicit ROGUE_ACTOR_* values are screened too - compiled bundles already
 # in the field bake a git-config pre-seed into ${CLAUDE_PLUGIN_ROOT}\env, so a
 # plugin update can only fix them if we distrust a poisoned value. See actor.sh.
+# Screen the WHOLE address before splitting it. Taking the local-part first
+# smuggles the sandbox identity past the screen: noreply@anthropic.com is
+# rejected as an email, but its local-part "noreply" is not on the list.
+$hostMail = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)
 $actorName = Select-ActorValue @(
     $creds['ROGUE_ACTOR_NAME'],
-    (($env:CLAUDE_CODE_USER_EMAIL -split '@')[0])
+    (($hostMail -split '@')[0])
 )
 if (-not $actorName) {
     $gitName = ''
