@@ -135,17 +135,44 @@ Parse the JSON response and display in a clear format:
 
 ```bash
 . /tmp/rogue-source-env.sh
-echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
-echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
+RAW_EMAIL="${ROGUE_ACTOR_EMAIL:-}"; RAW_NAME="${ROGUE_ACTOR_NAME:-}"
+# Report what the hooks ACTUALLY send, which is the cascade's output — not the
+# raw env-file values. Those two differ whenever the file carries an identity the
+# cascade rejects (a bundle compiled before the fix pre-seeds ROGUE_ACTOR_* from
+# `git config`, which in a sandbox is Anthropic's synthetic Claude identity), and
+# reporting the raw one would contradict the row Step 2 just registered.
+PJ=$(find "$HOME/.claude/plugins" -path '*rogue*/.claude-plugin/plugin.json' 2>/dev/null | head -1)
+PLUGIN_ROOT=$(dirname "$(dirname "$PJ")")
+if [ -r "$PLUGIN_ROOT/scripts/actor.sh" ]; then
+  . "$PLUGIN_ROOT/scripts/actor.sh"
+else
+  echo "WARNING: actor.sh not found under $PLUGIN_ROOT — showing raw env values"
+fi
+echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unresolved)}"
+echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unresolved)}"
+[ "$RAW_EMAIL" = "${ROGUE_ACTOR_EMAIL:-}" ] || \
+  echo "  note: env file holds \"${RAW_EMAIL:-(unset)}\", replaced by the cascade"
+[ "$RAW_NAME" = "${ROGUE_ACTOR_NAME:-}" ] || \
+  echo "  note: env file holds \"${RAW_NAME:-(unset)}\", replaced by the cascade"
 ```
 
-If either is unset:
+These are the values every hook sends, so they are what the dashboard attributes
+events to. Read them like this:
 
-- **Managed deployment**: the MDM script (`mdm-provision-actor.sh`) hasn't run
-  yet or ran with empty placeholders. Events are POSTing with blank actor
-  headers until MDM provisioning completes. Force an enforcement run on your
-  MDM (Kandji "Run library item now", `sudo jamf policy`).
-- **Individual user**: re-run `/rogue:setup` to populate identity.
+- **A real address and name** — nothing to do.
+- **`unknown@<host>` / `unknown`** — no usable identity was found anywhere: the
+  cascade tried `ROGUE_ACTOR_*`, `CLAUDE_CODE_USER_EMAIL`, `git config --global`
+  and `whoami`, and either found them empty or rejected them as the sandbox's
+  synthetic `Claude <noreply@anthropic.com>`. Events still POST and are still
+  enforced; they are just attributed to a marker instead of a person. Fix by
+  setting a real git identity, or by provisioning `ROGUE_ACTOR_*` explicitly:
+  - **Managed deployment**: the MDM script (`mdm-provision-actor.sh`) hasn't run
+    yet or ran with empty placeholders. Force an enforcement run on your MDM
+    (Kandji "Run library item now", `sudo jamf policy`).
+  - **Individual user**: re-run `/rogue:setup` to populate identity.
+- **A `note:` line** — the credential file carries an identity the cascade
+  rejected or superseded. Harmless, and expected from bundles compiled before
+  the cascade fix; the reported value is the one actually sent.
 
 ## Step 5: Summary
 

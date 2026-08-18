@@ -40,13 +40,20 @@ chmod +x "$STAGE/bin/curl"
 
 # Pull the block out of the doc and point its hardcoded /tmp env path at ours,
 # so the test never reads or writes a real user's file.
-awk '/^```bash$/{inb=1; buf=""; next} /^```$/{if (inb && buf ~ /hooks\/status/) {printf "%s", buf; exit} inb=0} inb{buf = buf $0 "\n"}' \
-  "$SKILL" | sed 's|/tmp/rogue-source-env.sh|'"$STAGE"'/env.sh|' > "$STAGE/step2.sh"
-[ -s "$STAGE/step2.sh" ] || { echo "FAIL: could not extract the Step 2 bash block from SKILL.md"; exit 1; }
-"$SH" -n "$STAGE/step2.sh" || { echo "FAIL: extracted block is not valid POSIX sh"; exit 1; }
+extract() { # extract <marker> <outfile> — the bash block containing <marker>
+  awk -v m="$1" '/^```bash$/{inb=1; buf=""; next} /^```$/{if (inb && buf ~ m) {printf "%s", buf; exit} inb=0} inb{buf = buf $0 "\n"}' \
+    "$SKILL" | sed 's|/tmp/rogue-source-env.sh|'"$STAGE"'/env.sh|' > "$2"
+  [ -s "$2" ] || { echo "FAIL: could not extract the block matching /$1/ from SKILL.md"; exit 1; }
+  "$SH" -n "$2" || { echo "FAIL: extracted block ($1) is not valid POSIX sh"; exit 1; }
+}
+extract 'hooks\/status' "$STAGE/step2.sh"
+extract 'Actor email'    "$STAGE/step4.sh"
 
 run() { # run [VAR=VALUE ...] -> the stubbed request
   env -i HOME="$FAKE_HOME" PATH="$STAGE/bin:$PATH" "$@" "$SH" "$STAGE/step2.sh" 2>&1
+}
+run4() { # run4 [VAR=VALUE ...] -> what Step 4 reports to the user
+  env -i HOME="$FAKE_HOME" PATH="$STAGE/bin:$PATH" "$@" "$SH" "$STAGE/step4.sh" 2>&1
 }
 
 assert_has() { # assert_has <needle> <haystack> <desc>
@@ -95,6 +102,23 @@ rm -f "$STAGE/bin/hostname"
 # ── same block outside Cowork ──────────────────────────────────────────────
 out=$(run CLAUDE_CODE_ENTRYPOINT=cli)
 assert_has '"agent":"claude_code"'               "$out" "CLI surface id when not in Cowork"
+
+# ── Step 4 must report what Step 2 posted, not the raw env file ───────────
+# Otherwise the command registers the right row and then tells the user their
+# actor is Claude <noreply@anthropic.com>, or claims blank actor headers when the
+# cascade in fact resolved a real identity.
+out=$(run4 CLAUDE_CODE_USER_EMAIL=real.user@corp.com)
+assert_has  'Actor email: real.user@corp.com' "$out" "Step 4 shows the resolved email"
+assert_has  'Actor name:  real.user'          "$out" "Step 4 shows the resolved name"
+assert_lacks 'Actor email: noreply@anthropic.com' "$out" "Step 4 never shows the rejected env-file email"
+assert_lacks 'Actor name:  Claude'                "$out" "Step 4 never shows the rejected env-file name"
+assert_has  'note: env file holds'            "$out" "Step 4 flags that the env file was superseded"
+
+# With nothing resolvable, the marker is reported — not "(unset)", which used to
+# be followed by advice claiming events POST with blank actor headers.
+out=$(run4)
+assert_has  'Actor email: unknown@' "$out" "Step 4 reports the unknown marker when nothing resolves"
+assert_lacks '(unset)'              "$out" "Step 4 never reports an unset actor"
 
 [ "$fails" -eq 0 ] || { echo "$fails failure(s)"; exit 1; }
 echo "all status skill tests passed"
