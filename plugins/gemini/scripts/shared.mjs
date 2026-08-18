@@ -78,6 +78,14 @@ export function loadEnvFiles() {
  * `agent` is the surface and also the PLUGIN_REPOS key the backend resolves the
  * latest version from, so it stays "gemini_cli".
  */
+// Gemini ships one surface, so this is a constant rather than a detection - but it
+// is still declared in exactly one place, because it has three consumers: hook.mjs
+// stamps it as each log line's `surface=` token and sends it as x-rogue-agent (via
+// installId below), and heartbeat.mjs sends it as the roster's `agent`. A log line
+// and the roster row for one install naming different surfaces is worse than a line
+// naming none, and that is what a second literal would eventually produce.
+export const SURFACE = "gemini_cli";
+
 export function installId() {
   // `error` names whatever could not be resolved, or is null when all of it was.
   // Returned rather than logged: this helper is shared with heartbeat.mjs, which
@@ -109,7 +117,7 @@ export function installId() {
     error = error ? `host-unresolved,${error}` : "host-unresolved";
   }
 
-  return { host, version, agent: "gemini_cli", error };
+  return { host, version, agent: SURFACE, error };
 }
 
 export function gitConfig(key) {

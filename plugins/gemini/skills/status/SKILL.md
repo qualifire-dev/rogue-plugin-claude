@@ -74,8 +74,91 @@ for f in "$HOME/.gemini/extensions/rogue/env" /etc/rogue/env "$HOME/.rogue-env";
 echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
 echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
 echo "--- recent hook activity ---"
-tail -n 20 "${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}" 2>/dev/null || echo "no hook activity yet"
+# Same precedence as the dispatcher: the env files first (system, then per-user),
+# with the process environment winning over both. Read with sed, never by
+# sourcing - a status command must not execute an env file. Reading only
+# $ROGUE_LOG_* would report "no activity" on exactly the machines that relocate
+# their logs by policy, which are the ones support is called about.
+rogue_log_var() {
+  v=$(sed -n "s/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}$1=//p" \
+        /etc/rogue/env "$HOME/.rogue-env" 2>/dev/null | tail -1 | sed "s/^['\"]//;s/['\"]$//")
+  eval "p=\${$1:-}"
+  [ -n "$p" ] && v=$p
+  printf '%s' "$v"
+}
+log=$(rogue_log_var ROGUE_LOG_FILE)
+if [ -z "$log" ]; then
+  dir=$(rogue_log_var ROGUE_LOG_DIR)
+  [ -n "$dir" ] || dir="$HOME/.rogue/logs"
+  log="$dir/gemini.log"
+fi
+echo "Log: $log"
+tail -n 20 "$log" 2>/dev/null || echo "(no hook log yet)"
 ```
+
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`gemini.log` only — a sibling agent's activity lives in `claude.log`,
+`cursor.log`, and so on. `<file>.1` is the previous rotation, if any.
+
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+**Uploading needs no opt-in.** A configured install uploads its log on its own; the
+commands below only make one run happen *now*, with its output visible. There is no
+`ROGUE_SHIP_LOGS` flag any more — nothing here switches uploading on or off.
+
+**One SCRIPT, both platforms** — Gemini CLI guarantees Node 20+ on PATH, so the
+shipper is a single Node script here rather than the sh/PowerShell pair the other
+Rogue plugins ship, and there is no `.ps1` variant. The *invocation* still differs:
+the bash form below uses `$HOME` and `VAR=value cmd` prefixing, neither of which
+exists in PowerShell, so Windows gets its own form rather than being told to run a
+command it cannot.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 node "$HOME/.gemini/extensions/rogue/scripts/ship-logs.mjs"
+```
+- Windows (PowerShell):
+```powershell
+$ship = Join-Path $env:USERPROFILE '.gemini\extensions\rogue\scripts\ship-logs.mjs'
+if (-not (Test-Path -LiteralPath $ship)) { "ship-logs.mjs not found at $ship - list %USERPROFILE%\.gemini\extensions and report what is there" }
+else {
+  "using $ship"
+  # Set, run, unset: PowerShell has no `VAR=value command` prefix, and leaving these
+  # in the session would waive the 15-minute throttle and keep debug output on for
+  # every later run. No child process is needed here (unlike the other plugins,
+  # whose shipper is a .ps1 that ends in `exit 0` and would end this session).
+  $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  try { & node $ship } finally {
+    Remove-Item Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG -ErrorAction SilentlyContinue
+  }
+}
+```
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `gemini.log`. Each line is attributed by its
+own `provider=` token, so a mixed upload is still filed per agent — and the state
+directory is shared with the other plugins' shippers, so a log another agent
+already uploaded is not sent twice.
+
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/setup`), `http=0` is a network or proxy problem — the Node shipper reports a
+transport failure or a timeout as `http=0`, where the other plugins' sh and
+PowerShell shippers print curl's `000` — and
+`outcome=skip reason=no-actor` means identity is unresolved.
 
 ## Step 5: Summary
 
@@ -91,7 +174,9 @@ detection as a false positive. The override is per-prompt only.
 
 ## Windows (PowerShell)
 
-Run this single block instead of Steps 1–4:
+Run this single block instead of Steps 1–4. The log **upload** has its own
+PowerShell form in *Upload the log to Rogue support* above — run that one when the
+user asks for an upload.
 
 ```powershell
 $creds = @{}
@@ -117,7 +202,21 @@ try {
 } catch { "Status check failed: $($_.Exception.Message)" }
 "Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
 "Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
-Get-Content -Tail 20 "$env:USERPROFILE\.rogue\hook.log" -ErrorAction SilentlyContinue
+# The process environment wins over every file, exactly as it does in the
+# dispatcher - overlay it before deriving the path, or an operator who exported
+# ROGUE_LOG_DIR for this session is told there is no activity.
+foreach ($v in 'ROGUE_LOG_FILE','ROGUE_LOG_DIR') {
+  $pv = [Environment]::GetEnvironmentVariable($v)
+  if ($pv) { $creds[$v] = $pv }
+}
+$logPath = $creds['ROGUE_LOG_FILE']
+if (-not $logPath) {
+  $logDir = $creds['ROGUE_LOG_DIR']
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'gemini.log'
+}
+"Log: $logPath"
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
 
 Report the same fields as Step 2.
