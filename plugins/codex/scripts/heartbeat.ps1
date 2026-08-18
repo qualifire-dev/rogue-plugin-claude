@@ -109,4 +109,38 @@ try {
     Dbg 'heartbeat sent'
 } catch { Dbg "heartbeat failed: $($_.Exception.Message)" }
 
+# ── ship the hook log ──────────────────────────────────────────────────────
+# See plugins/rogue/scripts/heartbeat.ps1 for why this is a separate process
+# (in-process, the shipper's `$script:` writes would clobber this file's variables
+# and its `exit 0` would kill the heartbeat), why the values travel as environment
+# variables (no interpolation to escape) and why the actor is passed in rather than
+# re-resolved (a second cascade would key the log's source row differently from the
+# roster row just posted).
+#
+# SLUG `codex`, FAMILY `openai` - they differ here and that is not a mistake: the
+# log file is codex.log and the dispatcher writes `provider=codex`, while the
+# roster family is `openai`, exactly as this script's own body reports.
+$shipScript = Join-Path $pluginRoot 'scripts\ship-logs.ps1'
+if (Test-Path -LiteralPath $shipScript) {
+    try {
+        $env:ROGUE_ACTOR_EMAIL     = [string]$actorEmail
+        $env:ROGUE_ACTOR_NAME      = [string]$actorName
+        $env:ROGUE_SHIPPER_SCRIPT  = $shipScript
+        $env:ROGUE_SHIPPER_ROOT    = $pluginRoot
+        $env:ROGUE_SHIPPER_SLUG    = 'codex'
+        $env:ROGUE_SHIPPER_VERSION = [string]$ver
+        $env:ROGUE_SHIPPER_FAMILY  = 'openai'
+        $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))' +
+                 ' $env:ROGUE_SHIPPER_ROOT $env:ROGUE_SHIPPER_SLUG' +
+                 ' $env:ROGUE_SHIPPER_VERSION $env:ROGUE_SHIPPER_FAMILY'
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+        $psExe = 'powershell'
+        try { if ((Get-Process -Id $PID).Path) { $psExe = (Get-Process -Id $PID).Path } } catch {}
+        Start-Process -FilePath $psExe `
+            -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded `
+            -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        Dbg 'log shipper started'
+    } catch { Dbg "log shipper not started: $($_.Exception.Message)" }
+}
+
 exit 0

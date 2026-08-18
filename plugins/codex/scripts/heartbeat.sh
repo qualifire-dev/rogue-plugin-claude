@@ -37,4 +37,21 @@ curl -sS --max-time 10 -X POST \
   -d "$BODY" \
   >/dev/null 2>&1 || true
 
+# ── ship the hook log ──────────────────────────────────────────────────────
+# See plugins/rogue/scripts/heartbeat.sh for why this runs after the POST (the
+# roster row must exist first), why it needs no extra backgrounding (hooks.json
+# already detaches this script) and why the actor is passed in rather than
+# re-resolved (a second cascade would key the log's source row differently from
+# the roster row just posted).
+#
+# The SLUG AND THE FAMILY DIFFER HERE and that is not a mistake: the log file is
+# `codex.log` (slug `codex`, matching the `provider=` token the dispatcher writes)
+# while the roster family is `openai`, exactly as this script's own body reports.
+# The shipper never derives one from the other - both are arguments.
+if [ -r "${PLUGIN_ROOT}/scripts/ship-logs.sh" ]; then
+  ROGUE_ACTOR_EMAIL="${ROGUE_ACTOR_EMAIL:-}" ROGUE_ACTOR_NAME="${ROGUE_ACTOR_NAME:-}" \
+    sh "${PLUGIN_ROOT}/scripts/ship-logs.sh" \
+      "${PLUGIN_ROOT}" codex "${ROGUE_INSTALL_VERSION:-unknown}" openai >/dev/null 2>&1 || true
+fi
+
 exit 0

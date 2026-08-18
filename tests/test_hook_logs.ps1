@@ -69,12 +69,19 @@ function Invoke-Probe {
         [Environment]::SetEnvironmentVariable($k, $envOverrides[$k])
     }
     try {
+        # -SeedPrevious is appended ONLY when it has a value. Windows PowerShell 5.1
+        # DROPS an empty string when it builds a native command's argument list, so
+        # `-SeedPrevious ''` reached the probe as a bare `-SeedPrevious` and failed
+        # with "Missing an argument for parameter 'SeedPrevious'". pwsh 7 passes it as
+        # `""`, which is why this only surfaced once these suites ran under 5.1 too.
+        # The probe's default for it is '' anyway, so omitting it is exact.
         $argv = @('-NoProfile', '-File', $probe,
                   '-Dispatcher', (Join-Path $repo $Case.path),
                   '-EventName', $Case.event,
-                  '-CredsJson', ($Creds | ConvertTo-Json -Compress),
-                  '-SeedBytes', $SeedBytes,
-                  '-SeedPrevious', $SeedPrevious)
+                  '-CredsB64', [Convert]::ToBase64String(
+                      [System.Text.Encoding]::UTF8.GetBytes(($Creds | ConvertTo-Json -Compress))),
+                  '-SeedBytes', $SeedBytes)
+        if ($SeedPrevious) { $argv += @('-SeedPrevious', $SeedPrevious) }
         $out = & (Get-Process -Id $PID).Path @argv 2>$null
     } finally {
         foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
@@ -106,12 +113,24 @@ foreach ($c in $cases) {
 }
 
 Write-Host ""
-Write-Host "== USERPROFILE unset falls back to `$HOME (dot-sourced on macOS/Linux)"
-foreach ($c in $cases) {
-    $h = New-CaseHome "nouserprofile-$($c.slug)"; $homes += $h
-    $f = Invoke-Probe -Case $c -CaseHome $h -NoUserProfile
-    $expected = Join-Path (Join-Path (Join-Path $h '.rogue') 'logs') "$($c.slug).log"
-    Check "$($c.slug) still resolves a log path" $expected $f['LOGFILE']
+Write-Host "== USERPROFILE unset falls back to `$HOME (non-Windows only)"
+# SKIPPED ON WINDOWS, deliberately. The fallback under test is for pwsh on macOS and
+# Linux, where USERPROFILE does not exist; on Windows USERPROFILE is always set, so the
+# branch is unreachable in practice. It is also not expressible here: the `$HOME` the
+# dispatchers fall back to is PowerShell's AUTOMATIC variable, which Windows builds at
+# session start from HOMEDRIVE + HOMEPATH and never from $env:HOME — so the child cannot
+# be steered into the sandbox by this fixture, and a run with USERPROFILE stripped
+# produced no probe output at all rather than a wrong path. Asserting it there would be
+# testing the fixture, not the product.
+if ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows) {
+    Write-Host '  skip: USERPROFILE is always set on Windows; the fallback is a POSIX path'
+} else {
+    foreach ($c in $cases) {
+        $h = New-CaseHome "nouserprofile-$($c.slug)"; $homes += $h
+        $f = Invoke-Probe -Case $c -CaseHome $h -NoUserProfile
+        $expected = Join-Path (Join-Path (Join-Path $h '.rogue') 'logs') "$($c.slug).log"
+        Check "$($c.slug) still resolves a log path" $expected $f['LOGFILE']
+    }
 }
 
 Write-Host ""
@@ -186,7 +205,7 @@ foreach ($c in $cases) {
     Check "$($c.slug) rotated the old log to $($c.slug).log.1" 'True' $f['ROTATED']
     Check "$($c.slug) started a fresh log (1 line)" '1' $f['LINES']
     if ($f['PREVIOUS'] -eq 'STALE-PREVIOUS-GENERATION') {
-        Fail "$($c.slug) left the stale .1 in place — rotation silently no-oped"
+        Fail "$($c.slug) left the stale .1 in place - rotation silently no-oped"
     } else { Pass "$($c.slug) replaced the previous .1 generation" }
 }
 

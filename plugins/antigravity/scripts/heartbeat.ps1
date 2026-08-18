@@ -169,6 +169,49 @@ function Send-Heartbeat {
     } catch { Dbg "heartbeat failed: $($_.Exception.Message)" }
 }
 
+# AFTER Send-Heartbeat, deliberately: the heartbeat is what creates or refreshes
+# the roster row an uploaded log attaches to.
+#
+# A SEPARATE PROCESS - see plugins/rogue/scripts/heartbeat.ps1 for the full
+# reasoning. It matters more here than anywhere else in this repo: this file is
+# main-and-functions and keeps ALL its state in `$script:` variables, which is
+# exactly what an in-process [scriptblock]::Create would resolve against, so the
+# shipper's own `$script:stateKey` / `$script:offset` writes would land on this
+# script's own state. Its `exit 0` would also end the heartbeat, not the shipper.
+#
+# Every value travels as an environment variable, so the command is a constant with
+# nothing to escape. The actor is PASSED IN, never re-resolved: Resolve-Actor
+# already ran a cascade of its own, and a second one inside the shipper would key
+# the log's source row differently from the roster row just posted.
+#
+# This heartbeat fires once per USER TURN, not once per session (`invocationNum`
+# resets to 0 on every new prompt), so this runs on every turn. No gate is needed:
+# the shipper's own 15-minute per-file throttle is stamped before any upload, so
+# the extra calls make no request at all.
+function Start-LogShipper {
+    $shipScript = Join-Path $script:pluginRoot 'scripts\ship-logs.ps1'
+    if (-not (Test-Path -LiteralPath $shipScript)) { return }
+    try {
+        $env:ROGUE_ACTOR_EMAIL     = [string]$script:actorEmail
+        $env:ROGUE_ACTOR_NAME      = [string]$script:actorName
+        $env:ROGUE_SHIPPER_SCRIPT  = $shipScript
+        $env:ROGUE_SHIPPER_ROOT    = $script:pluginRoot
+        $env:ROGUE_SHIPPER_SLUG    = 'antigravity'
+        $env:ROGUE_SHIPPER_VERSION = [string]$script:ver
+        $env:ROGUE_SHIPPER_FAMILY  = 'antigravity'
+        $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))' +
+                 ' $env:ROGUE_SHIPPER_ROOT $env:ROGUE_SHIPPER_SLUG' +
+                 ' $env:ROGUE_SHIPPER_VERSION $env:ROGUE_SHIPPER_FAMILY'
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+        $psExe = 'powershell'
+        try { if ((Get-Process -Id $PID).Path) { $psExe = (Get-Process -Id $PID).Path } } catch {}
+        Start-Process -FilePath $psExe `
+            -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded `
+            -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        Dbg 'log shipper started'
+    } catch { Dbg "log shipper not started: $($_.Exception.Message)" }
+}
+
 # ── main ───────────────────────────────────────────────────────────────────
 # Same order as heartbeat.sh: stand down, configure, then fire and forget.
 function Invoke-Main {
@@ -182,6 +225,7 @@ function Invoke-Main {
     Resolve-Version
     Resolve-Surface
     Send-Heartbeat
+    Start-LogShipper
     exit 0
 }
 

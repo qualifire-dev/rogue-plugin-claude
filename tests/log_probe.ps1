@@ -15,7 +15,13 @@
 param(
     [Parameter(Mandatory)][string]$Dispatcher,   # path to a hook.ps1
     [string]$EventName = 'PreToolUse',
-    [string]$CredsJson = '{}',                   # JSON object of ROGUE_* values
+    # BASE64 of the UTF-8 JSON, not the JSON itself. Windows PowerShell 5.1 mangles
+    # the double quotes when it builds a native command's argument list, so a
+    # `{"ROGUE_API_KEY":"k"}` argument arrived as `{ROGUE_API_KEY:k}` and
+    # ConvertFrom-Json failed with "Invalid JSON primitive". Base64 has no character
+    # any shell or argument parser treats specially - the same reason the dispatchers
+    # ship transcript tails and subagent names base64-encoded.
+    [string]$CredsB64 = '',                      # base64 of a JSON object of ROGUE_* values
     [int]$SeedBytes = 0,                         # >0: pre-fill the log
     [string]$SeedPrevious = ''                   # non-empty: also create <log>.1
 )
@@ -26,7 +32,11 @@ param(
 # that assignment would silently overwrite our own parameter with an empty
 # hashtable and every override in it would vanish.
 $map = @{}
-foreach ($p in (ConvertFrom-Json $CredsJson).PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
+$credsJson = '{}'
+if ($CredsB64) {
+    $credsJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($CredsB64))
+}
+foreach ($p in (ConvertFrom-Json $credsJson).PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
 
 $env:ROGUE_PS_LIB_ONLY = '1'
 . $Dispatcher $EventName

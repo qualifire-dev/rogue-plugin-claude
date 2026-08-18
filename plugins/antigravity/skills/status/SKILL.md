@@ -162,6 +162,104 @@ if (-not $logPath) {
 Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background on the
+first model invocation of a turn, at most once every 15 minutes per file, resuming
+from wherever the last upload finished. Run it by hand only to push the newest
+lines *now*.
+
+**Uploading is off by default right now.** The receiving route is not deployed yet,
+so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
+is why every command below sets it explicitly. Once the route is live the default
+flips and the paragraph above applies unchanged.
+
+- macOS / Linux:
+```bash
+# Antigravity installs into one of two trees (IDE, then the CLI surface), so
+# resolve rather than assume, and PRINT what was chosen: which copy runs decides
+# which bundled `env` supplies ROGUE_BASE_URL, so an operator reading the output
+# has to be able to see it. Prose naming the alternate path is no help at the
+# moment the command silently does nothing.
+ship=""
+for c in "$HOME/.gemini/config/plugins/rogue/scripts/ship-logs.sh" \
+         "$HOME/.gemini/antigravity-cli/plugins/rogue/scripts/ship-logs.sh"; do
+  [ -r "$c" ] && { ship="$c"; break; }
+done
+if [ -z "$ship" ]; then
+  echo "ship-logs.sh not found - list ~/.gemini/config/plugins and ~/.gemini/antigravity-cli/plugins and report what is there"
+else
+  echo "using $ship"
+  ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$ship"
+fi
+```
+- Windows (PowerShell):
+```powershell
+# Both install trees, resolved and reported - see the bash form above.
+$ship = $null
+foreach ($r in @((Join-Path $env:USERPROFILE '.gemini\config\plugins\rogue'),
+                 (Join-Path $env:USERPROFILE '.gemini\antigravity-cli\plugins\rogue'))) {
+  $c = Join-Path $r 'scripts\ship-logs.ps1'
+  if (Test-Path -LiteralPath $c) { $ship = $c; break }
+}
+if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.gemini\config\plugins and %USERPROFILE%\.gemini\antigravity-cli\plugins and report what is there' }
+else {
+  "using $ship"
+  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  $env:ROGUE_SHIPPER_SCRIPT = $ship
+  # PASS THE ROOT. On a no-argument run the shipper self-locates its plugin root to
+  # read <root>\env, the FIRST file in the credential chain - and $PSCommandPath is
+  # EMPTY under [scriptblock]::Create, so it falls back to the current directory,
+  # which is the operator's cwd and has no env file. The bundled ROGUE_BASE_URL is
+  # then missed and identity can be absent entirely (outcome=skip reason=no-actor),
+  # on the one command support asks them to run. heartbeat.ps1 passes it for the
+  # same reason. The slug stays unset, which is what keeps this the
+  # collect-everything support invocation.
+  $env:ROGUE_SHIPPER_ROOT = Split-Path (Split-Path $ship -Parent) -Parent
+  $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+    '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT))) $env:ROGUE_SHIPPER_ROOT'))
+  Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+    -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+  # One run only. The bash form scopes these to a single command; setting them as
+  # session variables would leave later runs from this session with the 15-minute
+  # throttle waived and debug output on.
+  Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT, Env:ROGUE_SHIPPER_ROOT -ErrorAction SilentlyContinue
+}
+```
+
+**A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
+loading it into the current session would terminate *that* session rather than
+the shipper. The script path travels as an environment variable and the command
+itself is a constant, so a path containing a quote cannot alter it;
+`-EncodedCommand` because `-ArgumentList` quoting is unreliable on Windows
+PowerShell 5.1. Same shape `heartbeat.ps1` uses.
+
+`~/.gemini/config/plugins/rogue` is the directory **both** surfaces read — the IDE
+and the `agy` CLI — which is where the installer copies the plugin. Antigravity's
+own docs name `~/.gemini/antigravity-cli/plugins/`; if the path above does not
+exist, try that one.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `antigravity.log`. Each line is attributed by
+its own `provider=` token, so a mixed upload is still filed per agent.
+
+`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file keeps uploading off even with the flag above,
+and stays off after the default flips.
+
 ## Step 5: Summary
 
 Present a clean summary: credential sources, connection status, mode + ruleset count, the Antigravity event sets (IDE and CLI surfaces), and actor identity (`${ROGUE_ACTOR_EMAIL}` / `${ROGUE_ACTOR_NAME}`).

@@ -365,8 +365,25 @@ function Add-FilePreImage {
                 }
                 if ($len -gt 0) {
                     $buf = New-Object byte[] ([int]$len)
-                    $read = $fs.Read($buf, 0, [int]$len)
-                    if ($read -le 0) { return $Body }
+                    # LOOP: FileStream.Read is only guaranteed to return at least one
+                    # byte, not the count asked for. A single call that came up short
+                    # used to be base64-encoded and attached as if it were the WHOLE
+                    # file - the truncated pre-image the header above rules out, and a
+                    # divergence from hook.sh, whose `base64 < "$_fp"` always consumes
+                    # everything. A short total sends NO pre-image rather than a
+                    # partial one: not knowing the pre-edit state is safe, while
+                    # misreporting it is not. (Read-Range in ship-logs.ps1 carries the
+                    # same loop, for the same reason.)
+                    $read = 0
+                    while ($read -lt [int]$len) {
+                        $n = $fs.Read($buf, $read, [int]$len - $read)
+                        if ($n -le 0) { break }
+                        $read += $n
+                    }
+                    if ($read -ne [int]$len) {
+                        Dbg "pre-image short read ($read of $len B) -> sending none"
+                        return $Body
+                    }
                     $b64 = [Convert]::ToBase64String($buf, 0, $read)
                 }
             } finally { $fs.Close() }
@@ -655,6 +672,45 @@ if ($EventName -eq 'sessionStart') {
     } catch {
         Dbg "heartbeat POST failed: $($_.Exception.Message)"
         Log "heartbeat=fail ver=$pluginVersion error=`"$(Sanitize $_.Exception.Message)`""
+    }
+
+    # ── ship the hook log ────────────────────────────────────────────────────
+    # A SEPARATE, HIDDEN PROCESS, and here that is doing two jobs at once. As in
+    # the other PowerShell callers, in-process would let the shipper's `$script:`
+    # writes land on this dispatcher's variables and its `exit 0` end the
+    # dispatcher before it prints the relayed response. On top of that, unlike
+    # heartbeat.ps1 this file IS the synchronous dispatcher - Cursor is waiting on
+    # our stdout - so the upload must not be awaited at all. Start-Process without
+    # -Wait returns immediately.
+    #
+    # After the heartbeat, so the roster row the log attaches to exists first.
+    #
+    # Every value travels as an environment variable, so the command is a constant
+    # with nothing to escape. The actor is passed in, never re-resolved: Cursor's
+    # cascade ends at "$env:USERNAME@$env:COMPUTERNAME" where actor.sh ends at the
+    # hostname, so a second cascade would key the log's source row differently
+    # from the roster row just posted.
+    $shipScript = Join-Path $pluginRoot 'scripts\ship-logs.ps1'
+    if (Test-Path -LiteralPath $shipScript) {
+        try {
+            $env:ROGUE_ACTOR_EMAIL     = [string]$actorEmail
+            $env:ROGUE_ACTOR_NAME      = [string]$actorName
+            $env:ROGUE_SHIPPER_SCRIPT  = $shipScript
+            $env:ROGUE_SHIPPER_ROOT    = $pluginRoot
+            $env:ROGUE_SHIPPER_SLUG    = 'cursor'
+            $env:ROGUE_SHIPPER_VERSION = [string]$hbVer
+            $env:ROGUE_SHIPPER_FAMILY  = 'cursor'
+            $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))' +
+                     ' $env:ROGUE_SHIPPER_ROOT $env:ROGUE_SHIPPER_SLUG' +
+                     ' $env:ROGUE_SHIPPER_VERSION $env:ROGUE_SHIPPER_FAMILY'
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+            $psExe = 'powershell'
+            try { if ((Get-Process -Id $PID).Path) { $psExe = (Get-Process -Id $PID).Path } } catch {}
+            Start-Process -FilePath $psExe `
+                -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded `
+                -WindowStyle Hidden -ErrorAction Stop | Out-Null
+            Dbg 'log shipper started'
+        } catch { Dbg "log shipper not started: $($_.Exception.Message)" }
     }
 }
 

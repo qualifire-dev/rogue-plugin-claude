@@ -42,12 +42,21 @@ Remove the line from `~/.rogue-env` to get the reason back.
 [ -r /etc/rogue/env ]     && . /etc/rogue/env
 [ -r "$HOME/.rogue-env" ] && . "$HOME/.rogue-env"
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+PJ="$HOME/.copilot/installed-plugins/rogue-copilot/rogue/plugin.json"
+VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 curl -s -w "\n%{http_code}" -X POST \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"agent_family\":\"copilot\",\"agent\":\"github_copilot\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
+  -d "{\"agent_family\":\"copilot\",\"agent\":\"github_copilot\",\"version\":\"${VER:-unknown}\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
 ```
+
+`version` is read from `plugin.json` the same way `heartbeat.sh` reads it —
+grep/sed, never `python3`, because the `/usr/bin/python3` stub fails silently on
+a fresh macOS. Send it: without it the roster row has no running version, so the
+server has nothing to compare against the latest release and `update_available`
+is meaningless. If the file is missing, `unknown` is sent rather than the field
+being dropped.
 
 Report from the JSON response (HTTP 200 = connected): organization name, running
 vs latest version, and whether `update_available` is `true`. On HTTP 401 the key
@@ -125,6 +134,84 @@ if (-not $logPath) {
 "Log: $logPath"
 Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
 ```
+
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+**Uploading is off by default right now.** The receiving route is not deployed yet,
+so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
+is why every command below sets it explicitly. Once the route is live the default
+flips and the paragraph above applies unchanged.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
+  sh "$HOME/.copilot/installed-plugins/rogue-copilot/rogue/scripts/ship-logs.sh"
+```
+- Windows (PowerShell):
+```powershell
+$root = Join-Path $env:USERPROFILE '.copilot\installed-plugins\rogue-copilot\rogue'
+$env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+$env:ROGUE_SHIPPER_SCRIPT = Join-Path $root 'scripts\ship-logs.ps1'
+# PASS THE ROOT. On a no-argument run the shipper self-locates its plugin root to
+# read <root>\env, the FIRST file in the credential chain - and $PSCommandPath is
+# EMPTY under [scriptblock]::Create, so it falls back to the current directory,
+# which is the operator's cwd and has no env file. The bundled ROGUE_BASE_URL is
+# then missed and identity can be absent entirely (outcome=skip reason=no-actor),
+# on the one command support asks them to run. heartbeat.ps1 passes it for the
+# same reason. The slug stays unset, which is what keeps this the
+# collect-everything support invocation.
+$env:ROGUE_SHIPPER_ROOT = $root
+$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+  '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT))) $env:ROGUE_SHIPPER_ROOT'))
+Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+  -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+# One run only. The bash form scopes these to a single command; setting them as
+# session variables would leave later runs from this session with the 15-minute
+# throttle waived and debug output on.
+Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT, Env:ROGUE_SHIPPER_ROOT -ErrorAction SilentlyContinue
+```
+
+**A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
+loading it into the current session would terminate *that* session rather than
+the shipper. The script path travels as an environment variable and the command
+itself is a constant, so a path containing a quote cannot alter it;
+`-EncodedCommand` because `-ArgumentList` quoting is unreliable on Windows
+PowerShell 5.1. Same shape `heartbeat.ps1` uses.
+
+An absolute path, not a plugin-root variable: Copilot sets no root variable for a
+slash command's shell. If that path does not exist, list
+`~/.copilot/installed-plugins/` — the marketplace name is `rogue-copilot`, so the
+plugin lands one level deeper than the other agents'.
+
+**This is unavailable in the JetBrains IDE's Local agent**, which does not load
+`~/.copilot/installed-plugins` at all — the same reason `/rogue:status` itself is
+unreachable there. Ask the user to run it from the terminal CLI instead; both
+write the same `copilot.log`.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `copilot.log`. Each line is attributed by its
+own `provider=` token, so a mixed upload is still filed per agent.
+
+`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/rogue:setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file keeps uploading off even with the flag above,
+and stays off after the default flips.
 
 ## Step 5: Confirm hooks are trusted
 

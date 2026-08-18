@@ -100,6 +100,70 @@ Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
 `gemini.log` only — a sibling agent's activity lives in `claude.log`,
 `cursor.log`, and so on. `<file>.1` is the previous rotation, if any.
 
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action: the log ships by itself in the background at
+session start, at most once every 15 minutes per file, resuming from wherever the
+last upload finished. Run it by hand only to push the newest lines *now*.
+
+**Uploading is off by default right now.** The receiving route is not deployed yet,
+so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
+is why every command below sets it explicitly. Once the route is live the default
+flips and the paragraph above applies unchanged.
+
+**One SCRIPT, both platforms** — Gemini CLI guarantees Node 20+ on PATH, so the
+shipper is a single Node script here rather than the sh/PowerShell pair the other
+Rogue plugins ship, and there is no `.ps1` variant. The *invocation* still differs:
+the bash form below uses `$HOME` and `VAR=value cmd` prefixing, neither of which
+exists in PowerShell, so Windows gets its own form rather than being told to run a
+command it cannot.
+
+- macOS / Linux:
+```bash
+ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 node "$HOME/.gemini/extensions/rogue/scripts/ship-logs.mjs"
+```
+- Windows (PowerShell):
+```powershell
+$ship = Join-Path $env:USERPROFILE '.gemini\extensions\rogue\scripts\ship-logs.mjs'
+if (-not (Test-Path -LiteralPath $ship)) { "ship-logs.mjs not found at $ship - list %USERPROFILE%\.gemini\extensions and report what is there" }
+else {
+  "using $ship"
+  # Set, run, unset: PowerShell has no `VAR=value command` prefix, and leaving these
+  # in the session would waive the 15-minute throttle and keep debug output on for
+  # every later run. No child process is needed here (unlike the other plugins,
+  # whose shipper is a .ps1 that ends in `exit 0` and would end this session).
+  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  try { & node $ship } finally {
+    Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG -ErrorAction SilentlyContinue
+  }
+}
+```
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log in the log directory, not just `gemini.log`. Each line is attributed by its
+own `provider=` token, so a mixed upload is still filed per agent — and the state
+directory is shared with the other plugins' shippers, so a log another agent
+already uploaded is not sent twice.
+
+`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
+output at all** when everything already shipped — that is success. Nothing is
+re-sent, because the upload resumes from a stored byte offset that only advances
+on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `http=401` is a bad API key
+(`/setup`), `http=0` is a network or proxy problem — the Node shipper reports a
+transport failure or a timeout as `http=0`, where the other plugins' sh and
+PowerShell shippers print curl's `000` — and
+`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
+in any env file keeps uploading off even with the flag above,
+and stays off after the default flips.
+
 ## Step 5: Summary
 
 Present a clean summary: credential sources, connection status, mode + ruleset
@@ -114,7 +178,9 @@ detection as a false positive. The override is per-prompt only.
 
 ## Windows (PowerShell)
 
-Run this single block instead of Steps 1–4:
+Run this single block instead of Steps 1–4. The log **upload** has its own
+PowerShell form in *Upload the log to Rogue support* above — run that one when the
+user asks for an upload.
 
 ```powershell
 $creds = @{}

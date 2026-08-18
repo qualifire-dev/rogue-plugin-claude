@@ -112,7 +112,7 @@ foreach ($fn in $functions) {
     }
 }
 if ($unscoped) {
-    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: — $_" }
+    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: - $_" }
     $failures += $unscoped.Count
 } else {
     Write-Host "  ok: $(Split-Path $file -Leaf): every shared-state write inside a function is `$script:-qualified"
@@ -195,11 +195,24 @@ $cases = @(
        expected = 'C:/Users/y/.gemini/antigravity-ide/brain/c/t.jsonl' }
     # The conversation id becomes a path component, so anything but an id
     # character is dropped rather than trusted.
+    # `foldSeparators` is set on THIS CASE ONLY. Join-Path yields backslashes on
+    # Windows and forward slashes elsewhere, and what this case is about is that the
+    # id contributed no `..` and no separator of its own - not which slash the
+    # platform builds paths with. Asserting the raw string passed on the Linux runner
+    # and failed the moment these suites also ran on windows-latest. Folding EVERY
+    # case instead - which is what this did first - silently disabled the case above:
+    # a Get-PayloadTranscriptPath regression that returned the raw `C:\Users\…` form
+    # would be folded into the expected value and pass, while on Windows no IDE
+    # session would match '/antigravity-ide/' any more.
     @{ what = 'a traversal-shaped conversationId cannot escape the marker dir'
-       actual = $marker; expected = '/tmp/rogue-test-markers/etcpasswd.missed-prompt' }
+       actual = $marker; expected = '/tmp/rogue-test-markers/etcpasswd.missed-prompt'
+       foldSeparators = $true }
 )
 foreach ($c in $cases) {
-    if ($c.actual -eq $c.expected) { Write-Host "  ok: $($c.what)" }
+    $actual = [string]$c.actual
+    $expected = [string]$c.expected
+    if ($c.foldSeparators) { $actual = $actual -replace '\\', '/'; $expected = $expected -replace '\\', '/' }
+    if ($actual -eq $expected) { Write-Host "  ok: $($c.what)" }
     else { Write-Host "FAIL [$($c.what)]: expected <$($c.expected)> but got <$($c.actual)>"; $failures++ }
 }
 }

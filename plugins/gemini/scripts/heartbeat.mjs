@@ -11,7 +11,7 @@
 // the surface rides `agent` as "gemini_cli" (drives the dashboard version badge).
 
 import os from "node:os";
-import { loadEnvFiles, gitConfig, installId } from "./shared.mjs";
+import { EXT_ROOT, loadEnvFiles, gitConfig, installId } from "./shared.mjs";
 
 async function main() {
   const env = loadEnvFiles();
@@ -57,6 +57,35 @@ async function main() {
     });
   } catch {
     /* fire-and-forget */
+  }
+
+  // ── ship the hook log ──────────────────────────────────────────────────────
+  // AFTER the status POST, as in every other plugin: the heartbeat is what creates
+  // or refreshes the roster row an uploaded log attaches to, so this order means
+  // the server has somewhere to put the logs before they arrive.
+  //
+  // IN-PROCESS, unlike the sh and PowerShell callers, which spawn a child. Those
+  // have to: a sourced sh script shares every variable, and a PowerShell
+  // scriptblock resolves `$script:` against the caller's scope. An ESM module has
+  // neither problem - its scope is its own - and ship-logs.mjs only calls
+  // process.exit from the `argv[1] === this file` auto-run branch, which an import
+  // does not take. So this saves a whole node startup for free. This script is
+  // already spawned detached by hook.mjs, so nothing a user sees waits on it.
+  //
+  // THE ACTOR MUST BE PUT INTO process.env FIRST. It is resolved into module
+  // locals above (never process.env), and the shipper reads it from the
+  // environment because it deliberately has no cascade of its own - the plugins'
+  // cascades differ, so a re-resolve would key the log's source row differently
+  // from the roster row just posted and the logs would attach to nothing. Note
+  // loadEnvFiles() returns a merged object WITHOUT mutating process.env, which is
+  // exactly why this assignment is needed rather than assumed.
+  try {
+    process.env.ROGUE_ACTOR_EMAIL = email;
+    process.env.ROGUE_ACTOR_NAME = name || "";
+    const shipper = await import("./ship-logs.mjs");
+    await shipper.main([EXT_ROOT, "gemini", install.version, "gemini"]);
+  } catch {
+    /* a missing or broken shipper must never affect the heartbeat */
   }
 }
 

@@ -19,7 +19,12 @@ REPO="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SH="${SH:-sh}"
 FAILS=0
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/rogue-logtest.XXXXXX")"
-trap 'rm -rf "$TMPROOT"' EXIT INT TERM
+# Split, not one trap for all three: a bare `trap 'rm -rf …' INT` runs the handler
+# and then CONTINUES with the next statement, so a Ctrl-C would delete the fixtures
+# and let every remaining case run against them.
+trap 'rm -rf "$TMPROOT"' EXIT
+trap 'rm -rf "$TMPROOT"; exit 130' INT
+trap 'rm -rf "$TMPROOT"; exit 143' TERM
 
 pass() { echo "  ok: $1"; }
 fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }

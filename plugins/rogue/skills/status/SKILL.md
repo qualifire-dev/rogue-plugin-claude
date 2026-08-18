@@ -63,16 +63,20 @@ case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')"
   *desktop*) AGENT="Claude Code - Desktop" ;;
   *)         AGENT="Claude Code - CLI" ;;
 esac
-curl -s -w "\n%{http_code}" \
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+curl -s -w "\n%{http_code}" -X POST \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
-  -H "x-rogue-agent-family: claude" \
-  -H "x-rogue-agent: $AGENT" \
-  -H "x-rogue-agent-version: ${VER:-unknown}" \
-  -H "x-rogue-host: $(hostname)" \
-  -H "x-rogue-actor-email: ${ROGUE_ACTOR_EMAIL:-}" \
-  -H "x-rogue-actor-name: ${ROGUE_ACTOR_NAME:-}"
+  -H "Content-Type: application/json" \
+  -d "{\"agent_family\":\"claude\",\"agent\":\"$(esc "$AGENT")\",\"version\":\"${VER:-unknown}\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
 ```
+
+**A POST with a JSON body, not a GET with `x-rogue-agent-*` headers.** The route is
+`POST /hooks/status` and it validates `agent_family` from the body; the header form
+this command used to send was the pre-`/hooks/status` contract, so it reported a
+failure on a perfectly valid key. `heartbeat.sh` has always sent the body form — this
+is now the same shape, values escaped the same way, so a `/rogue:status` result and
+the background heartbeat can no longer disagree.
 
 Report from the JSON response (HTTP 200 = connected):
 
@@ -86,7 +90,10 @@ On failure suggest:
 - HTTP 401 → key invalid. Compare the resolved key tail (Step 1) against the
   [API keys dashboard](https://app.rogue.security/settings/api-keys); the
   precedence chain may be picking up a stale source — check Step 1's list.
-- HTTP 400 → unexpected (the `x-rogue-agent-family` header above should prevent it).
+- HTTP 400 → the JSON body was malformed or `agent_family` was missing; print the
+  body the command sent and compare it with `scripts/heartbeat.sh`.
+- HTTP 404 → the URL is wrong (a stale `ROGUE_BASE_URL`, or a path other than
+  `/api/v1/hooks/status`), not a credential problem.
 - No response → confirm network reachability to `api.rogue.security` (or `${ROGUE_BASE_URL}`).
 
 ## Step 3: Fetch configuration
@@ -147,6 +154,156 @@ If either is unset:
   headers until MDM provisioning completes. Force an enforcement run on your
   MDM (Kandji "Run library item now", `sudo jamf policy`).
 - **Individual user**: re-run `/rogue:setup` to populate identity.
+
+### Upload the log to Rogue support
+
+**Only run this if the user asks for it, or asks for help with a problem that
+needs the log read.** It uploads this machine's hook log to Rogue, where a
+support engineer can read it without an endpoint agent on the box.
+
+This normally needs no action at all: the log ships by itself in the background
+at session start, at most once every 15 minutes per file, resuming from wherever
+the last upload finished. Run it by hand only to push the newest lines *now*.
+
+**Uploading is off by default right now.** The receiving route is not deployed yet,
+so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
+is why every command below sets it explicitly. Once the route is live the default
+flips and the paragraph above applies unchanged.
+
+- macOS / Linux:
+```bash
+# CLAUDE_PLUGIN_ROOT is exported to HOOK processes, not to this shell, so the
+# script is located on disk the same way Step 1 locates the bundled env file.
+SHIP="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/scripts/ship-logs.sh}"
+if [ ! -r "$SHIP" ]; then
+  ROOT=$(grep -o '"installPath": *"[^"]*"' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null \
+           | sed 's/.*"\(\/[^"]*\)"$/\1/' | grep '/rogue/' | tail -1)
+  SHIP="${ROOT:+$ROOT/scripts/ship-logs.sh}"
+fi
+if [ ! -r "$SHIP" ]; then
+  # Last resort: newest under the plugin cache, skipping trees Claude Code has
+  # marked orphaned (an uninstalled marketplace leaves its extracted copy behind).
+  SHIP=$(ls -td "$HOME"/.claude/plugins/cache/*/rogue*/*/ 2>/dev/null | while IFS= read -r d; do
+    [ -e "$d/.orphaned_at" ] && continue
+    [ -r "$d/scripts/ship-logs.sh" ] && { printf '%s\n' "$d/scripts/ship-logs.sh"; break; }
+  done)
+fi
+if [ -r "$SHIP" ]; then
+  echo "using $SHIP"
+  ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 sh "$SHIP"
+else
+  echo "ship-logs.sh not found - list ~/.claude/plugins/cache/*/rogue*/ and report what is there"
+fi
+```
+- Windows (PowerShell):
+```powershell
+$ship = $null
+if ($env:CLAUDE_PLUGIN_ROOT) {
+  $candidate = Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts\ship-logs.ps1'
+  if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
+}
+if (-not $ship) {
+  # The same authoritative layer the bash form uses: the installPath Claude Code
+  # recorded for the plugin it actually installed. Test-Path first, -ErrorAction
+  # Stop inside, and a guard on every field - a missing file or a null property
+  # is a NON-terminating error, which try/catch does not suppress, so without
+  # these a red error prints in the operator's console before the fallback runs.
+  $registry = Join-Path $env:USERPROFILE '.claude\plugins\installed_plugins.json'
+  if (Test-Path -LiteralPath $registry) {
+    try {
+      $registryData = Get-Content -Raw -LiteralPath $registry -ErrorAction Stop |
+        ConvertFrom-Json -ErrorAction Stop
+      if ($registryData.plugins) {
+        $registryData.plugins.PSObject.Properties |
+          Where-Object { $_.Name -like 'rogue@*' } | ForEach-Object { $_.Value } | ForEach-Object {
+            if ($_.installPath) {
+              $candidate = Join-Path $_.installPath 'scripts\ship-logs.ps1'
+              if (Test-Path -LiteralPath $candidate) { $ship = $candidate }
+            }
+          }
+      }
+    } catch { }
+  }
+}
+if (-not $ship) {
+  $ship = Get-ChildItem (Join-Path $env:USERPROFILE '.claude\plugins') -Recurse -Filter ship-logs.ps1 -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like '*rogue*' -and
+                   -not (Test-Path -LiteralPath (Join-Path $_.Directory.Parent.FullName '.orphaned_at')) } |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $ship) { 'ship-logs.ps1 not found - list %USERPROFILE%\.claude\plugins and report what is there' }
+else {
+  "using $ship"
+  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  $env:ROGUE_SHIPPER_SCRIPT = $ship
+  # PASS THE ROOT. On a no-argument run the shipper self-locates its plugin root to
+  # read <root>\env, the FIRST file in the credential chain - and $PSCommandPath is
+  # EMPTY under [scriptblock]::Create, so it falls back to the current directory,
+  # which is the operator's cwd and has no env file. The bundled ROGUE_BASE_URL is
+  # then missed and identity can be absent entirely (outcome=skip reason=no-actor),
+  # on the one command support asks them to run. heartbeat.ps1 passes it for the
+  # same reason. The slug stays unset, which is what keeps this the
+  # collect-everything support invocation.
+  $env:ROGUE_SHIPPER_ROOT = Split-Path (Split-Path $ship -Parent) -Parent
+  $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+    '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT))) $env:ROGUE_SHIPPER_ROOT'))
+  Start-Process -FilePath 'powershell' -NoNewWindow -Wait `
+    -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded
+  # One run only. The bash form scopes these to a single command; setting them as
+  # session variables would leave later runs from this session with the 15-minute
+  # throttle waived and debug output on.
+  Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG, Env:ROGUE_SHIPPER_SCRIPT, Env:ROGUE_SHIPPER_ROOT -ErrorAction SilentlyContinue
+}
+```
+
+**Resolve the script, never assume `CLAUDE_PLUGIN_ROOT`.** That variable is
+exported to hook processes only — in the shell this command runs in it is empty,
+and `sh "/scripts/ship-logs.sh"` fails silently at exactly the moment support is
+trying to collect logs. Both forms use the same three layers, in order: the
+variable if something did set it, then the `installPath` recorded in
+`installed_plugins.json` (authoritative — it names the version actually
+installed), then the newest **non-orphaned** copy under
+`~/.claude/plugins/cache/`.
+
+**Which copy runs matters, so report the path it prints.** On a no-argument run
+the shipper self-locates its plugin root from its own script path and reads
+`<plugin-root>/env` as the *first* file in the credential chain, so a stale tree
+supplies credentials — and while a later `~/.rogue-env` overrides the API key,
+`setup.sh` writes no `ROGUE_BASE_URL`, so a stale base URL in an orphaned tree's
+bundled `env` would win and the upload would go to the wrong host. Hence all
+three layers prefer the installed tree and skip anything carrying Claude Code's
+`.orphaned_at` marker, and the command echoes the path it chose. This is also why
+"any copy will do" is wrong even though `ship-logs.sh` is byte-identical across
+the five sh plugins (`scripts/sync-shared-scripts.sh --check` enforces that): the
+*script* is interchangeable, the *tree it sits in* is not.
+
+**A child process, never in-process.** `ship-logs.ps1` ends in `exit 0`, so
+loading it into the current session would terminate *that* session — the one
+running this command — rather than the shipper. The script path travels as an
+environment variable and the command itself is a constant, so a plugin path
+containing a quote cannot alter it; `-EncodedCommand` because `-ArgumentList`
+quoting is unreliable on Windows PowerShell 5.1. This is the same shape
+`heartbeat.ps1` uses to start the shipper in the background.
+
+Run with **no arguments**, which is the support form: it uploads *every* agent's
+log found in the log directory, not just this one, which is usually what a
+support request needs on a machine with several coding agents. Each line is
+attributed by its own `provider=` token, so a mixed upload is still filed per
+agent.
+
+`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
+`ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
+`ROGUE_DEBUG=1` prints one line per upload so there is something to report back.
+Report what it prints. Expect **no output at all** when everything already
+shipped — that is success, not failure. Nothing is re-sent, because the upload
+resumes from a stored byte offset that only advances on a confirmed 2xx.
+
+Report failures as-is rather than retrying: `outcome=fail … http=401` is a bad
+API key (`/rogue:setup`), `http=000` is a network or proxy problem, and
+`outcome=skip reason=no-actor` means identity is unresolved (see the actor
+section above). `ROGUE_SHIP_LOGS=0` in any env file keeps uploading off even
+with the flag above, and stays off after the default flips.
+
 
 ## Step 5: Summary
 
