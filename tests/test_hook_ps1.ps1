@@ -211,6 +211,97 @@ if ($skill -notmatch [regex]::Escape("actor_email=[string]`$creds['ROGUE_ACTOR_E
     $script:fails++
 }
 
+# ── Test-WantAlert: the Cowork-only block-modal gate ───────────────────────
+# Twin of hook.sh's _rogue_want_alert (covered end-to-end in tests/test_hook_sh.sh).
+# The modal exists because Claude Cowork's client discards hook-authored text on
+# every documented channel, so the OS dialog is the only thing the user sees. The
+# CLI and the Desktop app render blocks natively and must never get one — a modal
+# there double-reports. These cases pin that split so a refactor cannot quietly
+# widen the blast radius to every surface, which is what c31ee5a removed.
+function Assert-Gate {
+    param([string]$InstallAgent, [string]$HookEvent, [bool]$Expected, [string]$Label)
+    $script:count++
+    $got = [bool](Test-WantAlert $InstallAgent $HookEvent)
+    if ($got -eq $Expected) {
+        Write-Host "  ok: $Label"
+    } else {
+        Write-Host "FAIL [$Label]: Test-WantAlert '$InstallAgent' '$HookEvent' = $got, expected $Expected"
+        $script:fails++
+    }
+}
+
+# Leave the environment as we found it — later assertions in this file read env.
+$savedRemote = $env:CLAUDE_CODE_REMOTE
+$savedAlert  = $env:ROGUE_ALERT
+$savedEvents = $env:ROGUE_ALERT_EVENTS
+$env:CLAUDE_CODE_REMOTE = $null; $env:ROGUE_ALERT = $null; $env:ROGUE_ALERT_EVENTS = $null
+
+# Cowork only. The surface id comes from the SAME cascade the roster uses
+# (CLAUDE_CODE_IS_COWORK first, then a *cowork* entrypoint), so the gate cannot
+# drift from install-id.sh / heartbeat.ps1.
+Assert-Gate 'claude_cowork'        'UserPromptSubmit' $true  'local Cowork fires the modal'
+Assert-Gate 'claude_cowork'        'PreToolUse'       $true  'local Cowork fires on a tool deny too'
+Assert-Gate 'claude_code'          'UserPromptSubmit' $false 'the CLI never gets a modal (renders blocks natively)'
+Assert-Gate 'claude_code_desktop'  'UserPromptSubmit' $false 'the Desktop app never gets a modal either'
+Assert-Gate ''                     'UserPromptSubmit' $false 'an unresolved surface gets no modal'
+
+# Cloud Cowork runs the hook in a headless Linux container: no GUI to reach, so it
+# is excluded explicitly rather than left to fail silently.
+$env:CLAUDE_CODE_REMOTE = 'true'
+Assert-Gate 'claude_cowork' 'UserPromptSubmit' $false 'cloud Cowork (CLAUDE_CODE_REMOTE=true) is excluded'
+$env:CLAUDE_CODE_REMOTE = $null
+
+# Kill switch.
+$env:ROGUE_ALERT = '0'
+Assert-Gate 'claude_cowork' 'UserPromptSubmit' $false 'ROGUE_ALERT=0 disables the modal'
+$env:ROGUE_ALERT = $null
+
+# Event allowlist: the escape hatch for narrowing to UserPromptSubmit (the one
+# event with no visible channel) without shipping a release.
+$env:ROGUE_ALERT_EVENTS = 'UserPromptSubmit'
+Assert-Gate 'claude_cowork' 'UserPromptSubmit' $true  'ROGUE_ALERT_EVENTS keeps a listed event'
+Assert-Gate 'claude_cowork' 'PreToolUse'       $false 'ROGUE_ALERT_EVENTS excludes an unlisted event'
+$env:ROGUE_ALERT_EVENTS = 'UserPromptSubmit PreToolUse'
+Assert-Gate 'claude_cowork' 'PreToolUse'       $true  'ROGUE_ALERT_EVENTS is space-separated'
+
+$env:CLAUDE_CODE_REMOTE = $savedRemote
+$env:ROGUE_ALERT        = $savedAlert
+$env:ROGUE_ALERT_EVENTS = $savedEvents
+
+# The dispatcher must relay the decision BEFORE launching the modal, and launch it
+# detached. Inline, a modal that waits for a click holds Claude's stdout pipe open
+# until dismissed; Claude times the hook out at 20s and FAILS OPEN, letting the
+# blocked prompt through. Its sh twin has an end-to-end regression test for this
+# (a hanging osascript stub); on this side the ordering is structural, so assert it
+# statically rather than not at all.
+$hookSrc = Get-Content -Raw -LiteralPath $hook
+$script:count++
+$emitIdx  = $hookSrc.IndexOf('Emit-Json $resp')
+$startIdx = $hookSrc.IndexOf('Start-Process -FilePath ' + [char]39 + 'powershell' + [char]39)
+if ($emitIdx -gt 0 -and $startIdx -gt $emitIdx) {
+    Write-Host "  ok: the response is relayed before the modal is launched"
+} else {
+    Write-Host "FAIL: modal launch is not strictly after Emit-Json (emit=$emitIdx start=$startIdx)"
+    $script:fails++
+}
+$script:count++
+if ($hookSrc -match [regex]::Escape('-WindowStyle Hidden')) {
+    Write-Host "  ok: the modal is launched detached and hidden, never inline"
+} else {
+    Write-Host "FAIL: modal is not launched via a detached hidden process"
+    $script:fails++
+}
+# -EncodedCommand, not -Command: Start-Process joins -ArgumentList with spaces and
+# does not quote elements, so a -Command scriptblock bootstrap reaches the child
+# mangled and silently never runs. A Base64 blob has no spaces.
+$script:count++
+if ($hookSrc -match [regex]::Escape("'-EncodedCommand'")) {
+    Write-Host "  ok: the modal bootstrap is passed as -EncodedCommand"
+} else {
+    Write-Host "FAIL: modal bootstrap must be -EncodedCommand, not -Command"
+    $script:fails++
+}
+
 if ($fails -gt 0) {
     Write-Host ""
     Write-Host "$fails of $count PowerShell unit test(s) FAILED."
