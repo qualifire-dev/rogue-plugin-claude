@@ -19,32 +19,15 @@ PLUGIN_ROOT="${PLUGIN_ROOT:-}"
 [ -n "${ROGUE_API_KEY:-}" ] || exit 0
 
 [ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
+# Host + version + surface. Shared with hook.sh, which sends the same three as
+# headers on every event: same values, same roster row. See install-id.sh.
+[ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
 
-# Plugin version from the manifest WITHOUT python3 (the /usr/bin/python3 stub
-# fails silently on a fresh macOS). grep/sed are always present.
-VER="unknown"
-PJ="${PLUGIN_ROOT}/.codex-plugin/plugin.json"
-if [ -r "$PJ" ]; then
-  v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" \
-        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-  [ -n "$v" ] && VER="$v"
-fi
-
-# Family is the fixed enum "openai"; the surface (codex_app|codex_cli) rides the
-# agent field. One table, in scripts/surface.sh, shared with hook.sh - which stamps
-# the same slug on each log line and sends it as x-rogue-agent. The literal is a
-# last-resort guard for a damaged install, not a second copy of the mapping.
-AGENT=""
-if [ -r "${PLUGIN_ROOT:-}/scripts/surface.sh" ]; then
-  . "${PLUGIN_ROOT}/scripts/surface.sh"
-  AGENT=$(codex_surface_slug 2>/dev/null)
-fi
-[ -n "$AGENT" ] || AGENT="codex_cli"
-
-HOST=$(hostname 2>/dev/null || echo unknown)
+# Family is the fixed enum "openai"; the surface rides the agent field.
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 BODY=$(printf '{"agent_family":"openai","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-  "$(esc "$AGENT")" "$(esc "$VER")" "$(esc "$HOST")" \
+  "$(esc "${ROGUE_INSTALL_AGENT:-codex_cli}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
+  "$(esc "${ROGUE_INSTALL_HOST:-unknown}")" \
   "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 
 curl -sS --max-time 10 -X POST \
@@ -68,7 +51,7 @@ curl -sS --max-time 10 -X POST \
 if [ -r "${PLUGIN_ROOT}/scripts/ship-logs.sh" ]; then
   ROGUE_ACTOR_EMAIL="${ROGUE_ACTOR_EMAIL:-}" ROGUE_ACTOR_NAME="${ROGUE_ACTOR_NAME:-}" \
     sh "${PLUGIN_ROOT}/scripts/ship-logs.sh" \
-      "${PLUGIN_ROOT}" codex "$VER" openai >/dev/null 2>&1 || true
+      "${PLUGIN_ROOT}" codex "${ROGUE_INSTALL_VERSION:-unknown}" openai >/dev/null 2>&1 || true
 fi
 
 exit 0

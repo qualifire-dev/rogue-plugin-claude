@@ -21,7 +21,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { HOME, SCRIPT_DIR, loadEnvFiles, gitConfig } from "./shared.mjs";
+import {
+  HOME,
+  SCRIPT_DIR,
+  SURFACE,
+  loadEnvFiles,
+  gitConfig,
+  installId,
+} from "./shared.mjs";
 
 const EVENT = process.argv[2] || "unknown";
 
@@ -36,8 +43,9 @@ const PROVIDER = "gemini";
 // A constant here: there is nothing to detect and nothing that can fail. It is
 // still emitted through the same conditional the multi-surface plugins use, so all
 // six dispatchers share one emit shape and an empty value omits the token entirely
-// rather than writing "surface=" or "surface=unknown".
-const SURFACE = "gemini_cli";
+// rather than writing "surface=" or "surface=unknown". Imported from shared.mjs
+// because installId() sends the same value as x-rogue-agent and heartbeat.mjs sends
+// it as the roster agent - one literal, three consumers.
 
 // ── Emit + exit ────────────────────────────────────────────────────────────
 // stdout must be ONLY the final JSON object. Always exit 0 — a blocking verdict
@@ -226,6 +234,14 @@ async function main() {
     "",
   );
   const url = env.ROGUE_API_URL || `${base}/api/v1/hooks/gemini`;
+  // Host + version + surface, resolved exactly as heartbeat.mjs does. Sent on
+  // every event so the fleet roster's row stays fresh between session starts,
+  // which are the only moments the heartbeat runs. See installId.
+  const install = installId();
+  // Still sent when degraded (never a hard failure — see installId), but an
+  // "unknown" host or version means this install reports itself imprecisely to
+  // the fleet roster, which is worth seeing in the hook log.
+  if (install.error) log(`error=install-id ${install.error}`);
 
   let bodyText = "{}";
   try {
@@ -237,6 +253,9 @@ async function main() {
         "x-rogue-event": EVENT,
         "x-rogue-actor-email": actor.email,
         "x-rogue-actor-name": actor.name,
+        "x-rogue-host": install.host,
+        "x-rogue-version": install.version,
+        "x-rogue-agent": install.agent,
       },
       body: payload,
       signal: AbortSignal.timeout(15000),

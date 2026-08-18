@@ -248,6 +248,36 @@ if (-not $actorEmail) {
     elseif ($env:USERNAME) { $actorEmail = $env:USERNAME } else { $actorEmail = $env:COMPUTERNAME }
 }
 
+# ── install identity: host + version ───────────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent ($surface
+# above), and until now only heartbeat.ps1 ever sent host and version, once, at
+# session start. A session still working a day later therefore aged out as
+# disconnected. Sending them as headers on EVERY event lets the backend refresh
+# this exact row from ordinary hook traffic. Resolved exactly as heartbeat.ps1
+# does (its sh sibling shares scripts/install-id.sh instead; PowerShell has no
+# such seam here). Any drift between the two is a duplicate roster row.
+$installError = @()
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
+if (-not $hostName) { $hostName = 'unknown'; $installError += 'host-unresolved' }
+
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $pluginRoot '.codex-plugin\plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $pluginJson), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+    if ($m.Success) { $pluginVersion = $m.Groups[1].Value }
+    # Manifest is there but carries no semver: schema drift, not a bad install.
+    else { $installError += "version-unparsed:$pluginJson" }
+} else {
+    $installError += "manifest-missing:$pluginJson"
+}
+# A degraded value is still SENT rather than failing the hook: it identifies the
+# install well enough to keep the roster fresh, and no liveness bookkeeping is
+# worth breaking a session over. But "unknown" in the roster is a real symptom,
+# so it is reported as an error once per event.
+if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
+
+
 # ── payload from stdin (recover UTF-8, strip BOM) ──────────────────────────
 $payload = [Console]::In.ReadToEnd()
 if (-not $payload) { $payload = '{}' }
@@ -264,6 +294,8 @@ $headers = @{
     'x-rogue-agent'       = $surface
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
 }
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 $resp = ''

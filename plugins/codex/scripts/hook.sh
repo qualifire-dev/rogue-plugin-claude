@@ -95,12 +95,14 @@ if [ -z "${ROGUE_API_KEY:-}" ]; then
 fi
 
 . "${PLUGIN_ROOT}/scripts/actor.sh"
-
-# SURFACE is already resolved above (scripts/surface.sh) and is reused verbatim for
-# the header, so the header, the log token and the roster row are one value. The
-# guard covers a damaged install where surface.sh was missing: the header has always
-# carried a surface and must keep carrying one, where the log token is optional.
-[ -n "$SURFACE" ] || SURFACE="codex_cli"
+# Host + version + surface, resolved exactly as heartbeat.sh does. Sent on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. See install-id.sh.
+. "${PLUGIN_ROOT}/scripts/install-id.sh"
+# A degraded value is still sent (never a hard failure — see install-id.sh), but
+# it is worth knowing about: an "unknown" host or version means this install
+# reports itself imprecisely to the fleet roster.
+[ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/openai}"
 
@@ -110,7 +112,9 @@ URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks
 RAW=$(curl -sS -X POST "$URL" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "x-rogue-event: $EVENT" \
-  -H "x-rogue-agent: $SURFACE" \
+  -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
+  -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+  -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
   -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
   -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
   -H 'Content-Type: application/json' \
