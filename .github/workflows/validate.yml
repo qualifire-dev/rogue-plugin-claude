@@ -81,6 +81,8 @@ jobs:
           set -euo pipefail
           TEST_SH=dash bash tests/test_actor_sh.sh
           TEST_SH=dash bash tests/test_install_id_sh.sh
+          TEST_SH=dash bash tests/test_status_skill_sh.sh
+          bash tests/test_gitignore_bundles.sh
 
       - name: PowerShell scripts parse
         # The .ps1 dispatchers are the Windows half of every plugin and cannot be

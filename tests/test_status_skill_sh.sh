@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Executes the bash block that skills/status/SKILL.md tells Claude to run, with
+# the network stubbed, and asserts what it would POST to /hooks/status.
+#
+# Why a test for a markdown file: /rogue:status does not just print — it upserts
+# a roster row, and the backend fingerprints that row on host|actor|family|agent.
+# So the block has to resolve the actor exactly as the hooks do. It used to post
+# ${ROGUE_ACTOR_*} straight out of the env files, which in a sandbox (or from a
+# bundle compiled before the cascade fix) is Anthropic's synthetic identity —
+# registering a second, wrongly-attributed row for the same install.
+set -u
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SKILL="$REPO/plugins/rogue/skills/status/SKILL.md"
+ACTOR="$REPO/plugins/rogue/scripts/actor.sh"
+SH="${TEST_SH:-sh}"
+fails=0
+
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+FAKE_HOME="$STAGE/home"
+PLUGIN="$FAKE_HOME/.claude/plugins/rogue-marketplace/rogue"
+mkdir -p "$PLUGIN/.claude-plugin" "$PLUGIN/scripts" "$STAGE/bin"
+printf '{\n  "name": "rogue",\n  "version": "9.9.9"\n}\n' > "$PLUGIN/.claude-plugin/plugin.json"
+cp "$ACTOR" "$PLUGIN/scripts/actor.sh"
+
+# The credential file a compiled bundle leaves behind, carrying the pre-seed that
+# poisons ROGUE_ACTOR_* with the sandbox's git identity.
+cat > "$STAGE/env.sh" <<'EOF'
+export ROGUE_API_KEY=rsk_test
+export ROGUE_ACTOR_EMAIL=noreply@anthropic.com
+export ROGUE_ACTOR_NAME=Claude
+EOF
+
+# curl stub: print the request so the test can assert on it, send nothing.
+cat > "$STAGE/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@"
+EOF
+chmod +x "$STAGE/bin/curl"
+
+# Pull the block out of the doc and point its hardcoded /tmp env path at ours,
+# so the test never reads or writes a real user's file.
+awk '/^```bash$/{inb=1; buf=""; next} /^```$/{if (inb && buf ~ /hooks\/status/) {printf "%s", buf; exit} inb=0} inb{buf = buf $0 "\n"}' \
+  "$SKILL" | sed 's|/tmp/rogue-source-env.sh|'"$STAGE"'/env.sh|' > "$STAGE/step2.sh"
+[ -s "$STAGE/step2.sh" ] || { echo "FAIL: could not extract the Step 2 bash block from SKILL.md"; exit 1; }
+"$SH" -n "$STAGE/step2.sh" || { echo "FAIL: extracted block is not valid POSIX sh"; exit 1; }
+
+run() { # run [VAR=VALUE ...] -> the stubbed request
+  env -i HOME="$FAKE_HOME" PATH="$STAGE/bin:$PATH" "$@" "$SH" "$STAGE/step2.sh" 2>&1
+}
+
+assert_has() { # assert_has <needle> <haystack> <desc>
+  case "$2" in
+    *"$1"*) echo "  ok: $3" ;;
+    *) echo "FAIL [$3]: expected to find <$1>"; fails=$((fails + 1)) ;;
+  esac
+}
+assert_lacks() {
+  case "$2" in
+    *"$1"*) echo "FAIL [$3]: found <$1>, which must not be sent"; fails=$((fails + 1)) ;;
+    *) echo "  ok: $3" ;;
+  esac
+}
+
+echo "status skill Step 2 ($SH)"
+
+# ── the poisoned env file must not reach the roster ────────────────────────
+out=$(run CLAUDE_CODE_USER_EMAIL=real.user@corp.com CLAUDE_CODE_IS_COWORK=1)
+assert_has  '"actor_email":"real.user@corp.com"' "$out" "actor email comes from the cascade, not the env file"
+assert_has  '"actor_name":"real.user"'           "$out" "actor name comes from the cascade"
+assert_lacks 'noreply@anthropic.com'             "$out" "poisoned ROGUE_ACTOR_EMAIL never posted"
+assert_lacks '"actor_name":"Claude"'             "$out" "poisoned ROGUE_ACTOR_NAME never posted"
+
+# ── the contract the route actually accepts ────────────────────────────────
+assert_has 'POST'                                "$out" "request is a POST"
+assert_has 'Content-Type: application/json'      "$out" "JSON content type sent"
+assert_has '"agent_family":"claude"'             "$out" "agent_family present (the route 400s without it)"
+assert_has '"version":"9.9.9"'                   "$out" "version read from the plugin manifest"
+assert_has '"agent":"claude_cowork"'             "$out" "Cowork surface id, matching install-id.sh"
+assert_lacks 'x-rogue-agent-family'              "$out" "no pre-JSON x-rogue-agent-* headers"
+
+# ── same block outside Cowork ──────────────────────────────────────────────
+out=$(run CLAUDE_CODE_ENTRYPOINT=cli)
+assert_has '"agent":"claude_code"'               "$out" "CLI surface id when not in Cowork"
+
+[ "$fails" -eq 0 ] || { echo "$fails failure(s)"; exit 1; }
+echo "all status skill tests passed"

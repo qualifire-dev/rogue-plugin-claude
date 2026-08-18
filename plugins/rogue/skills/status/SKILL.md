@@ -58,6 +58,18 @@ plugin version exists. The plugin version is read from the manifest without
 . /tmp/rogue-source-env.sh
 PJ=$(find "$HOME/.claude/plugins" -path '*rogue*/.claude-plugin/plugin.json' 2>/dev/null | head -1)
 VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+# Resolve the actor through the SAME cascade every hook uses, instead of posting
+# whatever the env files happen to hold. A bundle compiled before the cascade fix
+# pre-seeds ROGUE_ACTOR_* from `git config` at read time, which in a sandbox is
+# Anthropic's synthetic "Claude <noreply@anthropic.com>" — posting that raw would
+# register a roster row under the wrong actor, and the fingerprint is
+# host|actor|family|agent, so it would be a SECOND row for this install.
+PLUGIN_ROOT=$(dirname "$(dirname "$PJ")")
+if [ -r "$PLUGIN_ROOT/scripts/actor.sh" ]; then
+  . "$PLUGIN_ROOT/scripts/actor.sh"
+else
+  echo "WARNING: actor.sh not found under $PLUGIN_ROOT — reporting raw env values"
+fi
 # Surface id, mirroring scripts/install-id.sh: a stable snake_case id, not a
 # display label, because the backend resolves the latest release from this exact
 # value. CLAUDE_CODE_IS_COWORK is checked first — Cowork spawns Claude Code with
@@ -190,13 +202,45 @@ if ($pj) {
   $m = [regex]::Match((Get-Content -Raw -LiteralPath $pj.FullName), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
   if ($m.Success) { $ver = $m.Groups[1].Value }
 }
-$body = @{ agent_family='claude'; agent=$agent; version=$ver; host=$env:COMPUTERNAME; actor_email=[string]$creds['ROGUE_ACTOR_EMAIL']; actor_name=[string]$creds['ROGUE_ACTOR_NAME'] } | ConvertTo-Json -Compress
+# Resolve the actor through hook.ps1's own screen rather than trusting the env
+# files. A bundle compiled before the cascade fix pre-seeds ROGUE_ACTOR_* from
+# `git config` at read time, which in a sandbox is Anthropic's synthetic
+# "Claude <noreply@anthropic.com>"; posting that raw registers a roster row under
+# the wrong actor, and the row is fingerprinted on host|actor|family|agent.
+# ROGUE_PS_LIB_ONLY loads hook.ps1's helpers without running its dispatcher.
+$hookPs1 = Get-ChildItem "$env:USERPROFILE\.claude\plugins" -Recurse -Filter hook.ps1 -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -like '*rogue*' } | Select-Object -First 1
+$actorEmail = [string]$creds['ROGUE_ACTOR_EMAIL']; $actorName = [string]$creds['ROGUE_ACTOR_NAME']
+if ($hookPs1) {
+  $env:ROGUE_PS_LIB_ONLY = '1'; . $hookPs1.FullName; $env:ROGUE_PS_LIB_ONLY = $null
+  # Mirrors the cascade in hook.ps1 / heartbeat.ps1 — keep all three in step.
+  $hostMail  = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)
+  $actorName = Select-ActorValue @($creds['ROGUE_ACTOR_NAME'], (($hostMail -split '@')[0]))
+  if (-not $actorName) {
+    $gn = ''; try { $gn = (& git config --global user.name 2>$null | Out-String).Trim() } catch {}
+    $actorName = Select-ActorValue @($gn, $env:USERNAME, [Environment]::UserName)
+  }
+  if (-not $actorName) { $actorName = 'unknown' }
+  $actorEmail = Select-ActorValue @($creds['ROGUE_ACTOR_EMAIL'], $env:CLAUDE_CODE_USER_EMAIL)
+  if (-not $actorEmail) {
+    $ge = ''; try { $ge = (& git config --global user.email 2>$null | Out-String).Trim() } catch {}
+    $actorEmail = Select-ActorValue @($ge)
+  }
+  if (-not $actorEmail) {
+    $dns = ''; try { $dns = [System.Net.Dns]::GetHostName() } catch {}
+    $h = Select-ActorValue @($env:COMPUTERNAME, $dns)
+    if ($h) { $actorEmail = "unknown@$h" } else { $actorEmail = 'unknown' }
+  }
+} else {
+  'WARNING: hook.ps1 not found - reporting raw env values, which may be a sandbox identity'
+}
+$body = @{ agent_family='claude'; agent=$agent; version=$ver; host=$env:COMPUTERNAME; actor_email=$actorEmail; actor_name=$actorName } | ConvertTo-Json -Compress
 try {
   $r = Invoke-WebRequest -Uri "$base/api/v1/hooks/status" -Method Post -Headers @{ 'x-rogue-api-key'=$key } -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -UseBasicParsing -TimeoutSec 10
   "Connected (HTTP $($r.StatusCode)): $($r.Content)"
 } catch { "Status check failed: $($_.Exception.Message)" }
-"Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
-"Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
+"Actor email: $actorEmail"
+"Actor name:  $actorName"
 ```
 
 Interpret the JSON response and report the same fields as Step 2 (connected,
