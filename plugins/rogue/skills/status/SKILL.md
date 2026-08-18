@@ -58,27 +58,33 @@ plugin version exists. The plugin version is read from the manifest without
 . /tmp/rogue-source-env.sh
 PJ=$(find "$HOME/.claude/plugins" -path '*rogue*/.claude-plugin/plugin.json' 2>/dev/null | head -1)
 VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-# CLAUDE_CODE_IS_COWORK first: Cowork spawns Claude Code with
-# CLAUDE_CODE_ENTRYPOINT=local-agent, so the entrypoint cases alone would label a
-# Cowork install "Claude Code - CLI" (mirrors scripts/heartbeat.sh).
+# Surface id, mirroring scripts/install-id.sh: a stable snake_case id, not a
+# display label, because the backend resolves the latest release from this exact
+# value. CLAUDE_CODE_IS_COWORK is checked first — Cowork spawns Claude Code with
+# CLAUDE_CODE_ENTRYPOINT=local-agent, so the entrypoint cases alone would file a
+# Cowork install under the CLI surface.
 if [ -n "${CLAUDE_CODE_IS_COWORK:-}" ]; then
-  AGENT="Claude Cowork"
+  AGENT="claude_cowork"
 else
   case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-    *cowork*)  AGENT="Claude Cowork" ;;
-    *desktop*) AGENT="Claude Code - Desktop" ;;
-    *)         AGENT="Claude Code - CLI" ;;
+    *cowork*)  AGENT="claude_cowork" ;;
+    *desktop*) AGENT="claude_code_desktop" ;;
+    *)         AGENT="claude_code" ;;
   esac
 fi
-curl -s -w "\n%{http_code}" \
+# POST a JSON body, exactly as scripts/heartbeat.sh does: /hooks/status is
+# registered POST-only and validates body.agent_family, so the old GET with
+# x-rogue-agent-* headers could only ever fail. Escape each value so a name or
+# host containing " or \ can't break the JSON.
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+BODY=$(printf '{"agent_family":"claude","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
+  "$(esc "$AGENT")" "$(esc "${VER:-unknown}")" "$(esc "$(hostname 2>/dev/null || echo unknown)")" \
+  "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
+curl -s -w "\n%{http_code}" -X POST \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
-  -H "x-rogue-agent-family: claude" \
-  -H "x-rogue-agent: $AGENT" \
-  -H "x-rogue-agent-version: ${VER:-unknown}" \
-  -H "x-rogue-host: $(hostname)" \
-  -H "x-rogue-actor-email: ${ROGUE_ACTOR_EMAIL:-}" \
-  -H "x-rogue-actor-name: ${ROGUE_ACTOR_NAME:-}"
+  -H "Content-Type: application/json" \
+  -d "$BODY"
 ```
 
 Report from the JSON response (HTTP 200 = connected):
@@ -172,7 +178,19 @@ $key = $creds['ROGUE_API_KEY']
 if (-not $key) { 'API key: not resolved — run /rogue:setup'; return }
 'API key resolved: ...' + $key.Substring([Math]::Max(0,$key.Length-4))
 $base = if ($creds['ROGUE_BASE_URL']) { $creds['ROGUE_BASE_URL'].TrimEnd('/') } else { 'https://api.rogue.security' }
-$body = @{ agent_family='claude'; agent='Claude Code - CLI'; host=$env:COMPUTERNAME; actor_email=[string]$creds['ROGUE_ACTOR_EMAIL'] } | ConvertTo-Json -Compress
+$ep = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
+if ($env:CLAUDE_CODE_IS_COWORK)     { $agent = 'claude_cowork' }
+elseif ($ep -like '*cowork*')       { $agent = 'claude_cowork' }
+elseif ($ep -like '*desktop*')      { $agent = 'claude_code_desktop' }
+else                                { $agent = 'claude_code' }
+$pj = Get-ChildItem "$env:USERPROFILE\.claude\plugins" -Recurse -Filter plugin.json -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -like '*rogue*' } | Select-Object -First 1
+$ver = 'unknown'
+if ($pj) {
+  $m = [regex]::Match((Get-Content -Raw -LiteralPath $pj.FullName), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+  if ($m.Success) { $ver = $m.Groups[1].Value }
+}
+$body = @{ agent_family='claude'; agent=$agent; version=$ver; host=$env:COMPUTERNAME; actor_email=[string]$creds['ROGUE_ACTOR_EMAIL']; actor_name=[string]$creds['ROGUE_ACTOR_NAME'] } | ConvertTo-Json -Compress
 try {
   $r = Invoke-WebRequest -Uri "$base/api/v1/hooks/status" -Method Post -Headers @{ 'x-rogue-api-key'=$key } -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -UseBasicParsing -TimeoutSec 10
   "Connected (HTTP $($r.StatusCode)): $($r.Content)"
