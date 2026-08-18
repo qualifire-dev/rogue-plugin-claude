@@ -32,10 +32,21 @@ if [ -z "${ROGUE_API_KEY:-}" ]; then
 fi
 
 . "${CLAUDE_PLUGIN_ROOT}/scripts/actor.sh"
+# Host + version + surface label, resolved exactly as heartbeat.sh does. Sent on
+# every event so the fleet roster's row stays fresh between session starts, which
+# are the only moments the heartbeat runs. See install-id.sh.
+. "${CLAUDE_PLUGIN_ROOT}/scripts/install-id.sh"
+# A degraded value is still sent (never a hard failure — see install-id.sh), but
+# it is worth knowing about: an "unknown" host or version means this install
+# reports itself imprecisely to the fleet roster.
+[ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
 
 RESP=$(curl -sS -X POST "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/claude" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "x-rogue-event: $EVENT" \
+  -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
+  -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+  -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
   -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
   -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
   -H 'Content-Type: application/json' \

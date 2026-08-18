@@ -567,6 +567,25 @@ load_actor() {
   return 0
 }
 
+# ROGUE_INSTALL_HOST / ROGUE_INSTALL_VERSION (shared with heartbeat.sh) plus the
+# surface, which only this script can resolve — it reads the event's
+# transcriptPath, exactly as the heartbeat's is derived. Sent as headers on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. Called after read_body: the surface needs
+# the payload.
+load_install_id() {
+  [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+  # A degraded value is still sent (never a hard failure — see install-id.sh), but
+  # it is worth knowing about: an "unknown" host or version means this install
+  # reports itself imprecisely to the fleet roster.
+  [ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
+  ROGUE_INSTALL_AGENT=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  # Unattributable payload: default to the 2.0 app, the same guess the backend's
+  # parser makes, so the roster row matches the events it stores.
+  [ -n "$ROGUE_INSTALL_AGENT" ] || ROGUE_INSTALL_AGENT="antigravity"
+  return 0
+}
+
 # Buffer stdin so we can enrich it (PreInvocation/PostInvocation/Stop) before
 # POSTing.
 read_body() {
@@ -583,12 +602,17 @@ read_body() {
 # surfaceFromTranscript). heartbeat.sh alone can only guess from the filesystem,
 # and on a machine with more than one installed it guesses wrong — collapsing
 # every surface into one roster row.
+# Pass the SAME surface the event headers carry (load_install_id, which runs
+# first), never a freshly-derived one. An unattributable payload yields an empty
+# surface, and heartbeat.sh's own fallback then sniffs the filesystem and picks
+# antigravity_cli whenever `agy` is installed — so this event would report
+# `antigravity` while its heartbeat reported `antigravity_cli`, and one install
+# would own two roster rows. One resolution, one row.
 maybe_heartbeat() {
   [ "$EVENT" = "PreInvocation" ] || return 0
   case "$BODY" in
     *'"invocationNum":0'*|*'"invocationNum": 0'*)
-      _hb_agent=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
-      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$_hb_agent" >/dev/null 2>&1 & ) ;;
+      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$ROGUE_INSTALL_AGENT" >/dev/null 2>&1 & ) ;;
   esac
 }
 
@@ -654,6 +678,9 @@ post_and_relay() {
     -H "x-rogue-event: $EVENT" \
     -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
     -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+    -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+    -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
+    -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
     "$@" \
     -H 'Content-Type: application/json' \
     --data-binary @- --max-time 15 -w '\n%{http_code}')
@@ -689,6 +716,7 @@ main() {
   require_api_key        # exits before stdin is read when there is no key
   load_actor
   read_body
+  load_install_id
 
   maybe_heartbeat
   # Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON
