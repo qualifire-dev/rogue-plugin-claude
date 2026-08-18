@@ -43,11 +43,59 @@ PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
 [ -r /etc/rogue/env ]       && . /etc/rogue/env
 [ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
 
-ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+# Log destination — ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a
+# machine running Copilot CLI + Claude Code + Cursor + … used to interleave all of
+# them into a single hook.log with no way to tell whose line was whose.
+# Precedence: explicit file → directory override → per-agent default.
+ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/copilot.log}"
+# Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+# generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+# rotation; a NON-NUMERIC value falls back to this default, so a typo can
+# never leave the log growing unbounded. Enforced on the WRITE PATH rather
+# than by a periodic job because an UNCONFIGURED install writes a line per
+# event and never runs anything else - a cap enforced anywhere else would
+# not hold.
+ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
+# Clamp per the rule above: anything non-numeric becomes the default.
+case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
+# An all-digit value can still overflow the shell's integer type: dash answers
+# `[ "$cap" -gt 0 ]` with "Illegal number" on stderr and a FALSE, which reads
+# as "rotation disabled" and lets the log grow unbounded. Node has the same
+# bug through Number() -> Infinity; PowerShell is the only one that already
+# lands on the default, and only because its cast error is silenced. All
+# three clamp explicitly now. 18 digits is the widest value guaranteed to fit
+# a signed 64-bit int; leading zeros are stripped first so "000...0" still
+# reads as the rotation-disabling zero.
+_lcap="$ROGUE_LOG_MAX_BYTES"
+while [ "${_lcap#0}" != "$_lcap" ]; do _lcap="${_lcap#0}"; done
+if [ "${#_lcap}" -gt 18 ]; then ROGUE_LOG_MAX_BYTES=10485760; fi
+# NOTE: `_lsz` is not function-local (POSIX sh has no `local`) but is used
+# NOWHERE else in this file — unlike `_p`/`_n`, which are shared (see below).
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
 log() {
-  mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
-  printf '%s provider=github_copilot event=%s %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
+  # 0700 dir / 0600 file. The logged text is not only ours: it carries the
+  # server's block reason, which quotes the content that tripped the rule - a
+  # secret, a command, a slice of a prompt. Under the default umask the log
+  # lands 0644 and every other account on the box can read it. The umask
+  # applies to what THIS call creates, so a 0644 log from an older version
+  # keeps its mode; Windows needs no counterpart, since another standard user
+  # cannot read %USERPROFILE% to begin with.
+  ( umask 077
+    mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+    rotate_log
+    printf '%s provider=copilot event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 

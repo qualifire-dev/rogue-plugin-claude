@@ -72,17 +72,80 @@ curl -s -H "x-rogue-api-key: $ROGUE_API_KEY" \
 Parse and display: **Mode** (`settings.mode`), **Fail-open** (`settings.failOpen`),
 and each **ruleset** in `rulesets` (name, category, mode, severity).
 
-## Step 4: Confirm hooks are trusted
+## Step 4: Show the recent hook log
+
+Each Rogue plugin logs to its **own** file under `~/.rogue/logs/`, so this reads
+`codex.log` only — a sibling agent's activity lives in `claude.log`, `cursor.log`,
+and so on. `<file>.1` is the previous rotation, if any.
+
+```bash
+# Same precedence as the dispatcher: the env files first (system, then per-user),
+# with the process environment winning over both. Read with sed, never by
+# sourcing - a status command must not execute an env file. Reading only
+# $ROGUE_LOG_* would report "no activity" on exactly the machines that relocate
+# their logs by policy, which are the ones support is called about.
+rogue_log_var() {
+  v=$(sed -n "s/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}$1=//p" \
+        /etc/rogue/env "$HOME/.rogue-env" 2>/dev/null | tail -1 | sed "s/^['\"]//;s/['\"]$//")
+  eval "p=\${$1:-}"
+  [ -n "$p" ] && v=$p
+  printf '%s' "$v"
+}
+log=$(rogue_log_var ROGUE_LOG_FILE)
+if [ -z "$log" ]; then
+  dir=$(rogue_log_var ROGUE_LOG_DIR)
+  [ -n "$dir" ] || dir="$HOME/.rogue/logs"
+  log="$dir/codex.log"
+fi
+echo "Log: $log"
+tail -n 20 "$log" 2>/dev/null || echo "(no hook log yet)"
+```
+
+On Windows, resolve the same precedence before reading:
+
+```powershell
+$logCfg = @{}
+# Mirror the dispatcher's chain: C:\ProgramData\rogue\env (MDM) then
+# %USERPROFILE%\.rogue-env, with the process environment winning over both.
+# Parsed with a regex, never executed - a status command must not run an env
+# file. Reading only $env: would report "no activity" on exactly the machines
+# that relocate their logs by policy, which are the ones support is called about.
+foreach ($f in @('C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
+  if (-not (Test-Path -LiteralPath $f)) { continue }
+  foreach ($line in (Get-Content -LiteralPath $f)) {
+    if ($line -match '^\s*(?:export\s+)?(ROGUE_LOG_FILE|ROGUE_LOG_DIR)=(.+)$') {
+      $logCfg[$Matches[1]] = $Matches[2].Trim() -replace "^'(.*)'$",'$1' -replace '^"(.*)"$','$1'
+    }
+  }
+}
+foreach ($v in 'ROGUE_LOG_FILE','ROGUE_LOG_DIR') {
+  $pv = [Environment]::GetEnvironmentVariable($v)
+  if ($pv) { $logCfg[$v] = $pv }
+}
+$logPath = $logCfg['ROGUE_LOG_FILE']
+if (-not $logPath) {
+  $logDir = $logCfg['ROGUE_LOG_DIR']
+  if (-not $logDir) { $logDir = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'logs' }
+  $logPath = Join-Path $logDir 'codex.log'
+}
+"Log: $logPath"
+Get-Content -Tail 20 $logPath -ErrorAction SilentlyContinue
+```
+
+A `ROGUE_LOG_DIR` set in `~/.rogue-env` or `C:\ProgramData\rogue\env` also wins over
+the default — check those files if this shows no activity on a healthy connection.
+
+## Step 5: Confirm hooks are trusted
 
 Remind the user that Codex skips untrusted command hooks. If no events are showing
 up in the dashboard, open `/hooks` in Codex and trust the Rogue entries.
 
-## Step 5: Summary
+## Step 6: Summary
 
 Present a clean summary: credential sources, connection status, mode + ruleset
 count, actor identity (`${ROGUE_ACTOR_EMAIL}` / `${ROGUE_ACTOR_NAME}`).
 
-## Step 6: False-positive escape hatch
+## Step 7: False-positive escape hatch
 
 > **Was a prompt blocked by mistake?** Prepend `rgx!` to your next prompt and
 > resubmit. Rogue allows that one prompt and marks the previous detection as a

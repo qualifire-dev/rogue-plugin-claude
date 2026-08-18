@@ -25,10 +25,11 @@ import { HOME, SCRIPT_DIR, loadEnvFiles, gitConfig, installId } from "./shared.m
 
 const EVENT = process.argv[2] || "unknown";
 
-// Surface label stamped on every log line. The hook log (~/.rogue/hook.log) is
-// SHARED with the Claude/Codex/Cursor plugins, so this token is what lets you
-// tell whose events a line belongs to when reading the merged file.
-const PROVIDER = "gemini_cli";
+// Agent slug: names this plugin's log file AND is stamped on every line inside
+// it. Deliberately the plugin's common name, NOT the roster's `agent` label
+// ("gemini_cli", which the server keys its version lookup on) — see
+// heartbeat.mjs. Keep the two independent.
+const PROVIDER = "gemini";
 
 // ── Emit + exit ────────────────────────────────────────────────────────────
 // stdout must be ONLY the final JSON object. Always exit 0 — a blocking verdict
@@ -38,17 +39,79 @@ function emit(obj) {
   process.exit(0);
 }
 
+// ── Resolved configuration ───────────────────────────────────────────────────
+// Read the env files ONCE, here at module load, because the log destination below
+// is derived from them. `loadEnvFiles()` returns a MERGED OBJECT and deliberately
+// does not mutate `process.env`, so reading `process.env.ROGUE_LOG_DIR` directly
+// would silently ignore `~/.rogue-env` / `/etc/rogue/env` — the exact bug this
+// replaced. Precedence inside the merge: bundled env → MDM → per-user, then
+// process env wins (see shared.mjs).
+// Wrapped: a throw here would kill the hook before it could emit anything, and
+// Gemini must always get a body. An empty env degrades to "unconfigured".
+let ENV = {};
+try {
+  ENV = loadEnvFiles();
+} catch {
+  /* fail-open: no credentials and no overrides */
+}
+
 // ── Logging (file only; stdout is reserved for Gemini) ───────────────────────
-const LOG_FILE =
-  process.env.ROGUE_LOG_FILE || path.join(HOME, ".rogue", "hook.log");
+// ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a machine running
+// Gemini CLI + Claude Code + Cursor + … used to interleave all of them into a
+// single hook.log with no way to tell whose line was whose. Precedence:
+// explicit file → directory override → per-agent default.
+const LOG_DIR = ENV.ROGUE_LOG_DIR || path.join(HOME, ".rogue", "logs");
+const LOG_FILE = ENV.ROGUE_LOG_FILE || path.join(LOG_DIR, `${PROVIDER}.log`);
+// Size cap. Over it, the current log is renamed to <file>.1 (exactly one
+// generation kept, so worst case on disk is 2x this). A NUMERIC ZERO disables
+// rotation; a NON-NUMERIC value falls back to the default rather than disabling
+// it, so a typo can never leave the log growing unbounded. `Number("00") === 0`,
+// so any zero-padded zero disables too — matching the sh dispatchers' `-gt 0`
+// test and PowerShell's [int64]::TryParse.
+// Enforced on the WRITE PATH and not by a periodic job on purpose: an
+// UNCONFIGURED install writes a line per event and never runs anything else, so
+// a cap enforced anywhere else would not hold.
+//
+// isSafeInteger, not a bare Number(): an all-digit value can be far too wide to
+// represent, and Number() turns those into Infinity, which no file size ever
+// reaches — rotation would be silently off and the log would grow unbounded.
+// An unrepresentable value is a typo, so it takes the default like a
+// non-numeric one. The sh dispatchers clamp at 18 digits against the identical
+// bug (dash calls it an "Illegal number" and answers FALSE); PowerShell already
+// landed on the default because its cast error is silenced, and uses TryParse
+// so that is stated rather than accidental.
+const LOG_MAX_BYTES = (() => {
+  const n = /^\d+$/.test(ENV.ROGUE_LOG_MAX_BYTES ?? "")
+    ? Number(ENV.ROGUE_LOG_MAX_BYTES)
+    : NaN;
+  return Number.isSafeInteger(n) ? n : 10 * 1024 * 1024;
+})();
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/g;
 const sanitize = (s) => String(s ?? "").replace(CONTROL_CHARS, "");
+function rotateLog() {
+  if (LOG_MAX_BYTES <= 0) return;
+  try {
+    if (fs.statSync(LOG_FILE).size >= LOG_MAX_BYTES) {
+      fs.renameSync(LOG_FILE, `${LOG_FILE}.1`);
+    }
+  } catch {
+    /* no file yet, or rotation lost a race — either way just append */
+  }
+}
 function log(msg) {
   try {
-    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    // 0700 dir / 0600 file, matching the `umask 077` the sh dispatchers use.
+    // The log carries the server's block reason, which quotes the content that
+    // tripped the rule, so it must not land 0644 where every other account on
+    // the box can read it. `mode` applies only when this call CREATES the path,
+    // so an existing log from an older version keeps its mode (and Windows
+    // ignores it, which is fine: another standard user cannot read the profile
+    // directory anyway).
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true, mode: 0o700 });
+    rotateLog();
     const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    fs.appendFileSync(LOG_FILE, `${ts} provider=${PROVIDER} event=${EVENT} ${msg}\n`);
+    fs.appendFileSync(LOG_FILE, `${ts} provider=${PROVIDER} event=${EVENT} ${msg}\n`, { mode: 0o600 });
   } catch {
     /* logging is best-effort */
   }
@@ -117,7 +180,9 @@ function readStdin() {
 }
 
 async function main() {
-  const env = loadEnvFiles();
+  // Already merged at module load (the log destination depends on it) — reuse it
+  // rather than re-reading the same three files.
+  const env = ENV;
   const apiKey = env.ROGUE_API_KEY || "";
 
   // SessionStart: fire the detached roster heartbeat, then fall through to POST

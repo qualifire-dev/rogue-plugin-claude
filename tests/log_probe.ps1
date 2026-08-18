@@ -1,0 +1,62 @@
+# Helper for tests/test_hook_logs.ps1 — NOT a test on its own.
+#
+# Dot-sources ONE dispatcher through its ROGUE_PS_LIB_ONLY seam (which loads the
+# logging helpers without running the hook), calls Initialize-Logging with a
+# caller-supplied credential map, optionally pre-seeds the log file to force a
+# rotation, calls Log once, and prints KEY=value facts for the parent to assert
+# on. Run in a child pwsh per case so the five dispatchers' identically named
+# functions ($logFile, Log, Rotate-Log) can never collide in one session.
+#
+# -Creds takes JSON rather than a hashtable because it crosses a process boundary.
+# It stands in for the merged map each dispatcher builds from
+# <root>/env → /etc/rogue|ProgramData → ~/.rogue-env → process env: the point of
+# the test is that Initialize-Logging reads THAT map, not $env: directly, which is
+# what lets an env file relocate the log on Windows.
+param(
+    [Parameter(Mandatory)][string]$Dispatcher,   # path to a hook.ps1
+    [string]$EventName = 'PreToolUse',
+    [string]$CredsJson = '{}',                   # JSON object of ROGUE_* values
+    [int]$SeedBytes = 0,                         # >0: pre-fill the log
+    [string]$SeedPrevious = ''                   # non-empty: also create <log>.1
+)
+
+# Parse BEFORE dot-sourcing, and never name this parameter `$Creds`: dot-sourcing
+# runs the dispatcher in THIS scope, and hook.ps1 (antigravity) declares a
+# file-scope `$creds = @{}`. PowerShell variable names are case-INSENSITIVE, so
+# that assignment would silently overwrite our own parameter with an empty
+# hashtable and every override in it would vanish.
+$map = @{}
+foreach ($p in (ConvertFrom-Json $CredsJson).PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
+
+$env:ROGUE_PS_LIB_ONLY = '1'
+. $Dispatcher $EventName
+
+Initialize-Logging $map
+
+"LOGFILE=$logFile"
+"CAP=$logMaxBytes"
+if (-not $logFile) { return }
+
+New-Item -ItemType Directory -Path (Split-Path $logFile) -Force | Out-Null
+if ($SeedPrevious) {
+    Set-Content -LiteralPath "$logFile.1" -Value $SeedPrevious -NoNewline
+}
+if ($SeedBytes -gt 0) {
+    # -NoNewline so the byte count is exact; rotation compares against Length.
+    Set-Content -LiteralPath $logFile -Value ('s' * $SeedBytes) -NoNewline
+}
+Log 'outcome=probe'
+
+$lines = @(Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue)
+"LINES=$($lines.Count)"
+"LAST=$($lines[-1])"
+"ROTATED=$(Test-Path -LiteralPath ($logFile + '.1'))"
+if (Test-Path -LiteralPath "$logFile.1") {
+    "PREVIOUS=$((Get-Content -Raw -LiteralPath "$logFile.1") -replace '\s+$','')"
+}
+# First three bytes, so the parent can assert there is no UTF-8 BOM (EF BB BF).
+# Windows PowerShell 5.1's `Add-Content -Encoding UTF8` writes one on create,
+# which would corrupt the first record of every new/rotated log.
+$bytes = [System.IO.File]::ReadAllBytes($logFile)
+$head = if ($bytes.Length -ge 3) { $bytes[0..2] } else { $bytes }
+"HEAD=$(($head | ForEach-Object { $_.ToString('X2') }) -join ' ')"

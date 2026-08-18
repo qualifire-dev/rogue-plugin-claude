@@ -28,6 +28,8 @@
 # empty body all yield `{}` on stdout, exit 0. Cursor
 # must never block because Rogue infrastructure is unavailable.
 #
+# Logs every invocation to $ROGUE_LOG_FILE (default ~/.rogue/logs/cursor.log).
+#
 # Credential resolution (later file wins; process env wins over all):
 #   1. ${CURSOR_PLUGIN_ROOT}/env   (baked into a compiled customer plugin)
 #   2. /etc/rogue/env              (MDM-provisioned)
@@ -89,9 +91,72 @@ done
 [ -n "$_penv_ROGUE_ACTOR_NAME" ]  && ROGUE_ACTOR_NAME="$_penv_ROGUE_ACTOR_NAME"
 [ -n "$_penv_ROGUE_BASE_URL" ]    && ROGUE_BASE_URL="$_penv_ROGUE_BASE_URL"
 
+# ── hook log ───────────────────────────────────────────────────────────────
+# `dbg` above only writes to stderr under ROGUE_DEBUG, which Cursor keeps in its
+# own per-session log — useless for after-the-fact diagnosis and unavailable to
+# /rogue:status. So every invocation also gets one durable line here, matching the
+# other Rogue plugins' format: "<ts> provider=cursor event=<E> <k=v>".
+#
+# ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a single hook.log
+# would interleave Cursor with Claude Code / Codex / … and lose attribution.
+# Precedence: explicit file → directory override → per-agent default. Resolved
+# AFTER the env files are sourced, so `~/.rogue-env` can set either.
+ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/cursor.log}"
+# Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+# generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+# rotation; a NON-NUMERIC value falls back to this default, so a typo can
+# never leave the log growing unbounded. Enforced on the WRITE PATH rather
+# than by a periodic job because an UNCONFIGURED install writes a line per
+# event and never runs anything else - a cap enforced anywhere else would
+# not hold.
+ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
+# Clamp per the rule above: anything non-numeric becomes the default.
+case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
+# An all-digit value can still overflow the shell's integer type: dash answers
+# `[ "$cap" -gt 0 ]` with "Illegal number" on stderr and a FALSE, which reads
+# as "rotation disabled" and lets the log grow unbounded. Node has the same
+# bug through Number() -> Infinity; PowerShell is the only one that already
+# lands on the default, and only because its cast error is silenced. All
+# three clamp explicitly now. 18 digits is the widest value guaranteed to fit
+# a signed 64-bit int; leading zeros are stripped first so "000...0" still
+# reads as the rotation-disabling zero.
+_lcap="$ROGUE_LOG_MAX_BYTES"
+while [ "${_lcap#0}" != "$_lcap" ]; do _lcap="${_lcap#0}"; done
+if [ "${#_lcap}" -gt 18 ]; then ROGUE_LOG_MAX_BYTES=10485760; fi
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
+log() {
+  # 0700 dir / 0600 file. The logged text is not only ours: it carries the
+  # server's block reason, which quotes the content that tripped the rule - a
+  # secret, a command, a slice of a prompt. Under the default umask the log
+  # lands 0644 and every other account on the box can read it. The umask
+  # applies to what THIS call creates, so a 0644 log from an older version
+  # keeps its mode; Windows needs no counterpart, since another standard user
+  # cannot read %USERPROFILE% to begin with.
+  ( umask 077
+    mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+    rotate_log
+    printf '%s provider=cursor event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+}
+# Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
+# can carry anything), and a raw newline or CR would forge extra log lines.
+sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+
 API_KEY="${ROGUE_API_KEY:-}"
 if [ -z "$API_KEY" ]; then
   dbg "no API key after cred resolution -> fail-open"
+  log "outcome=unconfigured"
   if [ "$event" = "sessionStart" ]; then
     printf '%s' '{"additional_context": "Rogue Security plugin is installed but not configured. Run /rogue:setup to connect your API key."}'
   else
@@ -303,7 +368,9 @@ if [ "$event" = "preToolUse" ]; then
 fi
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
-command -v curl >/dev/null 2>&1 || { dbg "curl not found -> {}"; printf '{}'; exit 0; }
+command -v curl >/dev/null 2>&1 || {
+  dbg "curl not found -> {}"; log "outcome=fail-open reason=no-curl"; printf '{}'; exit 0
+}
 
 URL="$BASE_URL/api/v1/hooks/cursor"
 dbg "POST $URL actor=$actor_email"
@@ -321,6 +388,10 @@ RESP="$(printf '%s' "$PAYLOAD" | curl -fsS --max-time 10 -X POST \
   -H 'x-rogue-agent: cursor' \
   --data-binary @- "$URL" 2>/dev/null)"; _rc=$?
 dbg "curl rc=$_rc resp_len=${#RESP}"
+# Always log the raw response head so a relay/decision bug is diagnosable from
+# the hook log alone, without re-instrumenting the script. `-f` means a non-zero
+# rc is either a transport failure or an HTTP >= 400, and curl printed nothing.
+log "rc=$_rc raw=$(sanitize "$RESP" | head -c 400)"
 [ "$_rc" -eq 0 ] || RESP=""
 
 # ── presence heartbeat (sessionStart only, fire-and-forget) ────────────────
@@ -338,6 +409,8 @@ if [ "$event" = "sessionStart" ]; then
   HB_BODY=$(printf '{"agent_family":"cursor","agent":"cursor","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
     "$(hb_esc "$plugin_version")" "$(hb_esc "$host")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
   dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$plugin_version host=$host"
+  # Detached, so its HTTP outcome is unobservable — record only that it fired.
+  log "heartbeat=fired ver=$plugin_version"
   ( curl -fsS --max-time 10 -X POST \
       -H 'Content-Type: application/json' \
       -H "x-rogue-api-key: $API_KEY" \

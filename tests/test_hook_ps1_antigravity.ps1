@@ -80,14 +80,20 @@ if (Test-Section 'parse') {
 
 # ── 2. every write to shared state is $script:-qualified ───────────────────
 if (Test-Section 'scope') {
-$shared = @(
-    'logFile', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail', 'payload',
-    'subagentId', 'subagentName', 'brainDir', 'submapDir', 'payloadTp',
-    'isIdeSurface', 'PluginRoot',
-    # heartbeat.ps1's own shared state
-    'pluginRoot', 'baseUrl', 'ver', 'agent'
-)
+# Shared state is PER FILE. One combined list produced false positives: `baseUrl`
+# is shared state in heartbeat.ps1 but a function-LOCAL scratch value inside
+# hook.ps1's Resolve-Url (only $script:url escapes it), so a global list demanded
+# a `$script:` prefix that would have been actively misleading there.
+$sharedByFile = @{
+    'hook.ps1' = @(
+        'logFile', 'logMaxBytes', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail',
+        'payload', 'subagentId', 'subagentName', 'brainDir', 'submapDir', 'payloadTp',
+        'isIdeSurface', 'PluginRoot'
+    )
+    'heartbeat.ps1' = @('pluginRoot', 'baseUrl', 'ver', 'agent', 'creds', 'apiKey')
+}
 foreach ($file in $structural) {
+$shared = $sharedByFile[(Split-Path $file -Leaf)]
 $unscoped = @()
 # Materialised with @(): FindAll returns a lazy enumerable, and nesting a second
 # walk inside the first one's iteration silently yields null elements.
