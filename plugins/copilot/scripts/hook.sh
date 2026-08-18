@@ -449,6 +449,35 @@ case "$EVENT" in
   agentStop|subagentStop) BODY="$(augment_with_transcript "$BODY")" ;;
 esac
 
+# ── per-turn presence heartbeat + log ship (agentStop only) ────────────────
+# sessionStart's heartbeat is spawned by hooks.json; this is its per-TURN twin, and
+# it is fired from HERE rather than from a second hooks.json entry on purpose:
+# Copilot skips untrusted command hooks until the user reviews them via /hooks, so
+# adding an entry would silently disable every Rogue hook on every existing install
+# until each user re-approved. The dispatcher already runs on agentStop, so this
+# leaves the command strings byte-identical and trust intact.
+#
+# It exists because a session left open for days used to produce exactly one beacon
+# and one log upload for its whole lifetime - the roster row went stale and the hook
+# log sat on disk unshipped. heartbeat.sh throttles the beacon itself
+# (scripts/beacon.sh, 900s default) and the shipper throttles itself, so a per-turn
+# trigger is not a per-turn request.
+#
+# MAIN AGENT ONLY. Copilot fires agentStop for a subagent too (with sessionId
+# `toolu_…`), and SUBAGENT_ID is set by the time we get here, so this skips those:
+# a subagent's stop is not a user turn, and one turn using three subagents would
+# otherwise queue four beacons that the throttle then has to absorb.
+#
+# DETACHED double-fork with every fd redirected. This is the synchronous dispatcher
+# and Copilot is waiting on our stdout, so nothing here may be awaited - and stdin is
+# closed because the child must not touch the buffered event. heartbeat.sh
+# self-locates its plugin root from $0, exactly as this script does, so there is
+# nothing to pass but the trigger.
+if [ "$EVENT" = "agentStop" ] && [ -z "$SUBAGENT_ID" ] &&
+   [ -r "${PLUGIN_ROOT}/scripts/heartbeat.sh" ]; then
+  ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" agentStop </dev/null >/dev/null 2>&1 & )
+fi
+
 # Capture body + HTTP status. -w appends a final line "<code>"; on any transport
 # failure curl exits non-zero and the code is 000. Relay the body ONLY on a clean
 # HTTP 200 so an error page (401/404/500) is never handed to Copilot as a decision.

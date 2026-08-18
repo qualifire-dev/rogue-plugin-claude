@@ -1,6 +1,6 @@
 {
   "name": "rogue",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "Rogue Security AIDR — real-time AI agent detection and response for Gemini CLI",
   "contextFileName": "GEMINI.md"
 }

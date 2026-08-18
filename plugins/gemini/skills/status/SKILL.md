@@ -110,10 +110,9 @@ This normally needs no action: the log ships by itself in the background at
 session start, at most once every 15 minutes per file, resuming from wherever the
 last upload finished. Run it by hand only to push the newest lines *now*.
 
-**Uploading is off by default right now.** The receiving route is not deployed yet,
-so a background run makes no request at all unless `ROGUE_SHIP_LOGS=1` is set — which
-is why every command below sets it explicitly. Once the route is live the default
-flips and the paragraph above applies unchanged.
+**Uploading needs no opt-in.** A configured install uploads its log on its own; the
+commands below only make one run happen *now*, with its output visible. There is no
+`ROGUE_SHIP_LOGS` flag any more — nothing here switches uploading on or off.
 
 **One SCRIPT, both platforms** — Gemini CLI guarantees Node 20+ on PATH, so the
 shipper is a single Node script here rather than the sh/PowerShell pair the other
@@ -124,7 +123,7 @@ command it cannot.
 
 - macOS / Linux:
 ```bash
-ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 node "$HOME/.gemini/extensions/rogue/scripts/ship-logs.mjs"
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 node "$HOME/.gemini/extensions/rogue/scripts/ship-logs.mjs"
 ```
 - Windows (PowerShell):
 ```powershell
@@ -136,9 +135,9 @@ else {
   # in the session would waive the 15-minute throttle and keep debug output on for
   # every later run. No child process is needed here (unlike the other plugins,
   # whose shipper is a .ps1 that ends in `exit 0` and would end this session).
-  $env:ROGUE_SHIP_LOGS = '1'; $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
+  $env:ROGUE_SHIP_MIN_INTERVAL = '0'; $env:ROGUE_DEBUG = '1'
   try { & node $ship } finally {
-    Remove-Item Env:ROGUE_SHIP_LOGS, Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG -ErrorAction SilentlyContinue
+    Remove-Item Env:ROGUE_SHIP_MIN_INTERVAL, Env:ROGUE_DEBUG -ErrorAction SilentlyContinue
   }
 }
 ```
@@ -149,7 +148,6 @@ own `provider=` token, so a mixed upload is still filed per agent — and the st
 directory is shared with the other plugins' shippers, so a log another agent
 already uploaded is not sent twice.
 
-`ROGUE_SHIP_LOGS=1` opts this run in while the default is off;
 `ROGUE_SHIP_MIN_INTERVAL=0` waives the 15-minute throttle for this one run;
 `ROGUE_DEBUG=1` prints one line per upload. Report what it prints. Expect **no
 output at all** when everything already shipped — that is success. Nothing is
@@ -160,9 +158,7 @@ Report failures as-is rather than retrying: `http=401` is a bad API key
 (`/setup`), `http=0` is a network or proxy problem — the Node shipper reports a
 transport failure or a timeout as `http=0`, where the other plugins' sh and
 PowerShell shippers print curl's `000` — and
-`outcome=skip reason=no-actor` means identity is unresolved. `ROGUE_SHIP_LOGS=0`
-in any env file keeps uploading off even with the flag above,
-and stays off after the default flips.
+`outcome=skip reason=no-actor` means identity is unresolved.
 
 ## Step 5: Summary
 

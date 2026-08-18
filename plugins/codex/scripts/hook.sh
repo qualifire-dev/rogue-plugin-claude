@@ -104,6 +104,37 @@ fi
 # reports itself imprecisely to the fleet roster.
 [ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
 
+# ── per-turn presence heartbeat + log ship (Stop only) ─────────────────────
+# SessionStart's heartbeat is spawned by hooks.json; this is its per-TURN twin, and
+# it is fired from HERE rather than from a second hooks.json entry on purpose: Codex
+# hashes the whole hook definition and skips untrusted command hooks until the user
+# reviews them via /hooks, so adding an entry would silently disable every Rogue
+# hook on every existing install until each user re-approved. The dispatcher already
+# runs on Stop, so this leaves the command strings byte-identical and trust intact.
+#
+# Stop exists as a trigger because a session left open for days used to produce
+# exactly one beacon and one log upload for its whole lifetime - the roster row went
+# stale and the hook log sat on disk unshipped. heartbeat.sh throttles the beacon
+# itself (scripts/beacon.sh, 900s default) and the shipper throttles itself, so a
+# per-turn trigger is not a per-turn request.
+#
+# DETACHED double-fork with every fd redirected: this is the synchronous dispatcher
+# and Codex is waiting on our stdout for the relayed decision, so nothing here may
+# be awaited. </dev/null in particular - the child must not touch the event JSON
+# still queued on our own stdin.
+#
+# PLUGIN_ROOT is EXPORTED explicitly rather than assumed. heartbeat.sh reads it from
+# its own environment (`PLUGIN_ROOT="${PLUGIN_ROOT:-}"`) and everything it needs
+# hangs off it - the bundled env file, actor.sh, surface.sh, the manifest version and
+# the shipper. Codex does put it in the environment today, but the hooks.json entry
+# ALSO substitutes it as a `${PLUGIN_ROOT}` template placeholder, so a build that
+# only did the substitution would leave the child rootless: an unversioned beacon
+# that ships nothing, failing silently.
+if [ "$EVENT" = "Stop" ] && [ -r "${PLUGIN_ROOT}/scripts/heartbeat.sh" ]; then
+  ( export PLUGIN_ROOT
+    nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" Stop </dev/null >/dev/null 2>&1 & )
+fi
+
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/openai}"
 
 # Capture body + HTTP status. -w appends a final line "<code>"; on any curl/transport

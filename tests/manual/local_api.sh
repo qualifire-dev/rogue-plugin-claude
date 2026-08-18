@@ -2,10 +2,11 @@
 # Point THIS machine's Claude Code at the plugin WORKING TREE and a LOCAL Rogue API,
 # so you can exercise uncommitted plugin changes against a backend you control.
 #
-#   bash tests/manual/local_api.sh up [--url URL] [--key KEY] [--ship]
+#   bash tests/manual/local_api.sh up [--url URL] [--key KEY] [--ship] [--beacon-interval N]
 #   bash tests/manual/local_api.sh sync      # re-push working-tree edits, no reinstall
 #   bash tests/manual/local_api.sh status    # what is installed, where it points
 #   bash tests/manual/local_api.sh check     # assert the log looks like this branch
+#   bash tests/manual/local_api.sh ship [--reset]   # force a log upload NOW
 #   bash tests/manual/local_api.sh probe     # one headless session, no interactive restart
 #   bash tests/manual/local_api.sh down      # undo everything `up` did
 #
@@ -93,15 +94,21 @@ stage_tree() {
 }
 
 cmd_up() {
-  URL="$DEFAULT_URL"; KEY="$DEFAULT_KEY"; SHIP=0
+  URL="$DEFAULT_URL"; KEY="$DEFAULT_KEY"; SHIP=0; BEACON=''
   while [ $# -gt 0 ]; do
     case "$1" in
       --url) URL="${2:?--url needs a value}"; shift 2 ;;
       --key) KEY="${2:?--key needs a value}"; shift 2 ;;
       --ship) SHIP=1; shift ;;
+      # The Stop-triggered beacon is throttled to 900s by default, so a test session
+      # shorter than 15 minutes sees exactly ONE beacon - indistinguishable from the
+      # old SessionStart-only behaviour, which makes the feature unobservable. 0 means
+      # every turn.
+      --beacon-interval) BEACON="${2:?--beacon-interval needs a value}"; shift 2 ;;
       *) die "unknown argument: $1" ;;
     esac
   done
+  case "${BEACON:-0}" in *[!0-9]*) die "--beacon-interval takes seconds, got: $BEACON" ;; esac
 
   case "$URL" in
     # The brackets are ESCAPED. `http://[::1]:*` is a glob bracket expression, not
@@ -162,12 +169,17 @@ cmd_up() {
       echo "export ROGUE_BASE_URL=$URL"
       echo "export ROGUE_ACTOR_EMAIL=${ROGUE_ACTOR_EMAIL:-localdev@rogue.security}"
       echo "export ROGUE_ACTOR_NAME=${ROGUE_ACTOR_NAME:-Local Dev}"
-      [ "$SHIP" = 1 ] && echo "export ROGUE_SHIP_LOGS=1"
+      # Shipping itself is unconditional now - there is no ROGUE_SHIP_LOGS. What
+      # --ship buys is OBSERVABILITY: without this the 15-minute self-throttle means
+      # only the first turn of a run uploads, and "nothing arrived" reads as a bug.
       [ "$SHIP" = 1 ] && echo "export ROGUE_SHIP_MIN_INTERVAL=0"
+      [ -n "$BEACON" ] && echo "export ROGUE_HEARTBEAT_MIN_INTERVAL=$BEACON"
     } > "$ENV_FILE"
   )
   say "  wrote $ENV_FILE (mode 600) -> $URL"
-  [ "$SHIP" = 1 ] && say "  log shipping ON (your API must serve POST /api/v1/hooks/logs)"
+  say "  log shipping is always on - your API must serve POST /api/v1/hooks/logs"
+  [ "$SHIP" = 1 ] && say "  --ship: upload throttle disabled, so every turn ships"
+  [ -n "$BEACON" ] && say "  beacon throttle ${BEACON}s (0 = a beacon on every Stop)"
 
   rule "next"
   say "  1. Start your local API on $URL"
@@ -235,7 +247,13 @@ cmd_check() {
   ok()   { say "  ok: $1"; }
   bad()  { say "  FAIL: $1"; fails=$((fails + 1)); }
 
-  recent="$(tail -40 "$LOG")"
+  # DISPATCHER lines only. `event=ShipLogs` lines are written by ship-logs.sh, which
+  # is the byte-identical shared script - it takes the slug as an argument and has no
+  # surface signal at all, so an absent surface= is correct there per the spec ("absent
+  # when the surface cannot be determined"). Counting them as dispatcher lines made
+  # every assertion below fail as soon as one landed in the tail, i.e. exactly when
+  # --ship is on and the thing under test is working.
+  recent="$(tail -40 "$LOG" | grep -v 'event=ShipLogs')"
   total="$(printf '%s\n' "$recent" | grep -c 'provider=claude')"
   tagged="$(printf '%s\n' "$recent" | grep -c 'provider=claude surface=')"
 
@@ -287,9 +305,104 @@ cmd_check() {
   rule "what your API answered"
   printf '%s\n' "$recent" | grep 'raw=' | tail -4 | sed 's/^/  /' || say "  (no raw= lines)"
 
+  # A SUCCESSFUL SHIP WRITES NOTHING. ship-logs.sh logs only notable outcomes - a
+  # fail, a skip, a stall - and deliberately never the happy path, because a line per
+  # run would mean every run has new bytes to ship and would destroy the "an idle
+  # machine makes no HTTP request at all" property the throttle depends on. So these
+  # lines are a FAILURE feed, not a progress feed: the count you want is ZERO, and the
+  # evidence of success is the offset, which advances only on a 2xx.
+  rule "shipping and the Stop beacon"
+  ships="$(grep -c 'event=ShipLogs' "$LOG" 2>/dev/null)"
+  if [ "${ships:-0}" = 0 ]; then
+    say "  no ShipLogs lines - nothing has FAILED to ship (success is silent)"
+  else
+    say "  $ships ShipLogs line(s) - these are failures/skips, not progress:"
+    grep 'event=ShipLogs' "$LOG" 2>/dev/null | tail -3 | sed 's/^/    /'
+  fi
+  SHIP_STATE="$HOME/.rogue/ship/claude.state"
+  if [ -r "$SHIP_STATE" ]; then
+    _off="$(sed -n 's/^offset=\([0-9]*\)$/\1/p' "$SHIP_STATE" | head -1)"
+    _size="$(wc -c < "$LOG" | tr -d ' ')"
+    if [ -n "$_off" ]; then
+      if [ "$_off" = "$_size" ]; then
+        say "  offset $_off == log size: every byte has been accepted (2xx)"
+      else
+        say "  offset $_off of $_size bytes accepted; $((_size - _off)) pending"
+        say "  Flush now with: bash tests/manual/local_api.sh ship"
+      fi
+    fi
+  else
+    say "  no ship state yet at $SHIP_STATE - nothing has been uploaded yet. Shipping is"
+    say "  unconditional, so this means no turn has run, or every run was throttled;"
+    say "  \`up --ship\` disables the throttle and \`ship\` forces one upload now."
+  fi
+  BEACON_STAMP="$HOME/.rogue/beacon/.last-claude"
+  if [ -r "$BEACON_STAMP" ]; then
+    _bs="$(head -n1 "$BEACON_STAMP" | tr -d '[:space:]')"
+    _now="$(date -u +%s)"
+    case "$_bs" in
+      ''|*[!0-9]*) say "  beacon stamp is NOT an integer ($_bs) - the throttle reads it as untrusted" ;;
+      *) say "  last beacon $(( _now - _bs ))s ago (stamp $_bs)" ;;
+    esac
+  else
+    say "  no beacon stamp yet at $BEACON_STAMP"
+  fi
+
   say
   [ "$fails" = 0 ] && say "LOCAL API CHECK PASSED" || say "$fails failure(s)"
   return "$fails"
+}
+
+# Force one shipper run NOW, instead of waiting for the next Stop and guessing.
+# `--reset` first clears the offset state, so the whole log re-ships from byte 0 - the
+# only way to get a repeatable, observable POST at your API on demand.
+#
+# ROGUE_DEBUG is forced on: a successful run prints NOTHING (see the note in `check`),
+# so without it a working ship looks identical to one that did nothing at all.
+cmd_ship() {
+  RESET=0
+  [ "${1:-}" = "--reset" ] && RESET=1
+  MK="$MARKET_NAME"; export MK
+  IP="$(install_path)"
+  [ -n "$IP" ] || die "rogue@$MARKET_NAME is not installed - run \`up\` first"
+  [ -f "$IP/scripts/ship-logs.sh" ] || die "no shipper at $IP/scripts/ship-logs.sh"
+
+  SHIP_STATE="$HOME/.rogue/ship/claude.state"
+  rule "force a ship"
+  if [ "$RESET" = 1 ]; then
+    rm -f "$HOME"/.rogue/ship/*.state 2>/dev/null
+    say "  cleared the offset state - the whole log will re-ship from byte 0"
+  fi
+  before="$(sed -n 's/^offset=\([0-9]*\)$/\1/p' "$SHIP_STATE" 2>/dev/null | head -1)"
+  [ -n "$before" ] || before=0
+
+  # The actor is INHERITED, never re-resolved inside the shipper: the six plugins'
+  # cascades differ, so a second cascade would key the uploaded logs to a different
+  # identity for this same machine and they would join to nothing on the backend.
+  # shellcheck disable=SC1090
+  [ -r "$ENV_FILE" ] && . "$ENV_FILE"
+  [ -n "${ROGUE_ACTOR_EMAIL:-}" ] \
+    || die "no ROGUE_ACTOR_EMAIL to inherit - the shipper would skip with reason=no-actor"
+  export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
+  say "  running $IP/scripts/ship-logs.sh (slug=claude version=$(plugin_version) family=claude)"
+  ROGUE_DEBUG=1 sh "$IP/scripts/ship-logs.sh" "$IP" claude "$(plugin_version)" claude 2>&1 \
+    | sed 's/^/  ship: /'
+
+  after="$(sed -n 's/^offset=\([0-9]*\)$/\1/p' "$SHIP_STATE" 2>/dev/null | head -1)"
+  [ -n "$after" ] || after=0
+  say
+  if [ "$after" -gt "$before" ]; then
+    say "  OFFSET ADVANCED $before -> $after ($((after - before)) bytes accepted with a 2xx)"
+    say "  That is durable proof your API accepted them - the offset moves on 2xx only."
+  elif [ "$before" -gt 0 ]; then
+    say "  offset unchanged at $before. Tell the two cases apart by the ship: lines:"
+    say "    no POST line at all -> nothing new on disk (an idle run makes no request)"
+    say "    a POST line then outcome=fail http=NNN -> your API rejected the bytes"
+  else
+    say "  no offset recorded, and shipping is unconditional - so this is not a flag."
+    say "  Check the ship: lines above for a reason (no actor, no curl), and that your"
+    say "  API answers POST /api/v1/hooks/logs with a 2xx."
+  fi
 }
 
 # A headless probe, for when you do not want to restart your editor to see whether
@@ -357,7 +470,10 @@ case "${1:-}" in
   sync)   cmd_sync ;;
   status) cmd_status ;;
   check)  cmd_check ;;
+  ship)   shift; cmd_ship "$@" ;;
   probe)  cmd_probe ;;
   down)   cmd_down ;;
-  *)      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' ; exit 1 ;;
+  # 2,11p: the usage block above, which grew a `ship` line. Keep this range in step
+  # with it - a stale range silently stops printing the last subcommand.
+  *)      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ; exit 1 ;;
 esac

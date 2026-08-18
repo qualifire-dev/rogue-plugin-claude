@@ -30,11 +30,12 @@ native Antigravity decision shape verbatim.
 
 ```
 plugin.json          Antigravity manifest — $schema/name/description ONLY (no version key)
-VERSION              version of record (1.0.23) — read by build-release.sh, heartbeat, /status
+VERSION              version of record — read by build-release.sh, heartbeat, /status
 hooks.json           the five events, two handlers each (sh + powershell)
 scripts/hook.sh      POSIX-sh dispatcher (macOS/Linux/WSL); stands down under Git Bash
 scripts/hook.ps1     PowerShell dispatcher (native Windows); stands down on non-Windows
-scripts/heartbeat.sh|.ps1   detached presence beacon, fired from the first PreInvocation
+scripts/heartbeat.sh|.ps1   detached presence beacon (new conversation + every Stop)
+scripts/beacon.sh|.ps1      SHARED beacon throttle - edit scripts/shared/, never this copy
 scripts/setup.sh|.ps1       write the shared ~/.rogue-env (mode 600)
 scripts/actor.sh            actor cascade (env → git config --global → hostname/whoami)
 rules/rogue.md       always-on agent rule (don't route around Rogue; rgx! usage)
@@ -604,16 +605,42 @@ exact.
 
 ## Heartbeat
 
-Fired **detached from every `PreInvocation` with `invocationNum == 0`** —
-Antigravity has no `SessionStart` event, so this is the closest analogue.
-Note this is **once per user turn, not once per session**: `invocationNum` was
-verified to reset to 0 on each new prompt in the same conversation, so a
-10-prompt session sends 10 heartbeats. Harmless (the beacon is an idempotent
-upsert keyed host+actor+family+agent) but chattier than intended; gating on
-`invocationNum == 0 && initialNumSteps <= 1` would make it truly per-session. `heartbeat.sh` POSTs `/api/v1/hooks/status` with
+**TWO TRIGGERS, both fired detached from `hook.{sh,ps1}`** (`maybe_heartbeat` /
+`Invoke-Heartbeat`), because Antigravity has no `SessionStart` event:
+
+| Trigger passed | Fires on | Throttled |
+|---|---|---|
+| `SessionStart` | `PreInvocation` with `invocationNum == 0` **AND `initialNumSteps <= 1`** — a new conversation | no |
+| `Stop` | every agent run's end — the per-TURN trigger | yes, 900s default |
+
+This **replaced** a heartbeat on every `PreInvocation` with `invocationNum == 0`,
+which read as per-session and was not: `invocationNum` resets to 0 on each new
+prompt in the same conversation, so a 10-prompt session sent 10 *unthrottled*
+beacons. Worse, `PreInvocation` runs **before** the turn's own transcript rows
+exist, so the log shipper riding inside `heartbeat.sh` only ever uploaded turns
+1..N-1 — which is why the per-turn work moved to `Stop`.
+
+Two details are load-bearing:
+
+- **`initialNumSteps` is EXTRACTED and compared numerically, never glob/`-like`
+  matched.** `*"initialNumSteps":1*` also matches `18`, so every continuation of
+  a long conversation looked like a fresh one and got an unthrottled beacon.
+  `tests/test_hook_sh_antigravity.sh` caught exactly this.
+- **A continuation (`invocationNum == 0` with steps already recorded, e.g.
+  `agy -c`) fires NOTHING** — its `Stop` covers it, and treating it as a session
+  start would hand an unthrottled beacon to every resumed conversation.
+
+The throttle itself lives in `scripts/beacon.{sh,ps1}`, a byte-identical copy of
+`scripts/shared/beacon.{sh,ps1}` shared with the other four sh/ps plugins; the
+stamp slug is **`antigravity`** (the log file's name) for **all three surfaces**,
+which share one install and one log and therefore must share one throttle
+window. `heartbeat.ps1`'s library load is the one that cannot sit in a helper —
+see the note on PowerShell dot-source scoping in the root `CLAUDE.md`.
+
+`heartbeat.sh` POSTs `/api/v1/hooks/status` with
 `agent_family:"antigravity"`, `version` from `VERSION`, host, and actor fields.
-Surface is **passed in by the dispatcher** (`heartbeat.sh <surface>` /
-`heartbeat.ps1 -Agent <surface>`), read off the triggering event's
+Surface is **passed in by the dispatcher** (`heartbeat.sh <surface> <trigger>` /
+`heartbeat.ps1 -Agent <surface> -Trigger <trigger>`), read off the triggering event's
 `transcriptPath` — the only reliable source, since one install at
 `~/.gemini/config/plugins/rogue` serves all three products. The old
 environment-sniffing inference survives only as a fallback for a manual run
@@ -673,8 +700,9 @@ sh tests/test_hooks_json_antigravity.sh   # FAILS today (asserts the pre-fix nes
 
 `test_hook_sh_antigravity.sh` covers the invariants worth protecting: per-event
 fail-open defaults, always-exit-0, empty stdout on Git Bash stand-down,
-heartbeat only on `invocationNum:0`, transcript enrichment on the three
-content-less events and *not* on `PreToolUse`, and that the base64 round-trips.
+heartbeat trigger mapping (a new conversation vs a continuation vs `Stop`),
+transcript enrichment on the three content-less events and *not* on `PreToolUse`,
+and that the base64 round-trips.
 
 ## Things that look weird but are intentional
 
@@ -684,8 +712,8 @@ content-less events and *not* on `PreToolUse`, and that the base64 round-trips.
 - No `; exit 0` on command strings (see the noise caveat above).
 - Git Bash / non-Windows stand-down emits **nothing**, not `{}`.
 - `PreToolUse` fails open to `{"decision":"allow"}`, never `{}`.
-- Heartbeat rides `PreInvocation` `invocationNum == 0` — there is no
-  `SessionStart` event.
+- Heartbeat rides `PreInvocation` for its session trigger and `Stop` for its
+  per-turn one — there is no `SessionStart` event to hang either on.
 
 ## Open items
 
@@ -736,4 +764,3 @@ content-less events and *not* on `PreToolUse`, and that the base64 round-trips.
   ever adds one) would not resolve.
 - MCP tool naming under Antigravity's `mcp(server/tool)` permission namespace is
   matched heuristically server-side; no real MCP call has been observed.
-- Heartbeat fires per user turn rather than per session (see above).

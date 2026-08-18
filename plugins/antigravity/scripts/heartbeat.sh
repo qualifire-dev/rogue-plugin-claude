@@ -1,9 +1,26 @@
 #!/usr/bin/env bash
-# Rogue presence heartbeat (Google Antigravity plugin). Fired detached from
-# the first PreInvocation. POSTs /api/v1/hooks/status so this install shows up
-# in the dashboard's Coding Agents roster and the org learns which plugin
-# version runs (drives the "outdated" badge). Fire-and-forget: never blocks
-# Antigravity, always exits 0.
+# Usage: heartbeat.sh [surface] [TriggerEvent]     (default trigger SessionStart)
+#
+# Rogue presence heartbeat (Google Antigravity plugin). Fired detached by hook.sh -
+# from the first PreInvocation of a CONVERSATION, and from every Stop. POSTs
+# /api/v1/hooks/status so this install shows up in the dashboard's Coding Agents
+# roster and the org learns which plugin version runs (drives the "outdated" badge).
+# Fire-and-forget: never blocks Antigravity, always exits 0.
+#
+# TWO TRIGGERS, ONE SCRIPT, as in every other plugin - but Antigravity has no
+# SessionStart event, so the mapping is its own:
+#
+#   SessionStart  the first PreInvocation of a new conversation (invocationNum 0 AND
+#                 initialNumSteps <= 1). Never throttled, so a fresh install or a new
+#                 conversation updates the roster at once.
+#   Stop          every agent run's end. Throttled, and the per-TURN trigger.
+#
+# This REPLACED a heartbeat on every PreInvocation with invocationNum == 0, which
+# looked per-session and was not: invocationNum resets on each new prompt, so a
+# 10-prompt session sent 10 unthrottled beacons. It also shipped the hook log a turn
+# LATE - PreInvocation of turn N runs before turn N's own transcript rows exist, so
+# only turns 1..N-1 were ever on disk to upload. Stop is after the rows are written,
+# which is why the per-turn work moved there.
 #
 # Main-and-functions, like hook.sh: everything below is a function and only
 # `main "$@"` runs. The one ordering that matters is the same as the
@@ -11,9 +28,10 @@
 set -u
 
 PLUGIN_ROOT=""
-AGENT=""       # which of the three surfaces this install is reporting for
-VER="unknown"  # plugin version, from the bundled VERSION file
-HOST="unknown" # hostname; both set by resolve_version via install-id.sh
+AGENT=""               # which of the three surfaces this install is reporting for
+VER="unknown"          # plugin version, from the bundled VERSION file
+HOST="unknown"         # hostname; both set by resolve_version via install-id.sh
+TRIGGER="SessionStart" # which hook fired us; anything else is rate-limited
 
 # Self-locate the plugin root from $0 (<root>/scripts/heartbeat.sh).
 locate_plugin_root() {
@@ -76,8 +94,38 @@ resolve_surface() {
 
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
+# ── beacon throttle ────────────────────────────────────────────────────────
+# The rule lives in scripts/beacon.sh, a byte-identical copy of
+# scripts/shared/beacon.sh shared with the other four sh-side plugins. Every
+# per-plugin difference is an argument: the stamp slug, and whether this trigger is
+# the session one. The knob (ROGUE_HEARTBEAT_MIN_INTERVAL, numeric zero disables,
+# non-numeric falls back to the default) is read from the environment inside the
+# library, which is correct because load_env ran first.
+#
+# `-r` guarded so a partial or older install degrades to an unthrottled beacon -
+# today's behaviour - rather than erroring out under `set -u`.
+load_beacon() {
+  if [ -r "${PLUGIN_ROOT}/scripts/beacon.sh" ]; then
+    . "${PLUGIN_ROOT}/scripts/beacon.sh"
+  else
+    rogue_beacon_claim() { return 0; }
+  fi
+  return 0
+}
+
 # Family is the fixed enum "antigravity"; surface rides the agent field.
+#
+# The stamp slug is `antigravity`, the log file's name, and NOT $AGENT: the three
+# surfaces (the 2.0 app, the IDE, the agy CLI) share one install and one log, so they
+# must share one throttle window too - a per-surface stamp would let a machine with
+# two of them installed beacon twice as often as configured.
 post_heartbeat() {
+  # rogue_beacon_claim writes the stamp itself, BEFORE the request - deciding and
+  # stamping are one call so a caller cannot leave the window permanently open by
+  # forgetting the second half.
+  _unthrottled=0
+  [ "$TRIGGER" = "SessionStart" ] && _unthrottled=1
+  rogue_beacon_claim antigravity "$_unthrottled" || return 0
   _body=$(printf '{"agent_family":"antigravity","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
     "$(esc "$AGENT")" "$(esc "$VER")" "$(esc "$HOST")" \
     "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
@@ -96,11 +144,12 @@ post_heartbeat() {
 # somewhere to put the logs before they arrive. This script is ALREADY detached by
 # the dispatcher, so the upload delays nothing a user sees.
 #
-# This heartbeat fires once per USER TURN, not once per session (`invocationNum`
-# resets to 0 on every new prompt — see plugins/antigravity/CLAUDE.md), so a
-# 10-prompt session calls this ten times. That is fine and needs no gate here: the
-# shipper's own 15-minute throttle is per log file and is stamped before any
-# upload, so the extra calls exit having made no request at all.
+# This heartbeat fires once per USER TURN (from Stop), plus once at the start of a
+# conversation, so a 10-prompt session calls this eleven times. That is fine and
+# needs no gate here: the shipper's own 15-minute throttle is per log file and is
+# stamped before any upload, so the extra calls exit having made no request at all.
+# It is also deliberately OUTSIDE the beacon throttle above - a throttled beacon
+# still means a turn happened, and the log is worth draining either way.
 #
 # The actor is PASSED IN, never re-resolved — a second cascade would key the log's
 # source row differently from the roster row this script just posted, and the logs
@@ -114,12 +163,14 @@ ship_logs() {
 }
 
 main() {
+  TRIGGER="${2:-SessionStart}"
   locate_plugin_root
   load_env          # sources the env files, then normalises the base URL
   require_api_key   # exits 0 when this install is not configured
   load_actor
   resolve_version
   resolve_surface "${1:-}"
+  load_beacon       # after load_env, so the library sees the interval knob
   post_heartbeat
   ship_logs
   exit 0

@@ -27,12 +27,15 @@ REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/scripts/shared"
 
 # Each row: <source basename> | <space-separated plugin dirs that get it>
-# Gemini is deliberately absent: it ships a single Node implementation
-# (plugins/gemini/scripts/ship-logs.mjs) because Gemini CLI guarantees Node 20+,
-# which is why there is no sh/PowerShell pair to keep in lockstep there.
+# Gemini is deliberately absent from every row: it ships single Node
+# implementations (plugins/gemini/scripts/ship-logs.mjs, and the beacon throttle
+# inlined in heartbeat.mjs) because Gemini CLI guarantees Node 20+, which is why
+# there is no sh/PowerShell pair to keep in lockstep there.
 ROWS=(
   "ship-logs.sh|rogue codex cursor copilot antigravity"
   "ship-logs.ps1|rogue codex cursor copilot antigravity"
+  "beacon.sh|rogue codex cursor copilot antigravity"
+  "beacon.ps1|rogue codex cursor copilot antigravity"
 )
 
 # An unrecognized argument is an ERROR, not a silent write: the two modes have

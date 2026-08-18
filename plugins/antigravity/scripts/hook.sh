@@ -652,9 +652,24 @@ read_body() {
   BODY="$(cat)"
 }
 
-# Heartbeat on the first invocation of a session (invocationNum == 0). Fire
-# detached so the hook itself returns immediately regardless of heartbeat.sh's
-# own latency.
+# Heartbeat, fired detached so the hook itself returns immediately regardless of
+# heartbeat.sh's own latency.
+#
+# TWO TRIGGERS, because Antigravity has no SessionStart event and `invocationNum == 0`
+# is NOT one: it resets on every new prompt, so gating on it alone sent an
+# unthrottled beacon per turn, and it fires BEFORE the turn's own transcript rows
+# exist, so the log shipper riding along uploaded only turns 1..N-1.
+#
+#   SessionStart  first invocation of a NEW CONVERSATION - invocationNum 0 AND
+#                 initialNumSteps <= 1. Never throttled, so a fresh install or a new
+#                 conversation reaches the roster at once.
+#   Stop          every agent run's end: the per-TURN trigger, throttled by
+#                 scripts/beacon.sh, and late enough that the turn's rows are on disk
+#                 for the shipper.
+#
+# A continuation invocation (invocationNum 0 with more steps already recorded, e.g.
+# `agy -c`) deliberately fires NOTHING here - its Stop covers it, and treating it as
+# a session start would hand an unthrottled beacon to every resumed conversation.
 #
 # The surface is passed along because only the hook can know it: three products
 # share this one install, each with its own state dir, and the surface is
@@ -669,11 +684,39 @@ read_body() {
 # `antigravity` while its heartbeat reported `antigravity_cli`, and one install
 # would own two roster rows. One resolution, one row.
 maybe_heartbeat() {
-  [ "$EVENT" = "PreInvocation" ] || return 0
-  case "$BODY" in
-    *'"invocationNum":0'*|*'"invocationNum": 0'*)
-      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$ROGUE_INSTALL_AGENT" >/dev/null 2>&1 & ) ;;
+  _hb_trigger=""
+  case "$EVENT" in
+    Stop) _hb_trigger="Stop" ;;
+    PreInvocation)
+      case "$BODY" in
+        *'"invocationNum":0'*|*'"invocationNum": 0'*)
+          # The step count is EXTRACTED and compared numerically, never glob-matched.
+          # A glob is what a first attempt used and it is wrong in a way that reads as
+          # correct: `*'"initialNumSteps":1'*` also matches 18, so every continuation
+          # of a long conversation looked like a fresh one and got an unthrottled
+          # beacon. Anchoring on the terminator instead would have to enumerate `,`
+          # and `}` and both spacings, and still break on pretty-printed JSON.
+          #
+          # The boundary is the count BEFORE this invocation: 0 on a brand-new
+          # conversation, 1 once the pending prompt has been recorded as a step.
+          _hb_steps="$(printf '%s' "$BODY" \
+            | sed -n 's/.*"initialNumSteps"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            | head -1)"
+          case "${_hb_steps:-}" in
+            ''|*[!0-9]*) ;;
+            *) [ "$_hb_steps" -le 1 ] && _hb_trigger="SessionStart" ;;
+          esac ;;
+      esac ;;
   esac
+  [ -n "$_hb_trigger" ] || return 0
+  # ROGUE_INSTALL_AGENT, not SURFACE: an unattributable payload leaves the log token
+  # empty, and an empty first argument makes heartbeat.sh fall back to sniffing the
+  # filesystem - which picks antigravity_cli whenever `agy` is installed, so the event
+  # would report `antigravity` while its own heartbeat reported `antigravity_cli` and
+  # one install would own two roster rows. Both come from the one resolution in
+  # load_install_id; only this consumer needs the default applied.
+  ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$ROGUE_INSTALL_AGENT" "$_hb_trigger" \
+      </dev/null >/dev/null 2>&1 & )
 }
 
 # Enrichment is per surface, because the surfaces differ in WHEN the transcript

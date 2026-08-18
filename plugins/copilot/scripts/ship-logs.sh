@@ -82,7 +82,6 @@ SHIPPER_SLUG="unknown"
 SHIPPER_VERSION="unknown"
 AGENT_FAMILY=""
 SHIP_ALL_LOGS=0
-SHIP_DISABLED_BY_FILE=0   # an env file said ROGUE_SHIP_LOGS=0 - see load_env
 EXACT_LOG_FILE=""      # non-empty when ROGUE_LOG_FILE pins one exact path
 LOG_DIR=""
 STATE_DIR=""
@@ -295,7 +294,7 @@ parse_args() {
 #   <plugin-root>/env  ->  /etc/rogue/env (MDM)  ->  $HOME/.rogue-env
 # Process env is saved BEFORE sourcing, because `. file` overwrites it.
 SHIP_ENV_VARS='ROGUE_API_KEY ROGUE_BASE_URL ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
-ROGUE_LOG_FILE ROGUE_LOG_DIR ROGUE_SHIP_LOGS ROGUE_SHIP_MIN_INTERVAL
+ROGUE_LOG_FILE ROGUE_LOG_DIR ROGUE_SHIP_MIN_INTERVAL
 ROGUE_SHIP_MAX_BYTES ROGUE_SHIP_MAX_RUN_BYTES ROGUE_SHIP_MAX_LINE_BYTES
 ROGUE_SHIP_ALL'
 
@@ -305,14 +304,6 @@ load_env() {
   done
   for _env_file in "$PLUGIN_ROOT/env" /etc/rogue/env "$HOME/.rogue-env"; do
     [ -n "$_env_file" ] && [ -r "$_env_file" ] && . "$_env_file" 2>/dev/null
-    # OFF WINS. Every other knob here follows "process env beats the files", but an
-    # explicit ROGUE_SHIP_LOGS=0 in a CONFIG FILE is a kill switch, and a kill switch
-    # a process variable can defeat is not one: the documented support one-liner sets
-    # ROGUE_SHIP_LOGS=1 inline, so under plain precedence it would silently re-enable
-    # uploading on a machine whose MDM profile or whose user had turned it off. Noted
-    # per file as it is sourced, because the restore below is about to overwrite the
-    # value with the process one.
-    value_is_zero "${ROGUE_SHIP_LOGS:-}" && SHIP_DISABLED_BY_FILE=1
   done
   for _env_var_name in $SHIP_ENV_VARS; do
     eval "[ -n \"\${_process_env_$_env_var_name:-}\" ] && $_env_var_name=\$_process_env_$_env_var_name"
@@ -342,36 +333,19 @@ number_or_default() { # <value> <default> <allow-zero:0|1>
   printf '%s' "$1"
 }
 
-# SHIPPING IS OPT-IN: unset means OFF, and only a numeric non-zero ROGUE_SHIP_LOGS
-# turns it on. That is the reverse of every other knob here, and deliberate - the
-# receiving route /api/v1/hooks/logs is not deployed yet, so a default-on client
-# would have every configured install POST into a permanent 404 on each session
-# start: no offset ever advances, and each failure appends an `outcome=fail http=404`
-# line to the very file being shipped, so the backlog only grows. Flipping the
-# default (here, in ship-logs.ps1 and in ship-logs.mjs, one line each) is the last
-# step of the rollout, once the route answers 2xx *after* a durable write - see
-# docs/log-shipping-backend.md. Until then `ROGUE_SHIP_LOGS=1` in any env file opts
-# a machine in, which is also how the support invocation and the e2e suite run it.
+# SHIPPING IS UNCONDITIONAL. There is no ROGUE_SHIP_LOGS flag: a configured install
+# uploads its hook log, and the only things that stop a given run are the ones that
+# were always able to - no API key, no resolvable actor, the self-throttle, or simply
+# no new bytes on disk. It was opt-in while /api/v1/hooks/logs was undeployed, since a
+# default-on client would have POSTed into a permanent 404 and appended an
+# `outcome=fail http=404` line to the very file it was draining. The route now exists
+# (an empty body is answered 422 with a body-schema validation error, where a genuinely
+# unknown hooks path is answered a bare 404), so the gate is gone rather than flipped.
 #
-# A non-numeric value ("yes", "true", a typo) is NOT an opt-in: it falls back to the
-# default, matching every other knob's "a typo must never change behaviour" rule.
-# Numeric zero, including a zero-padded "00" (phase 1's rotation-cap precedent),
-# is an explicit off and stays off after the default flips.
-flag_is_enabled() { # <value>
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-    *) [ "$1" -eq 0 ] && return 1; return 0 ;;
-  esac
-}
-
-# An EXPLICIT numeric zero, including a zero-padded one. Absent and non-numeric are
-# both "said nothing", which is what separates a kill switch from a default.
-value_is_zero() { # <value>
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-    *) [ "$1" -eq 0 ] ;;
-  esac
-}
+# What the 2xx contract still requires of the server is unchanged and load-bearing:
+# the offset advances only on 2xx and the client then forgets those bytes, so a 2xx
+# sent before a durable write is a permanent, silent gap. See
+# docs/log-shipping-backend.md.
 
 resolve_knobs() {
   MIN_INTERVAL_SECONDS=$(number_or_default "${ROGUE_SHIP_MIN_INTERVAL:-}" 900 1)
@@ -924,14 +898,6 @@ main() {
   parse_args "$@"
   load_env
   resolve_knobs
-  if [ "$SHIP_DISABLED_BY_FILE" = 1 ]; then
-    debug 'ROGUE_SHIP_LOGS=0 in an env file -> no-op (a config kill switch is not overridable)'
-    exit 0
-  fi
-  if ! flag_is_enabled "${ROGUE_SHIP_LOGS:-}"; then
-    debug "ROGUE_SHIP_LOGS=${ROGUE_SHIP_LOGS:-<unset>} -> no-op (shipping is opt-in)"
-    exit 0
-  fi
   [ -n "$API_KEY" ] || { debug 'not configured -> no-op'; exit 0; }
   command -v curl >/dev/null 2>&1 || { log 'outcome=fail reason=no-curl'; exit 0; }
   command -v base64 >/dev/null 2>&1 || { log 'outcome=fail reason=no-base64'; exit 0; }

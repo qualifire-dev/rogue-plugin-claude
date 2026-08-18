@@ -100,17 +100,16 @@ new_case() {
 # case is skipped by the 15-minute throttle, and "nothing was re-sent" would pass
 # for entirely the wrong reason.
 #
-# ROGUE_SHIP_LOGS=1 for the same class of reason: shipping is opt-in until the
-# backend route is deployed, so without it EVERY case here would pass vacuously -
-# a shipper that does nothing sends no mid-line chunk and never advances an offset
-# wrongly. The kill-switch case below overrides it to assert the default itself.
+# Nothing opts these runs in. Shipping is unconditional - there is no ROGUE_SHIP_LOGS
+# flag - so a configured install with new bytes on disk uploads them, and the cases
+# below assert that rather than an opt-in.
 ship_as() { # <plugin> <slug|-> <version> <family> [VAR=val …]
   _p="$1"; _s="$2"; _v="$3"; _fam="$4"; shift 4
   ( cd "$REPO" || exit 1
     export HOME="$CASE/home" CAP="$CASE/cap" PATH="$T/bin:$PATH"
     export ROGUE_API_KEY=test-key ROGUE_ACTOR_EMAIL=amos@rogue.security ROGUE_ACTOR_NAME=amos
     export ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_BASE_URL=http://127.0.0.1:1
-    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL='' ROGUE_SHIP_LOGS=1
+    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL=''
     export ROGUE_SHIP_MAX_BYTES='' ROGUE_SHIP_MAX_RUN_BYTES='' ROGUE_SHIP_MAX_LINE_BYTES=''
     for kv in "$@"; do export "${kv?}"; done
     _root="${SHIP_ROOT:-$REPO/plugins/$_p}"
@@ -128,7 +127,7 @@ ship_mjs() { # <slug> <version> <family> [VAR=val …]
     export HOME="$CASE/home" CAP="$CASE/cap"
     export ROGUE_API_KEY=test-key ROGUE_ACTOR_EMAIL=amos@rogue.security ROGUE_ACTOR_NAME=amos
     export ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_BASE_URL=http://127.0.0.1:1
-    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL='' ROGUE_SHIP_LOGS=1
+    export ROGUE_LOG_FILE='' ROGUE_LOG_DIR='' ROGUE_SHIP_ALL=''
     export ROGUE_SHIP_MAX_BYTES='' ROGUE_SHIP_MAX_RUN_BYTES='' ROGUE_SHIP_MAX_LINE_BYTES=''
     for kv in "$@"; do export "${kv?}"; done
     node tests/ship_probe.mjs "$REPO/plugins/gemini" "$_s" "$_v" "$_fam" )
@@ -700,7 +699,7 @@ else
   seed 1 2 gemini "$glog"
   ( cd "$REPO" || exit 1
     export HOME="$CASE/home" CAP="$CASE/cap"
-    export ROGUE_API_KEY=test-key ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0
+    export ROGUE_API_KEY=test-key ROGUE_SHIP_MIN_INTERVAL=0
     export ROGUE_BASE_URL=http://127.0.0.1:1
     env -u ROGUE_ACTOR_EMAIL -u ROGUE_ACTOR_NAME \
       node tests/ship_probe.mjs "$REPO/plugins/gemini" gemini 9.9.9 gemini ) >/dev/null 2>&1
@@ -708,64 +707,61 @@ else
 fi
 
 echo
-echo "== kill switches and knob clamping"
-new_case off
+echo "== shipping is unconditional, and knob clamping"
+new_case default-on
+seed 1 3
+# NOTHING opts this in. A configured install with new bytes ships them, which is the
+# whole of the policy now that /api/v1/hooks/logs is deployed. Asserted first, from a
+# clean case, because every other assertion in this file would pass vacuously against
+# a shipper that uploads nothing.
+ship
+check "a configured install ships with no flag at all" "1" "$(bodies)"
+# Compared against the file's own size rather than a literal: the fixture's line
+# count is a detail of `seed`, and a drained file means offset == size.
+check "…and records the whole file as drained" "$(wc -c < "$LOG" | tr -d ' ')" "$(state offset)"
+
+new_case unconfigured
+seed 1 3
+ship "ROGUE_API_KEY="
+check "an unconfigured install is still silent" "0" "$(bodies)"
+check "…leaving no state" "" "$(state offset)"
+
+# ROGUE_SHIP_LOGS IS GONE, and a value left behind on a machine that had it must not
+# change anything. An install that upgrades into this version keeps whatever the
+# operator once wrote in ~/.rogue-env or an MDM /etc/rogue/env, and the shipper is
+# required to ignore all of it - inline and in a file, `0`, `00` and non-numeric alike.
+# Anything else would leave a fleet silently half-off with no knob left to explain it.
+new_case retired-flag
 seed 1 3
 ship "ROGUE_SHIP_LOGS=0"
-check "ROGUE_SHIP_LOGS=0 is a no-op" "0" "$(bodies)"
-check "…leaving no state" "" "$(state offset)"
-ship "ROGUE_SHIP_LOGS=00"
-check "a zero-padded 00 also disables" "0" "$(bodies)"
-ship "ROGUE_API_KEY="
-check "an unconfigured install is silent" "0" "$(bodies)"
-# SHIPPING IS OPT-IN until /api/v1/hooks/logs is deployed, so UNSET must be a
-# no-op — the reverse of every other knob here. Asserted from a clean case rather
-# than by re-running the one above, whose state would make "sent nothing" pass for
-# the wrong reason. `ROGUE_SHIP_LOGS=` (empty) is what the harness's own reset
-# looks like, so both spellings of absent are covered.
-new_case default-off
-seed 1 3
-ship "ROGUE_SHIP_LOGS="
-check "unset does NOT ship (opt-in)" "0" "$(bodies)"
-check "…and leaves no state" "" "$(state offset)"
-ship "ROGUE_SHIP_LOGS=yes"
-check "a non-numeric value is not an opt-in either" "0" "$(bodies)"
-ship "ROGUE_SHIP_LOGS=1"
-check "an explicit 1 opts in" "1" "$(bodies)"
-# AN ENV FILE'S EXPLICIT ZERO IS A KILL SWITCH, and an inline ROGUE_SHIP_LOGS=1 must
-# not defeat it. Every other knob here is "process env beats the files", so this is the
-# one deliberate exception: the documented support one-liner passes =1 inline, and under
-# plain precedence it would silently re-enable uploading on a machine whose MDM profile
-# or whose user had turned it off - in the privacy-sensitive path of all places.
-new_case killswitch
+check "an inline 0 no longer disables" "1" "$(bodies)"
+new_case retired-flag-file
 seed 1 3
 printf 'export ROGUE_SHIP_LOGS=0\n' > "$CASE/home/.rogue-env"
 chmod 600 "$CASE/home/.rogue-env"
-ship "ROGUE_SHIP_LOGS=1"
-check "an env file's 0 beats an inline 1" "0" "$(bodies)"
-check "…and leaves no state" "" "$(state offset)"
-# A zero-padded 00 is the same explicit off (phase 1's rotation-cap precedent).
+ship
+check "a 0 in an env file no longer disables" "1" "$(bodies)"
+new_case retired-flag-file-padded
+seed 1 3
 printf 'export ROGUE_SHIP_LOGS=00\n' > "$CASE/home/.rogue-env"
-ship "ROGUE_SHIP_LOGS=1"
-check "a zero-padded 00 in the file also holds" "0" "$(bodies)"
-# A file that merely says nothing must NOT block: absent and non-numeric both mean
-# "said nothing", or a typo in one line would silently disable uploading everywhere.
-printf 'export ROGUE_SHIP_LOGS=yes\n' > "$CASE/home/.rogue-env"
-ship "ROGUE_SHIP_LOGS=1"
-check "a non-numeric file value is not a kill switch" "1" "$(bodies)"
-# The Node shipper must agree - it shares ~/.rogue/ship and the same documented
-# semantics, and a kill switch honored on one implementation only is not one.
+chmod 600 "$CASE/home/.rogue-env"
+ship
+check "a zero-padded 00 in a file no longer disables" "1" "$(bodies)"
+# The Node shipper must agree: it shares ~/.rogue/ship and the same documented
+# semantics, and a policy honored on one implementation only is not one.
 if command -v node >/dev/null 2>&1; then
-  new_case killswitch-mjs
+  new_case retired-flag-mjs
   glog="$CASE/home/.rogue/logs/gemini.log"
   seed 1 3 gemini "$glog"
   printf 'export ROGUE_SHIP_LOGS=0\n' > "$CASE/home/.rogue-env"
   chmod 600 "$CASE/home/.rogue-env"
-  ship_mjs gemini 9.9.9 gemini "ROGUE_SHIP_LOGS=1"
-  check "an env file's 0 beats an inline 1 (Node)" "0" "$(bodies)"
-  printf 'export ROGUE_SHIP_LOGS=yes\n' > "$CASE/home/.rogue-env"
-  ship_mjs gemini 9.9.9 gemini "ROGUE_SHIP_LOGS=1"
-  check "a non-numeric file value is not a kill switch (Node)" "1" "$(bodies)"
+  ship_mjs gemini 9.9.9 gemini
+  check "a 0 in an env file no longer disables (Node)" "1" "$(bodies)"
+  new_case default-on-mjs
+  glog="$CASE/home/.rogue/logs/gemini.log"
+  seed 1 3 gemini "$glog"
+  ship_mjs gemini 9.9.9 gemini
+  check "a configured install ships with no flag at all (Node)" "1" "$(bodies)"
 fi
 # The debug stream must carry the reason, because a no-arg support run has no log
 # file of its own to write to (SELF_LOG_FILE is empty when the slug is `unknown`).

@@ -25,7 +25,20 @@ Callers (one line each, no `hooks.json` change anywhere):
 |---|---|
 | claude, codex, copilot, antigravity | `scripts/heartbeat.sh` / `heartbeat.ps1` |
 | gemini | `scripts/heartbeat.mjs` |
-| cursor | inside the existing `if [ "$event" = "sessionStart" ]` block in `hook.sh` / `hook.ps1` |
+| cursor | the inline beacon block in `hook.sh` / `hook.ps1` (it has no heartbeat script) |
+
+**Every one of those call sites now runs on a PER-TURN trigger as well as a session
+one** — `Stop` (claude, codex, antigravity), `agentStop` (copilot), `stop` (cursor),
+`AfterAgent` (gemini). Before that, a session left open for days shipped exactly ONCE,
+at its start, when the log was still nearly empty. Only the claude plugin got a new
+`hooks.json` group for it; the rest fire from inside the dispatcher, because Codex,
+Copilot and Gemini fingerprint the hook definition and would have skipped every Rogue
+hook until each user re-approved via `/hooks`.
+
+**The shipper call sits OUTSIDE the beacon throttle** that the per-turn trigger
+introduced (`scripts/shared/beacon.{sh,ps1}`, 900 s default). A throttled beacon still
+means a turn happened, and the log is worth draining either way; the shipper's own
+interval is what limits it.
 
 **Never behind an agent-specific gate.** `plugins/rogue/scripts/heartbeat.sh` opened
 with `[ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ] && exit 0`; a shipper call anywhere below
@@ -108,15 +121,14 @@ is still derived from `$0`/`$PSCommandPath` so the bundled `env` is not skipped.
       /etc/rogue/env            (POSIX)   |  C:\ProgramData\rogue\env  (Windows, MDM)
       $HOME/.rogue-env          (POSIX)   |  %USERPROFILE%\.rogue-env   (Windows)
     process env wins over all files
- 3. ROGUE_SHIP_LOGS not a numeric non-zero → exit 0   (shipping is OPT-IN, see below)
- 4. no ROGUE_API_KEY → exit 0
- 5. resolve which log file(s) to ship — own slug only by default
- 6. mkdir -p ~/.rogue/ship
- 7. per-file: throttle check on .last-<key>; too recent → skip this file
- 8. per-file: acquire .lock-<key> (mkdir); stamp .last-<key> immediately
- 9. host from hostname; actor_email/actor_name INHERITED, never re-resolved (§9)
-10. ship chunks until drained or the run budget is spent
-11. release the lock; exit 0
+ 3. no ROGUE_API_KEY → exit 0
+ 4. resolve which log file(s) to ship — own slug only by default
+ 5. mkdir -p ~/.rogue/ship
+ 6. per-file: throttle check on .last-<key>; too recent → skip this file
+ 7. per-file: acquire .lock-<key> (mkdir); stamp .last-<key> immediately
+ 8. host from hostname; actor_email/actor_name INHERITED, never re-resolved (§9)
+ 9. ship chunks until drained or the run budget is spent
+10. release the lock; exit 0
 ```
 
 Every path `exit 0`, no `set -e`. Two separate disciplines, both load-bearing:
@@ -236,12 +248,16 @@ The throttle exists to bound *our own worst case*:
 - **Rate ceiling per machine**, for the same reason, on any future bug that makes
   the shipper chattier than intended.
 
-**Why 900 s and not less:** the trigger is *session start*, not a timer. Someone
-in one four-hour session ships nothing during it no matter what the interval says
-— their logs arrive at their next session. So a lower interval only helps people
-who open many sessions, and 15 minutes already puts that group inside the window
-where a support request is still warm. Going to 60 s would multiply the crash-loop
-ceiling by 15 to make no practical difference to freshness.
+**Why 900 s and not less:** the trigger is not a timer, it is a *turn* — so the
+interval is the floor on how fresh a log can be, and 15 minutes puts a support
+request inside the window while it is still warm. Going to 60 s would multiply the
+crash-loop ceiling by 15 for no practical gain.
+
+This paragraph used to argue from *session start* being the only trigger, and
+concluded that "someone in one four-hour session ships nothing during it no matter
+what the interval says". That was true and was the bug: a long session's log sat on
+disk unshipped for its whole lifetime. Every plugin now also ships on a per-turn
+trigger, so the interval finally does the job this number was chosen for.
 
 #### The lock
 
@@ -963,7 +979,6 @@ fleet-wide, and process env still wins:
 
 | var | default | meaning |
 |---|---|---|
-| `ROGUE_SHIP_LOGS` | **`0` (opt-in)** | must be a numeric non-zero to ship at all — see **Rollout** |
 | `ROGUE_SHIP_MIN_INTERVAL` | `900` | seconds between attempts, per log file |
 | `ROGUE_SHIP_MAX_BYTES` | `1048576` | bytes per HTTP request (ordinary chunks) |
 | `ROGUE_SHIP_MAX_RUN_BYTES` | `10485760` | bytes per file per run (one generation) |
@@ -996,19 +1011,19 @@ of this script:
 ```sh
 # No arguments → collects every agent's log (ROGUE_SHIP_ALL is implied, since
 # without a slug there is no "own log" to pick). Throttled like any other run.
-ROGUE_SHIP_LOGS=1 sh ~/.claude/plugins/.../scripts/ship-logs.sh
+sh ~/.claude/plugins/.../scripts/ship-logs.sh
 
 # The actual support one-liner: ignore the throttle, and report the outcome even
 # though a no-argument run has no log file of its own to write it to.
-ROGUE_SHIP_LOGS=1 ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
+ROGUE_SHIP_MIN_INTERVAL=0 ROGUE_DEBUG=1 \
   sh ~/.claude/plugins/.../scripts/ship-logs.sh
 
 # This agent only, attributed properly: pass what the heartbeat passes.
-ROGUE_SHIP_LOGS=1 sh .../ship-logs.sh "$CLAUDE_PLUGIN_ROOT" claude 1.4.2 claude
+sh .../ship-logs.sh "$CLAUDE_PLUGIN_ROOT" claude 1.4.2 claude
 ```
 
-`ROGUE_SHIP_LOGS=1` is on every one of those lines because shipping is opt-in until
-the route ships (**Rollout**, below). `ROGUE_DEBUG=1` is on the support line for a
+No line above turns uploading on, because nothing has to: shipping is unconditional
+(**Rollout**, below). `ROGUE_DEBUG=1` is on the support line for a
 subtler reason: the shipper's own diagnostics go into the SHIPPING plugin's log file,
 which a no-argument run does not have (its slug is `unknown`), so without the debug
 stream `outcome=fail … http=<code>` and `outcome=skip reason=no-actor` would have
@@ -1034,45 +1049,33 @@ collection does not want.
 
 ## Rollout
 
-**The client is complete and shipping is off by default.** `ROGUE_SHIP_LOGS` must be
-a numeric non-zero for a run to make any request — the reverse of every other knob
-here, where unset means "use the default behaviour".
+**Shipping is unconditional.** A configured install uploads its hook log; there is no
+`ROGUE_SHIP_LOGS` flag and no way to opt a machine out. The only things that stop a
+given run are the ones that always could: no API key, no resolvable actor, the
+self-throttle, or no new bytes on disk.
 
-**OFF WINS: a numeric zero in any env file is a kill switch that process env cannot
-defeat.** `ROGUE_SHIP_LOGS=0` in `/etc/rogue/env`, a bundled `env`, or `~/.rogue-env`
-disables uploading for that machine even when the caller exports
-`ROGUE_SHIP_LOGS=1`, and it keeps disabling it after the default above flips. This is
-the one place the documented "process env wins over files" precedence is deliberately
-inverted, because the two directions are not symmetric: an admin who turns log
-upload off is exercising a privacy control, and a control that any inline variable can
-override is not a control. Turning it *on* still follows normal precedence — process
-env, or a `1` in a later file, both work.
+It was opt-in for one reason, and that reason is gone: `/api/v1/hooks/logs` was not
+deployed, and prod answers an unknown hooks path with `404 NOT_FOUND` *before* auth, so
+a default-on client would have had every configured install POST into a permanent 404
+once per session start — nothing lost, since the offset advances only on 2xx, but
+nothing recovered either, while each failure appended an `outcome=fail … http=404` line
+to the very file it was draining. **The route now exists** (probed 2026-08-18: an empty
+body is answered `422` with `{"type":"validation","on":"body"}`, i.e. body validation
+runs before auth and the route knows this schema, where `/api/v1/hooks/nonexistent`
+still answers a bare `404 NOT_FOUND`), so the gate was removed rather than flipped.
 
-Mechanically, each implementation records the fact **while reading the files**, before
-the process-env pass overwrites the value: `SHIP_DISABLED_BY_FILE` in
-`ship-logs.sh` (set inside `load_env`), `$script:shipDisabledByFile` in
-`ship-logs.ps1` (inside `Import-ShipEnv`'s file loop), and a non-enumerable
-`SHIP_DISABLED_BY_FILE` symbol on the merged map in `ship-logs.mjs` — non-enumerable
-so it can never be read back as a knob. Only a numeric zero counts
-(`value_is_zero` / `Test-ValueIsZero` / `valueIsZero`): `0` and `00` are kill
-switches, `no`, `off` and `false` are not, matching the numeric-only parsing used
-everywhere else. The check runs before the opt-in test in `main` /
-`Invoke-Main` / `run`, so a disabled machine does no work at all.
+**What was removed, so a reader of an older revision is not surprised:** the
+`ROGUE_SHIP_LOGS` opt-in *and* its `=0` kill switch, which used to be the one place
+where an env file deliberately beat process env. `flag_is_enabled` / `Test-FlagEnabled`
+/ `flagIsEnabled`, `value_is_zero` / `Test-ValueIsZero` / `valueIsZero`, and the
+`SHIP_DISABLED_BY_FILE` plumbing in all three implementations are gone with it. A value
+left behind on an upgraded machine — inline or in `/etc/rogue/env` — is ignored, which
+is asserted on purpose in all three test layers: an upgrade must not leave a fleet
+silently half-off with no knob left to explain it. **There is therefore no
+machine-level opt-out any more.** If one is ever needed again it is a new control, not
+a resurrection of this one, and it wants a name that says what it does.
 
-The reason is the receiving route: `/api/v1/hooks/logs` **does not exist yet**. The
-AIDR hooks router registers `/ping`, `/status`, `/config`, `/claude`, `/cursor`,
-`/gemini`, `/antigravity`, `/copilot` and `/openai`, and production answers an
-unknown hooks path with `404 NOT_FOUND` *before* auth. A default-on client would
-therefore have every configured install POST into a permanent 404 on each session
-start. Nothing would be lost — the offset advances only on 2xx — but nothing would
-recover either, and each failure appends an `outcome=fail … http=404` line to the very
-file being shipped, so the backlog it is trying to drain only grows.
-
-Flipping the default is **three one-line edits**, one per implementation
-(`flag_is_enabled` in `scripts/shared/ship-logs.sh`, `Test-FlagEnabled` in
-`scripts/shared/ship-logs.ps1`, `flagIsEnabled` in
-`plugins/gemini/scripts/ship-logs.mjs`), plus `scripts/sync-shared-scripts.sh`. The
-preconditions, in order:
+The 2xx contract on the server is unchanged and remains the one hard requirement:
 
 1. `POST /api/v1/hooks/logs` deployed, authenticating `x-rogue-api-key`, and
    answering **2xx only after a durable write**. This is a correctness requirement,
@@ -1084,8 +1087,8 @@ preconditions, in order:
    `agent_family` resolve to a row rather than being stored raw.
 3. Server-side redaction over every parsed field **and** the raw line.
 
-Until then the feature is exercised by CI (a real receiver, real HTTP, on both
-platforms) and reachable by hand for support with an explicit `ROGUE_SHIP_LOGS=1`.
+The feature is exercised by CI (a real receiver, real HTTP, on both platforms) and
+reachable by hand for support with the one-liners above.
 Endpoint contract, storage model and the task-worker side:
 [log-shipping-backend.md](log-shipping-backend.md).
 
@@ -1177,9 +1180,10 @@ Cases:
   is reclaimed; **two different keys do not block each other**;
 - throttle honored per key, honored **from `~/.rogue-env`** (phase 1's actual bug),
   and a `.last-<key>` timestamped in the future is treated as stale;
-- `ROGUE_SHIP_LOGS=0` is a no-op that leaves the offset untouched, **and so is an
-  unset one** — shipping is opt-in (see **Rollout**), so the whole suite would pass
-  vacuously without an explicit `=1`; a non-numeric value ("yes") is not an opt-in;
+- a configured install with new bytes **uploads with no flag set at all**, asserted
+  first and from a clean case because every other assertion in the suite would pass
+  vacuously against a shipper that did nothing; and a leftover `ROGUE_SHIP_LOGS=0`,
+  inline or in an env file, **no longer disables anything** (see **Rollout**);
 - a lock directory with **no readable `ts` marker** still blocks: creating the
   directory and writing the marker are two operations, so a lock taken microseconds
   ago legitimately has no marker, and reading that absence as stale let a second run

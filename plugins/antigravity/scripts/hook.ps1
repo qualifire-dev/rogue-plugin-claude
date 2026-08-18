@@ -337,23 +337,54 @@ function Get-PayloadTranscriptPath {
     return $m.Groups[1].Value.Replace('\/', '/').Replace('\\', '\').Replace('\', '/')
 }
 
-# Heartbeat on the first invocation of a session (invocationNum == 0). Fire
-# detached (Start-Process -WindowStyle Hidden) so the hook itself returns
-# immediately regardless of heartbeat.ps1's own latency — mirrors hook.sh's
+# Heartbeat, fired detached (Start-Process -WindowStyle Hidden) so the hook itself
+# returns immediately regardless of heartbeat.ps1's own latency — mirrors hook.sh's
 # `( nohup sh heartbeat.sh & )`.
+#
+# TWO TRIGGERS, and the mapping is Antigravity's own because it has no SessionStart
+# event. Kept identical to hook.sh's maybe_heartbeat, including the reasoning:
+# `invocationNum == 0` is NOT once per session (it resets on every new prompt), so
+# gating on it alone sent an unthrottled beacon per turn AND shipped the hook log a
+# turn late, since PreInvocation runs before the turn's own transcript rows exist.
+#
+#   SessionStart  first invocation of a NEW CONVERSATION - invocationNum 0 AND
+#                 initialNumSteps 0 or 1. Never throttled.
+#   Stop          every agent run's end: the per-TURN trigger, throttled by
+#                 scripts/beacon.ps1, and late enough for the shipper.
+#
+# A continuation invocation (invocationNum 0 with steps already recorded, e.g.
+# `agy -c`) fires nothing here - its Stop covers it.
 function Invoke-Heartbeat {
-    if ($EventName -ne 'PreInvocation') { return }
-    if (-not ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) { return }
+    $hbTrigger = ''
+    if ($EventName -eq 'Stop') {
+        $hbTrigger = 'Stop'
+    } elseif ($EventName -eq 'PreInvocation' -and
+              ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) {
+        # The step count is EXTRACTED and compared numerically, never -like matched.
+        # A glob is what a first attempt used and it is wrong in a way that reads as
+        # correct: '*"initialNumSteps":1*' also matches 18, so every continuation of a
+        # long conversation looked like a fresh one and got an unthrottled beacon.
+        #
+        # The boundary is the step count BEFORE this invocation: 0 on a fresh
+        # conversation, 1 once the pending prompt has been recorded as a step.
+        $stepsMatch = [regex]::Match($payload, '"initialNumSteps"\s*:\s*([0-9]+)')
+        if ($stepsMatch.Success -and [int]$stepsMatch.Groups[1].Value -le 1) {
+            $hbTrigger = 'SessionStart'
+        }
+    }
+    if (-not $hbTrigger) { return }
     try {
         $hbPath = Join-Path $PluginRoot 'scripts/heartbeat.ps1'
-        # Pass the SAME surface the event headers carry ($install, resolved
-        # first), never a freshly-derived one. An unattributable payload yields an
-        # empty surface, and heartbeat.ps1's own fallback then sniffs the
-        # filesystem and picks antigravity_cli whenever `agy` is installed — so
-        # this event would report `antigravity` while its heartbeat reported
-        # `antigravity_cli`, and one install would own two roster rows. One
-        # resolution, one row. Mirrors hook.sh's maybe_heartbeat.
+        # Pass the SAME surface the event headers carry ($install.agent, resolved
+        # first off the same transcriptPath), never a freshly-derived one and never
+        # the possibly empty log token. An unattributable payload yields an empty
+        # surface, and heartbeat.ps1's own fallback then sniffs the filesystem and
+        # picks antigravity_cli whenever `agy` is installed, so this event would
+        # report `antigravity` while its heartbeat reported `antigravity_cli`, and one
+        # install would own two roster rows. One resolution, one row. Mirrors
+        # hook.sh's `heartbeat.sh "$ROGUE_INSTALL_AGENT" "$_hb_trigger"`.
         $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath,'-Agent',$install.agent)
+        $hbArgs += @('-Trigger', $hbTrigger)
         Start-Process -FilePath 'powershell' `
             -ArgumentList $hbArgs `
             -WindowStyle Hidden -ErrorAction Stop
