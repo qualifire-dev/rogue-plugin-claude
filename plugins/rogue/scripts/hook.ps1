@@ -234,7 +234,8 @@ $baseUrl = $baseUrl.TrimEnd('/')
 #   EMAIL: ROGUE_ACTOR_EMAIL -> CLAUDE_CODE_USER_EMAIL -> git config user.email
 #          -> marker unknown@<COMPUTERNAME>
 #   NAME:  ROGUE_ACTOR_NAME -> local-part of CLAUDE_CODE_USER_EMAIL
-#          -> git config user.name -> USERNAME -> marker unknown
+#          -> git config user.name -> USERNAME / [Environment]::UserName
+#          -> marker unknown
 # The explicit ROGUE_ACTOR_* values are screened too - compiled bundles already
 # in the field bake a git-config pre-seed into ${CLAUDE_PLUGIN_ROOT}\env, so a
 # plugin update can only fix them if we distrust a poisoned value. See actor.sh.
@@ -245,7 +246,12 @@ $actorName = Select-ActorValue @(
 if (-not $actorName) {
     $gitName = ''
     try { $gitName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {}
-    $actorName = Select-ActorValue @($gitName, $env:USERNAME)
+    # POSIX ends this cascade at `whoami`. Windows deliberately does NOT shell out
+    # to whoami.exe: its output is DOMAIN\user, a different identity string that
+    # would re-fingerprint every existing roster row, and it costs a process per
+    # hook. [Environment]::UserName is the true twin — it reads the process token,
+    # so it still answers in the service contexts where USERNAME is unset.
+    $actorName = Select-ActorValue @($gitName, $env:USERNAME, [Environment]::UserName)
 }
 if (-not $actorName) { $actorName = 'unknown' }
 
@@ -256,7 +262,11 @@ if (-not $actorEmail) {
     $actorEmail = Select-ActorValue @($gitEmail)
 }
 if (-not $actorEmail) {
-    $hostForActor = Select-ActorValue @($env:COMPUTERNAME)
+    # Same fallback the roster host below already uses: COMPUTERNAME can be unset
+    # in service contexts, where the sh twin's `hostname` still answers.
+    $dnsHost = ''
+    try { $dnsHost = [System.Net.Dns]::GetHostName() } catch {}
+    $hostForActor = Select-ActorValue @($env:COMPUTERNAME, $dnsHost)
     if ($hostForActor) { $actorEmail = "unknown@$hostForActor" } else { $actorEmail = 'unknown' }
 }
 

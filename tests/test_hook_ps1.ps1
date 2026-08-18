@@ -134,6 +134,36 @@ Assert-Selected @('Claude', '', 'Jane Dev')                      'Jane Dev'     
 Assert-Selected @('mdm@corp.com', 'real.user@corp.com')          'mdm@corp.com'       'first legitimate candidate wins'
 Assert-Selected @('Claude', 'claude code', '  ')                 ''                   'all-synthetic yields empty (caller emits the unknown marker)'
 
+# ── last-resort fallbacks: parity with the POSIX cascade ───────────────────
+# actor.sh ends at `whoami` / `hostname`; the PowerShell twin must still resolve
+# a real identity when USERNAME or COMPUTERNAME is unset (service contexts),
+# rather than skipping straight to the unknown marker. It does NOT shell out to
+# whoami.exe: that prints DOMAIN\user, which is a different identity string and
+# would re-fingerprint every existing roster row.
+Assert-Selected @('', '', [Environment]::UserName) ([Environment]::UserName) 'token user answers when git name and USERNAME are both empty'
+Assert-Selected @('Jane Dev', [Environment]::UserName) 'Jane Dev'             'a real git name still outranks the token user'
+
+# The cascade itself lives below the ROGUE_PS_LIB_ONLY seam (its dispatcher body
+# only runs on Windows), so its wiring is asserted structurally here: a silent
+# drop of either fallback is exactly the regression this covers.
+foreach ($f in @('hook.ps1', 'heartbeat.ps1')) {
+    $src = Get-Content -Raw -LiteralPath ([System.IO.Path]::Combine($here, '..', 'plugins', 'rogue', 'scripts', $f))
+    $script:count++
+    if ($src -match [regex]::Escape('Select-ActorValue @($gitName, $env:USERNAME, [Environment]::UserName)')) {
+        Write-Host "  ok: $f name cascade falls back to the process token user"
+    } else {
+        Write-Host "FAIL [$f]: name cascade does not fall back to [Environment]::UserName"
+        $script:fails++
+    }
+    $script:count++
+    if ($src -match [regex]::Escape('Select-ActorValue @($env:COMPUTERNAME, $dnsHost)')) {
+        Write-Host "  ok: $f actor-email host falls back to the DNS host name"
+    } else {
+        Write-Host "FAIL [$f]: actor-email host marker does not fall back to GetHostName()"
+        $script:fails++
+    }
+}
+
 if ($fails -gt 0) {
     Write-Host ""
     Write-Host "$fails of $count PowerShell unit test(s) FAILED."
