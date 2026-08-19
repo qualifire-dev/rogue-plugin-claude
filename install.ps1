@@ -341,6 +341,14 @@ if ($hasGemini) {
     }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rogue-gemini-" + [System.IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    # GEMINI_CLI_TRUST_WORKSPACE=true is Gemini's documented headless bypass for
+    # its folder-trust gate (default-ON): without it the install prompts "Do you
+    # trust the files in this folder?" for our own just-extracted temp dir, the
+    # prompt is invisible here (output piped to Out-Null), the non-interactive
+    # default is No, and the install aborts with 'Installation aborted: Folder
+    # "..." is not trusted.' Captured/restored so it never leaks into the user's
+    # shell session (iwr | iex runs in-session). No persistent trust granted.
+    $prevGeminiTrust = $env:GEMINI_CLI_TRUST_WORKSPACE
     try {
         Log "Downloading extension $asset"
         $tarball = Join-Path $tmp 'p.tar.gz'
@@ -351,6 +359,7 @@ if ($hasGemini) {
         if (-not $src) { throw "Gemini manifest missing in download." }
         $srcDir = $src.Directory.FullName
         # Reinstall cleanly so a re-run upgrades. Ignore uninstall errors (first run).
+        $env:GEMINI_CLI_TRUST_WORKSPACE = 'true'
         try { & gemini extensions uninstall rogue 2>&1 | Out-Null } catch {}
         & gemini extensions install $srcDir --consent 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "gemini extensions install failed." }
@@ -359,6 +368,11 @@ if ($hasGemini) {
     } catch {
         Warn2 "Gemini extension not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
     } finally {
+        if ($null -eq $prevGeminiTrust) {
+            Remove-Item Env:GEMINI_CLI_TRUST_WORKSPACE -ErrorAction SilentlyContinue
+        } else {
+            $env:GEMINI_CLI_TRUST_WORKSPACE = $prevGeminiTrust
+        }
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     }
 }
