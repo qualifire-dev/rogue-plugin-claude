@@ -187,6 +187,33 @@ for pair in 'cli:Claude Code - CLI' 'desktop:Claude Code - Desktop' 'cowork:Clau
   check "...and heartbeat reports \"$want\" for it" "$want" "$got"
 done
 
+# The AGENT ID projection - the roster's `agent` and the x-rogue-agent header, and
+# the THIRD consumer of this one table. It must be a stable snake_case id, never a
+# display label: the id doubles as the backend's PLUGIN_REPOS key, so a label there
+# resolves no latest version and every row reads as up to date.
+for pair in 'cli:claude_code' 'desktop:claude_code_desktop' 'cowork:claude_cowork' ':claude_code'; do
+  ep=${pair%%:*}; want=${pair#*:}
+  got=$(CLAUDE_CODE_ENTRYPOINT="$ep" "$SH" -c '. "$1"; rogue_surface_agent_id' _ "$REPO/plugins/rogue/scripts/surface.sh" 2>/dev/null)
+  check "...and the roster agent id for \"${ep:-(unset)}\" is $want" "$want" "$got"
+done
+
+# CLAUDE_CODE_IS_COWORK wins over the entrypoint, in ALL THREE projections.
+# Cowork spawns Claude Code with CLAUDE_CODE_ENTRYPOINT=local-agent - NOT a *cowork*
+# value - so matching the entrypoint alone files every LOCAL Cowork session under the
+# CLI. That misfiling is what put Cowork installs in the wrong roster row, and it is
+# also what would stop the Cowork-only block modal firing (see hook.sh's
+# _rogue_want_alert, which gates on the agent id).
+for fn_want in 'rogue_surface_slug:cowork' 'rogue_surface_agent_id:claude_cowork' 'rogue_surface_label:Claude Cowork'; do
+  fn=${fn_want%%:*}; want=${fn_want#*:}
+  got=$(CLAUDE_CODE_IS_COWORK=1 CLAUDE_CODE_ENTRYPOINT=local-agent \
+    "$SH" -c ". \"\$1\"; $fn" _ "$REPO/plugins/rogue/scripts/surface.sh" 2>/dev/null)
+  check "IS_COWORK=1 + entrypoint=local-agent -> $fn = $want" "$want" "$got"
+done
+# ...and without it, the same entrypoint is just the CLI - the arm only triggers on
+# the explicit Cowork marker, never on any local-agent-ish entrypoint.
+got=$(CLAUDE_CODE_ENTRYPOINT=local-agent "$SH" -c '. "$1"; rogue_surface_agent_id' _ "$REPO/plugins/rogue/scripts/surface.sh" 2>/dev/null)
+check "entrypoint=local-agent WITHOUT the marker is claude_code" "claude_code" "$got"
+
 echo
 echo "== ROGUE_LOG_DIR relocates, keeping the per-agent basename"
 for slug in $SLUGS; do

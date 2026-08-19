@@ -48,9 +48,10 @@ esac
 # Moving it is behaviour-neutral for the beacon itself - both are bare `exit 0`
 # guards ahead of any side effect, and the beacon still fires exactly when it did.
 
-# Actor identity via the shared cascade (env → git → CLAUDE_CODE_USER_EMAIL → host/whoami).
-# actor.sh uses ${CLAUDE_CODE_USER_EMAIL%@*} with no default — that aborts under
-# `set -u` on bash >=4.4 when the var is unset, so relax nounset across the source.
+# Actor identity via the shared cascade (env → CLAUDE_CODE_USER_EMAIL → git →
+# host/whoami marker), with synthetic sandbox identities screened out — see
+# actor.sh. It is written `set -u`-safe, but nounset is relaxed across the source
+# anyway so a future unguarded expansion there can never kill the heartbeat.
 set +u
 [ -r "${CLAUDE_PLUGIN_ROOT:-}/scripts/actor.sh" ] && . "${CLAUDE_PLUGIN_ROOT}/scripts/actor.sh"
 set -u
@@ -65,7 +66,7 @@ set -u
 # name/host with a " or \ can't break the JSON.
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 BODY=$(printf '{"agent_family":"claude","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-  "$(esc "${ROGUE_INSTALL_AGENT:-Claude Code - CLI}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
+  "$(esc "${ROGUE_INSTALL_AGENT:-claude_code}")" "$(esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
   "$(esc "${ROGUE_INSTALL_HOST:-unknown}")" \
   "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 

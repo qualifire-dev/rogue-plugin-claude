@@ -243,17 +243,31 @@ Write-Host "== claude's surface table is ONE table, shared with the heartbeat"
 # the sh half in tests/test_hook_logs.sh.
 . (Join-Path $repo 'plugins/rogue/scripts/surface.ps1')
 foreach ($row in @(
-    @{ ep = 'cli';               slug = 'cli';     label = 'Claude Code - CLI' },
-    @{ ep = 'desktop';           slug = 'desktop'; label = 'Claude Code - Desktop' },
-    @{ ep = 'cowork';            slug = 'cowork';  label = 'Claude Cowork' },
-    @{ ep = 'CLI';               slug = 'cli';     label = 'Claude Code - CLI' },
-    @{ ep = 'vscode-extension';  slug = 'cli';     label = 'Claude Code - CLI' },
-    @{ ep = '';                  slug = '';        label = 'Claude Code - CLI' }
+    @{ ep = 'cli';               slug = 'cli';     label = 'Claude Code - CLI' ; agent = 'claude_code' },
+    @{ ep = 'desktop';           slug = 'desktop'; label = 'Claude Code - Desktop' ; agent = 'claude_code_desktop' },
+    @{ ep = 'cowork';            slug = 'cowork';  label = 'Claude Cowork' ; agent = 'claude_cowork' },
+    @{ ep = 'CLI';               slug = 'cli';     label = 'Claude Code - CLI' ; agent = 'claude_code' },
+    @{ ep = 'vscode-extension';  slug = 'cli';     label = 'Claude Code - CLI' ; agent = 'claude_code' },
+    @{ ep = '';                  slug = '';        label = 'Claude Code - CLI' ; agent = 'claude_code' }
 )) {
     $env:CLAUDE_CODE_ENTRYPOINT = $row.ep
     Check "entrypoint '$($row.ep)' -> slug '$($row.slug)'" $row.slug ([string](Get-RogueSurfaceSlug))
     Check "entrypoint '$($row.ep)' -> label '$($row.label)'" $row.label ([string](Get-RogueSurfaceLabel))
+    Check "entrypoint '$($row.ep)' -> agent id '$($row.agent)'" $row.agent ([string](Get-RogueSurfaceAgentId))
 }
+Remove-Item Env:CLAUDE_CODE_ENTRYPOINT -ErrorAction SilentlyContinue
+
+# CLAUDE_CODE_IS_COWORK wins over the entrypoint, in all three projections - Cowork
+# spawns Claude Code with CLAUDE_CODE_ENTRYPOINT=local-agent, not a *cowork* value,
+# so the entrypoint alone files a LOCAL Cowork session under the CLI. Mirrors the sh
+# half; any drift between the twins is a per-platform behaviour difference.
+$env:CLAUDE_CODE_IS_COWORK = '1'
+$env:CLAUDE_CODE_ENTRYPOINT = 'local-agent'
+Check "IS_COWORK=1 + entrypoint=local-agent -> slug"     'cowork'        ([string](Get-RogueSurfaceSlug))
+Check "IS_COWORK=1 + entrypoint=local-agent -> agent id" 'claude_cowork' ([string](Get-RogueSurfaceAgentId))
+Check "IS_COWORK=1 + entrypoint=local-agent -> label"    'Claude Cowork' ([string](Get-RogueSurfaceLabel))
+Remove-Item Env:CLAUDE_CODE_IS_COWORK -ErrorAction SilentlyContinue
+Check "entrypoint=local-agent WITHOUT the marker is claude_code" 'claude_code' ([string](Get-RogueSurfaceAgentId))
 Remove-Item Env:CLAUDE_CODE_ENTRYPOINT -ErrorAction SilentlyContinue
 
 Write-Host ""

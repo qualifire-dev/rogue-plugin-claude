@@ -24,8 +24,11 @@
 # double-quoted $env:CLAUDE_PLUGIN_ROOT.
 #
 # This script mirrors hook.sh stage-for-stage: collect creds, resolve actor,
-# POST stdin to /api/v1/hooks/claude, detect + log a block decision, and relay
-# the server response verbatim (Claude shows the block reason natively).
+# POST stdin to /api/v1/hooks/claude, detect + log a block decision, relay the
+# server response verbatim, and — on Claude Cowork ONLY, where the client shows
+# no hook-authored text — fire a native modal carrying the reason as a
+# side-channel (see Test-WantAlert). The CLI and the Desktop app render blocks
+# themselves and deliberately get no modal.
 #
 # Fail-open everywhere: missing API key, network error, non-200, empty body all
 # yield `{}` on stdout, exit 0. Claude Code must never block because Rogue
@@ -222,6 +225,68 @@ function Log {
     } catch {}
 }
 
+function Test-SyntheticActor {
+    # True when the value is empty/whitespace or a known synthetic sandbox
+    # identity. Mirrors actor.sh's _rogue_is_synthetic: case-insensitive, with
+    # internal whitespace runs squeezed so "Claude  Code" matches too.
+    #
+    # In Claude Cowork the agent runs as unix user `claude` inside a sandbox whose
+    # git identity is Anthropic's synthetic one (user.name=Claude /
+    # user.email=noreply@anthropic.com), so those values must never be reported as
+    # the acting human.
+    param([string]$Value)
+    if ($null -eq $Value) { return $true }
+    $v = ($Value -replace '\s+', ' ').Trim().ToLowerInvariant()
+    return ($v -eq '' -or $v -eq 'claude' -or $v -eq 'claude code' -or $v -eq 'noreply@anthropic.com')
+}
+
+function Select-ActorValue {
+    # First non-synthetic candidate, or '' when every one is rejected. Callers
+    # invoke it in stages so an expensive candidate (git config) is only computed
+    # when the cheap ones have already been rejected.
+    param([string[]]$Candidates)
+    if ($null -eq $Candidates) { return '' }
+    foreach ($c in $Candidates) { if (-not (Test-SyntheticActor $c)) { return $c } }
+    return ''
+}
+
+function Test-WantAlert {
+    # True when a native block modal should be fired for this event. Twin of
+    # hook.sh's _rogue_want_alert — keep the two in lockstep; there is no shared
+    # seam between the shells, so any drift is divergent behaviour per platform
+    # (the same trap install-id.sh documents for the actor/surface cascade).
+    #
+    # Claude Code CLI and the Claude Desktop app render hook block messages
+    # themselves, so a modal there would double-report — that is why c31ee5a
+    # deleted this path. Claude Cowork, which was not a surface then, breaks the
+    # "pure relay" claim: its client discards hook-authored text on every
+    # documented channel (decision/reason, continue/stopReason, systemMessage,
+    # exit-2 stderr all stop the turn with NO text), so the OS modal is the only
+    # channel that reaches the user. Cowork CLOUD runs the hook in a headless
+    # Linux container and is excluded, so the log stays honest.
+    #
+    # Windows Cowork has NOT been observed in the wild; this keeps the twin
+    # honest rather than claiming verified behaviour. Unlike the sh side there is
+    # no capability probe: security-alert.ps1 uses a native WScript.Shell popup
+    # rather than an external binary, so alert_launched / alert_error logging is
+    # what catches a UI failure.
+    param([string]$InstallAgent, [string]$HookEvent)
+    # 1. Cowork only. Takes the surface the roster already resolved (the
+    #    CLAUDE_CODE_IS_COWORK-first cascade) rather than re-deriving it.
+    if ($InstallAgent -ne 'claude_cowork') { return $false }
+    # 2. Local execution only. CLAUDE_CODE_REMOTE=true marks the cloud container.
+    if ($env:CLAUDE_CODE_REMOTE) { return $false }
+    # 3. Escape hatches, so the blast radius can change without a release:
+    #    ROGUE_ALERT=0 disables; ROGUE_ALERT_EVENTS is a space-separated event
+    #    allowlist (see CLAUDE.md on narrowing to UserPromptSubmit).
+    if ($env:ROGUE_ALERT -eq '0') { return $false }
+    if ($env:ROGUE_ALERT_EVENTS) {
+        $allowed = @($env:ROGUE_ALERT_EVENTS -split '\s+' | Where-Object { $_ })
+        if ($allowed -notcontains $HookEvent) { return $false }
+    }
+    return $true
+}
+
 # Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
 # (e.g. ConvertFrom-ShellQuoted, Rotate-Log) without running the dispatcher.
 # Production never sets this, so the hook always runs its main body.
@@ -316,20 +381,48 @@ $baseUrl = $creds['ROGUE_BASE_URL']
 if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
 $baseUrl = $baseUrl.TrimEnd('/')
 
-# -- actor resolution: explicit creds -> git config -> CLAUDE_CODE_USER_EMAIL ->
-#    username/hostname (mirrors actor.sh) -------------------------------------
-$actorName = $creds['ROGUE_ACTOR_NAME']
-if (-not $actorName) { try { $actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorName -and $env:CLAUDE_CODE_USER_EMAIL) { $actorName = ($env:CLAUDE_CODE_USER_EMAIL -split '@')[0] }
-if (-not $actorName) { $actorName = $env:USERNAME }
+# -- actor resolution (mirrors actor.sh, first NON-SYNTHETIC candidate wins) --
+#   EMAIL: ROGUE_ACTOR_EMAIL -> CLAUDE_CODE_USER_EMAIL -> git config user.email
+#          -> marker unknown@<COMPUTERNAME>
+#   NAME:  ROGUE_ACTOR_NAME -> local-part of CLAUDE_CODE_USER_EMAIL
+#          -> git config user.name -> USERNAME / [Environment]::UserName
+#          -> marker unknown
+# The explicit ROGUE_ACTOR_* values are screened too - compiled bundles already
+# in the field bake a git-config pre-seed into ${CLAUDE_PLUGIN_ROOT}\env, so a
+# plugin update can only fix them if we distrust a poisoned value. See actor.sh.
+# Screen the WHOLE address before splitting it. Taking the local-part first
+# smuggles the sandbox identity past the screen: noreply@anthropic.com is
+# rejected as an email, but its local-part "noreply" is not on the list.
+$hostMail = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)
+$actorName = Select-ActorValue @(
+    $creds['ROGUE_ACTOR_NAME'],
+    (($hostMail -split '@')[0])
+)
+if (-not $actorName) {
+    $gitName = ''
+    try { $gitName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {}
+    # POSIX ends this cascade at `whoami`. Windows deliberately does NOT shell out
+    # to whoami.exe: its output is DOMAIN\user, a different identity string that
+    # would re-fingerprint every existing roster row, and it costs a process per
+    # hook. [Environment]::UserName is the true twin — it reads the process token,
+    # so it still answers in the service contexts where USERNAME is unset.
+    $actorName = Select-ActorValue @($gitName, $env:USERNAME, [Environment]::UserName)
+}
+if (-not $actorName) { $actorName = 'unknown' }
 
-$actorEmail = $creds['ROGUE_ACTOR_EMAIL']
-if (-not $actorEmail) { try { $actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorEmail -and $env:CLAUDE_CODE_USER_EMAIL) { $actorEmail = $env:CLAUDE_CODE_USER_EMAIL }
+$actorEmail = Select-ActorValue @($creds['ROGUE_ACTOR_EMAIL'], $env:CLAUDE_CODE_USER_EMAIL)
 if (-not $actorEmail) {
-    if ($env:USERNAME -and $env:COMPUTERNAME) { $actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
-    elseif ($env:USERNAME) { $actorEmail = $env:USERNAME }
-    else { $actorEmail = $env:COMPUTERNAME }
+    $gitEmail = ''
+    try { $gitEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {}
+    $actorEmail = Select-ActorValue @($gitEmail)
+}
+if (-not $actorEmail) {
+    # Same fallback the roster host below already uses: COMPUTERNAME can be unset
+    # in service contexts, where the sh twin's `hostname` still answers.
+    $dnsHost = ''
+    try { $dnsHost = [System.Net.Dns]::GetHostName() } catch {}
+    $hostForActor = Select-ActorValue @($env:COMPUTERNAME, $dnsHost)
+    if ($hostForActor) { $actorEmail = "unknown@$hostForActor" } else { $actorEmail = 'unknown' }
 }
 
 # -- install identity: host + version + surface label ------------------------
@@ -356,17 +449,17 @@ if (Test-Path -LiteralPath $pluginJson) {
     $installError += "manifest-missing:$pluginJson"
 }
 
-# Family is the fixed enum "claude"; the surface is this free-form display label.
-#
-# Taken from scripts\surface.ps1, ALREADY dot-sourced above for the log line's
-# `surface=` slug - the label and the slug are two columns of one table, and this
-# file must not hold a second copy of the mapping: a log line naming a different
-# surface than the roster row for the same session is worse than a line that names
-# none. The literal covers a damaged install where surface.ps1 was missing or its
-# resolver threw (the same case that leaves $script:surface empty).
+# The surface AGENT ID for the roster / x-rogue-agent header. Read from the
+# SHARED table in scripts/surface.ps1 rather than inlined, so this can never
+# disagree with hook.ps1's own `surface=` log slug or heartbeat.ps1's roster
+# row for the same session. That table checks CLAUDE_CODE_IS_COWORK ahead of
+# the entrypoint (Cowork's entrypoint is `local-agent`, not a *cowork* value),
+# and answers a snake_case id, not a display label: the id IS the backend's
+# PLUGIN_REPOS key, and a label matched none, so every Claude row read as up
+# to date. The literal is the last-resort guard for a damaged install.
 $installAgent = ''
-try { if (Get-Command Get-RogueSurfaceLabel -ErrorAction SilentlyContinue) { $installAgent = [string](Get-RogueSurfaceLabel) } } catch { $installAgent = '' }
-if (-not $installAgent) { $installAgent = 'Claude Code - CLI' }
+try { if (Get-Command Get-RogueSurfaceAgentId -ErrorAction SilentlyContinue) { $installAgent = [string](Get-RogueSurfaceAgentId) } } catch { $installAgent = '' }
+if (-not $installAgent) { $installAgent = 'claude_code' }
 
 # A degraded value is still SENT rather than failing the hook: it identifies the
 # install well enough to keep the roster fresh, and no liveness bookkeeping is
@@ -434,6 +527,7 @@ Log "raw=$(Sanitize $respHead)"
 #   "permissionDecision":"deny"  PreToolUse (inside hookSpecificOutput)
 #   "behavior":"deny"            PermissionRequest (inside hookSpecificOutput.decision)
 $blockRe = '"decision"\s*:\s*"block"|"continue"\s*:\s*false|"permissionDecision"\s*:\s*"deny"|"behavior"\s*:\s*"deny"'
+$fireAlert = $false
 if ($resp -imatch $blockRe) {
     # Extract reason (first match across the field names the formatter uses).
     $reason = $null
@@ -442,12 +536,68 @@ if ($resp -imatch $blockRe) {
     }
     if (-not $reason) { $reason = 'prompt blocked' }
 
-    # No local alert: Claude (CLI and Desktop/Cowork) shows the block reason
-    # natively now, so the response relay below is the whole user-facing story.
     Log "outcome=block reason=`"$(Sanitize $reason)`""
+    if (Test-WantAlert $installAgent $EventName) {
+        switch ($EventName) {
+            'UserPromptSubmit'              { $noun = 'prompt' }
+            { $_ -in 'PreToolUse','PermissionRequest' } { $noun = 'tool call' }
+            default                         { $noun = 'action' }
+        }
+        # No leading emoji here, unlike hook.sh's "⛔ Rogue blocked this …": the
+        # title crosses a process boundary as an environment variable into a
+        # Start-Process child, and Windows console/codepage handling makes a
+        # non-ASCII round-trip there unreliable. A deliberate divergence from the
+        # sh twin, not drift — do not "fix" it into lockstep.
+        $alertTitle = "Rogue blocked this $noun"
+        $alertMsg = "Why:`n$reason"
+        if ($reason -notlike '*rgx!*') {
+            $alertMsg += "`n`nTo allow it: prepend `"rgx!`" to your prompt and resend (marks it a false positive)."
+        }
+        $fireAlert = $true
+    } else {
+        # Logged with the gate's inputs so a future surface change is diagnosable
+        # from the log alone (mirrors hook.sh's alert_skipped line).
+        $ccCowork = if ($env:CLAUDE_CODE_IS_COWORK) { $env:CLAUDE_CODE_IS_COWORK } else { 'unset' }
+        $ccRemote = if ($env:CLAUDE_CODE_REMOTE) { $env:CLAUDE_CODE_REMOTE } else { 'unset' }
+        Log "alert_skipped=1 entrypoint=$($env:CLAUDE_CODE_ENTRYPOINT) cowork=$ccCowork remote=$ccRemote agent=$installAgent"
+    }
 } else {
     Log "outcome=allow"
 }
 
+# Relay the decision to Claude FIRST and flush it, BEFORE launching the modal, so
+# the block is delivered even if the modal lingers on screen. The modal runs in a
+# separate, non-blocking Start-Process (its own handles), so it can never hold
+# Claude's stdout open or delay the decision — the sibling hook.sh detaches its
+# backgrounded alert's fds for the same reason.
 Emit-Json $resp
+
+if ($fireAlert) {
+    # Launch the modal detached (separate process, own handles) so the hook returns
+    # immediately. Title/msg/severity ride env vars (the child inherits them), so the
+    # launched command is constant.
+    #
+    # Pass it as a Base64 (UTF-16LE) -EncodedCommand, NOT -Command. Start-Process
+    # joins -ArgumentList with spaces and does NOT quote elements, so a -Command
+    # string containing spaces/quotes/parens (like the scriptblock bootstrap) reaches
+    # the child mangled and never runs (this is why the alert silently didn't show).
+    # A Base64 blob has no spaces, so it survives the array-join intact. EncodedCommand
+    # also sidesteps ExecutionPolicy/GPO (no -File on disk).
+    try {
+        $alert = Join-Path $pluginRoot 'scripts\security-alert.ps1'
+        if (Test-Path -LiteralPath $alert) {
+            $env:ROGUE_ALERT_TITLE = $alertTitle
+            $env:ROGUE_ALERT_MSG = $alertMsg
+            $env:ROGUE_ALERT_SEVERITY = 'critical'
+            $alertEsc = $alert.Replace("'", "''")
+            $boot = "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$alertEsc')))"
+            $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($boot))
+            Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile', '-NonInteractive', '-EncodedCommand', $enc) | Out-Null
+            Log "alert_launched=1 entrypoint=$($env:CLAUDE_CODE_ENTRYPOINT)"
+        } else {
+            Log "alert_skipped=missing_script"
+        }
+    } catch { Log "alert_error=$(Sanitize $_.Exception.Message)" }
+}
 exit 0

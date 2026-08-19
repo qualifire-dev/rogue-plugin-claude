@@ -16,7 +16,7 @@ There is no build step for the plugin itself: it's a directory of JSON + shell s
 Mirrors the Claude plugin with deliberate differences:
 - **Manifest is `.codex-plugin/plugin.json`**; the Codex marketplace file is `.agents/plugins/marketplace.json` (kept separate from the Claude `.claude-plugin/marketplace.json` so the shared plugin name `rogue` doesn't collide and Codex never falls back to the Claude marketplace).
 - **Codex-native env vars ONLY.** Use `PLUGIN_ROOT` / `PLUGIN_DATA` — never any `CLAUDE_*` variable. Codex exposes `CLAUDE_PLUGIN_ROOT`/`CLAUDE_CODE_USER_EMAIL` as compat shims, but the Codex plugin must not reference them (`hooks.json` uses `${PLUGIN_ROOT}` / `%PLUGIN_ROOT%`; `actor.sh` cascade is env → `git config` → hostname/whoami).
-- **`hook.sh`/`hook.ps1` are PURE RELAY** — no block-detection regex, no local alert. Codex displays the native deny shape itself. (The Claude plugin once shipped a `security-alert` modal because the Claude app hid the block reason; Claude Desktop now shows blocks natively, so that hack was removed everywhere.)
+- **`hook.sh`/`hook.ps1` are PURE RELAY** — no block-detection regex, no local alert. Codex displays the native deny shape itself. (The Claude plugin once shipped a `security-alert` modal because the Claude app hid the block reason; Claude Desktop now shows blocks natively, so it was removed — except on **Claude Cowork**, which still hides it, see the Claude plugin's Cowork-only exception below. Codex needs no such exception.)
 - **No `auto-update.sh`.** Codex has no documented native plugin auto-update, but the updater is speculative + fragile, so v1 omits it; heartbeat's `update_available` drives the dashboard "outdated" badge instead. Re-add (copy Claude's) only if a confirmed gap needs silent push.
 - No `CLAUDE_CODE_ENTRYPOINT` gate (Codex doesn't set it; the hook only ever fires from Codex's own `hooks.json`).
 - **Hook trust**: Codex hashes the whole hook definition and skips untrusted command hooks until reviewed via `/hooks`. Keep `hooks.json` command strings (POSIX `command` + Windows `commandWindows`) **byte-identical forever**; mutate only `scripts/*` so trust survives updates. Setup/status commands document the one-time `/hooks` trust step.
@@ -71,11 +71,12 @@ The single one-line installer detects every supported agent (`have_cmd claude` /
 - `plugins/rogue/.claude-plugin/plugin.json` — plugin manifest. **`version` here is the source of truth** — `build-release.sh` reads it, and `auto-update.sh` compares it against the latest GitHub release tag (`v${version}`).
 - `plugins/rogue/hooks/hooks.json` — 11 lifecycle hooks, all `type: "command"`. **Every event registers two entries** (an `sh` one and a PowerShell one) — see below.
 - `plugins/rogue/scripts/hook.sh` — POSIX-`sh` + `curl` dispatcher (macOS/Linux/WSL). Invoked via `sh` (NOT `bash`), so it is kept POSIX-clean (tested under `dash` via `tests/test_hook_sh.sh`). **Stands down** (emits `{}`, exits) under Git Bash (`uname` = MINGW/MSYS/CYGWIN) so the PowerShell entry owns native Windows.
-- `plugins/rogue/scripts/hook.ps1` — PowerShell + `Invoke-WebRequest` dispatcher. Owns native Windows; stands down on non-Windows (`pwsh` on macOS/Linux). Mirrors `hook.sh` stage-for-stage AND replicates Claude's block detection, native modal, logging, and SessionStart unconfigured hint.
+- `plugins/rogue/scripts/hook.ps1` — PowerShell + `Invoke-WebRequest` dispatcher. Owns native Windows; stands down on non-Windows (`pwsh` on macOS/Linux). Mirrors `hook.sh` stage-for-stage AND replicates Claude's block detection, the Cowork-only native modal (`Test-WantAlert`, the twin of `_rogue_want_alert`), logging, and SessionStart unconfigured hint.
 - `plugins/rogue/scripts/setup.sh` / `setup.ps1` — write `~/.rogue-env` (mode 600) / `%USERPROFILE%\.rogue-env` (ACL-restricted) with `ROGUE_API_KEY` / `ROGUE_ACTOR_EMAIL` / `ROGUE_ACTOR_NAME`. Both emit the same `export KEY=value` POSIX-quoted format. Called by `/rogue:setup`.
 - `plugins/rogue/scripts/auto-update.sh` / `auto-update.ps1` — fire (detached) from `SessionStart`. Rate-limited once/24h. Re-invoke the matching one-line installer (`install.sh` / `install.ps1`) when a newer release tag exists.
 - `plugins/rogue/scripts/heartbeat.sh` / `heartbeat.ps1` — presence beacon (detached), fired from `SessionStart` **and** `Stop`. POST `/api/v1/hooks/status`, then the log shipper. Takes the trigger as its one argument; the `Stop` beacon is throttled via `scripts/beacon.{sh,ps1}`.
 - `plugins/rogue/scripts/warn.sh` — SessionStart "not configured" nudge (sh path only; the ps1 path emits the hint inline from `hook.ps1`).
+- `plugins/rogue/scripts/security-alert.sh` / `security-alert.ps1` — the native block modal, fired by the dispatchers **on Claude Cowork local sessions ONLY** (see "The Cowork block modal" below). Restored from before `c31ee5a`, which deleted them. `security-alert.sh` must be invoked with **`bash`, not `sh`** — it converts the literal `\n` in API-relayed reasons to real newlines with a bash-only substitution. Two deliberate departures from the pre-`c31ee5a` version: its `osascript` is **not** wrapped in `tell application "System Events"` (see the notify_block note in the Copilot section for why that wrapper is harmful), and it **propagates the real `osascript`/`notify-send` exit status** instead of `|| true`-ing it away (see "The Cowork block modal" — without this every failure logged as `alert_rc=0`).
 - `plugins/rogue/skills/{setup,status}/SKILL.md` — slash commands (`/rogue:setup`, `/rogue:status`) in the skills format. **Instructions to Claude**, not scripts — Claude runs the bash/PowerShell inside them step-by-step (each carries macOS/Linux and Windows variants). `setup` sets `disable-model-invocation: true` (it writes credentials, so user-invoke only); `status` is read-only and model-invocable. Auto-discovered from `skills/` — no manifest entry needed.
 - `install.sh` / `install.ps1` — one-line installers. Both add the marketplace via the Claude CLI (`claude plugin marketplace add` + `claude plugin install`) — they do NOT download the release tarball.
 - `scripts/build-release.sh` + `.github/workflows/release.yml` — tag-driven release pipeline. Pushing a `v*` tag builds a single cross-platform `dist/rogue-plugin-claude.tar.gz` (both `.sh` and `.ps1` scripts) and attaches it to the release. The artifact filename intentionally has **no version and no OS suffix** so `/latest/` URLs stay stable. (The tarball is consumed by `compile-customer-plugin.sh` for MDM bundles; the marketplace install clones the repo directly.)
@@ -111,7 +112,7 @@ The reason: the backend's Coding Agents roster keys one row per `host | actor-em
 Two rules follow, and both are load-bearing:
 
 - **Resolve host/version/agent in ONE place per plugin**, so the heartbeat and the dispatcher cannot disagree: `scripts/install-id.sh` (sourced by both, sh side), `installId()` in `scripts/shared.mjs` (Gemini). The `.ps1` halves have no such seam and mirror their `heartbeat.ps1` inline; keep them in step. A single differing segment fingerprints a SECOND roster row for one install.
-- **`agent` is per-surface and free-form**, not the family: `cursor`, `github_copilot`, `gemini_cli`, `codex_cli`/`codex_app`, `antigravity`/`antigravity_ide`/`antigravity_cli`, and for Claude a display label (`Claude Code - CLI` / `- Desktop` / `Claude Cowork`). The backend also keys its latest-version lookup on this value, so changing it drops the "outdated" badge for that surface.
+- **`agent` is per-surface and free-form**, not the family: `cursor`, `github_copilot`, `gemini_cli`, `codex_cli`/`codex_app`, `antigravity`/`antigravity_ide`/`antigravity_cli`, and for Claude `claude_code` / `claude_code_desktop` / `claude_cowork`. The backend keys its latest-version lookup (`PLUGIN_REPOS`) on this exact value, which is why every one of them is a stable snake_case id and never a display label — Claude used to send `Claude Code - CLI`, which matched no key, so **every** Claude row carried `latest_version: null` / `update_available: false` however old the install was. Rendering a human label is the dashboard's job. A new surface id needs its own `PLUGIN_REPOS` entry (as `codex_app` and `antigravity_cli` did) or it silently never resolves a version; changing an existing one also re-fingerprints the roster row (`host|actor|family|agent`), so the old row lingers until it ages out.
 
 Older installs send none of the three; the backend falls back to refreshing whatever rows that actor already has, so a mixed fleet degrades rather than duplicating.
 
@@ -158,7 +159,7 @@ The Git Bash stand-down matters because Git Bash's `~` maps to `%USERPROFILE%` �
 
 **No `-File` on the PowerShell entry.** Logic loads via `[scriptblock]::Create((Get-Content ...))` so ExecutionPolicy never applies (this also survives a GPO-enforced policy, which `-ExecutionPolicy Bypass` does not). The plugin root is read via `(Get-Item Env:CLAUDE_PLUGIN_ROOT).Value` at runtime — dollar-free so Git Bash can't mangle it (see polyglot rules).
 
-`scripts/warn.sh` is the SessionStart "not configured" nudge (sh path; `hook.ps1` emits the hint inline on the Windows path). `auto-update.{sh,ps1}` are the SessionStart background updaters. `heartbeat.{sh,ps1}` are the background presence beacons — fire-and-forget `POST /api/v1/hooks/status` (JSON body: `agent_family: "claude"` fixed enum, `agent` display label from `$CLAUDE_CODE_ENTRYPOINT`, `version` from `plugin.json` via grep/sed or regex, `host`, actor fields) that registers the install in the dashboard's Coding Agents roster and learns `update_available`. Reads the plugin version without `python3` for the fresh-macOS reason below.
+`scripts/warn.sh` is the SessionStart "not configured" nudge (sh path; `hook.ps1` emits the hint inline on the Windows path). `auto-update.{sh,ps1}` are the SessionStart background updaters. `heartbeat.{sh,ps1}` are the background presence beacons — fire-and-forget `POST /api/v1/hooks/status` (JSON body: `agent_family: "claude"` fixed enum, `agent` surface id from the shared table in `scripts/surface.{sh,ps1}` (`rogue_surface_agent_id` / `Get-RogueSurfaceAgentId`) — a stable `claude_code` / `claude_code_desktop` / `claude_cowork`, never a display label, because that value IS the backend's latest-version key; it checks `$CLAUDE_CODE_IS_COWORK` before `$CLAUDE_CODE_ENTRYPOINT` since Cowork spawns Claude Code with `CLAUDE_CODE_ENTRYPOINT=local-agent`, `version` from `plugin.json` via grep/sed or regex, `host`, actor fields) that registers the install in the dashboard's Coding Agents roster and learns `update_available`. Reads the plugin version without `python3` for the fresh-macOS reason below.
 
 **Two triggers, one script — in ALL SIX plugins: a session trigger AND a per-turn one, distinguished by `$1` / `param($Trigger)` / `process.argv[2]`, defaulting to the session one.** The session trigger alone meant a session left open for days produced exactly ONE beacon and ONE log upload for its whole lifetime — the roster row went stale and the hook log sat on disk unshipped. The log shipper rides along inside `heartbeat.*` exactly as it already did, so adding the per-turn trigger was a call site plus a throttle, never a second code path.
 
@@ -195,12 +196,119 @@ Because the per-turn trigger fires every turn, the **beacon POST is throttled** 
 Invariants to preserve when editing hooks (apply to **both** dispatchers — keep them in lockstep):
 
 - **Resolve env files in this precedence order** — `${CLAUDE_PLUGIN_ROOT}/env` (bundled defaults), then `/etc/rogue/env` (MDM) / `C:\ProgramData\rogue\env`, then `$HOME/.rogue-env` / `%USERPROFILE%\.rogue-env` (per-user). Later wins; process env wins over all files. `hook.sh` `source`s the files (valid POSIX sh); `hook.ps1` regex-parses the same `export KEY=value` lines and decodes the shell quoting via `ConvertFrom-ShellQuoted` so values round-trip identically. Never source from a world-writable path like `/tmp`.
-- **Actor cascade lives in `scripts/actor.sh`** (sh) / is inlined in `hook.ps1` (ps). Per-var fallback: existing env → `git config --global user.{email,name}` → `CLAUDE_CODE_USER_EMAIL` (local-part as name) → `hostname`/`whoami` (`COMPUTERNAME`/`USERNAME`) last-resort. Resolved every hook; no on-disk cache.
+- **Actor cascade lives in `scripts/actor.sh`** (sh) / is inlined in `hook.ps1` **and** `heartbeat.ps1` (ps — keep all three in lockstep). Per-var, **first NON-SYNTHETIC candidate wins**: email `ROGUE_ACTOR_EMAIL` → `CLAUDE_CODE_USER_EMAIL` → `git config --global user.email` → marker `unknown@<hostname>` (`COMPUTERNAME` on Windows; plain `unknown` with no hostname); name `ROGUE_ACTOR_NAME` → local-part of `CLAUDE_CODE_USER_EMAIL` → `git config --global user.name` → `whoami` (sh) / `USERNAME` then `[Environment]::UserName` (ps — never `whoami.exe`, whose `DOMAIN\user` output is a different identity string) → marker `unknown`. Resolved every hook; no on-disk cache. **`CLAUDE_CODE_USER_EMAIL` deliberately outranks `git config`**: in Claude Cowork the hook runs in a sandbox as unix user `claude` whose git identity is Anthropic's synthetic `Claude <noreply@anthropic.com>`, so a git-first cascade reported every Cowork user as "Claude" while the real authenticated email sat unread. On a normal dev machine `CLAUDE_CODE_USER_EMAIL` is unset, so the git identity is still what gets used.
+- **Synthetic-identity rejection is part of that cascade, and applies to `ROGUE_ACTOR_*` too.** Any candidate that is empty/whitespace, `claude`, `claude code`, or `noreply@anthropic.com` (case-insensitive, whitespace-squeezed) is discarded — `_rogue_is_synthetic` in `actor.sh`, `Test-SyntheticActor`/`Select-ActorValue` in the `.ps1` files (above the `ROGUE_PS_LIB_ONLY` seam, covered by `tests/test_actor_sh.sh` + `tests/test_hook_ps1.ps1`). Screening the *explicit* `ROGUE_ACTOR_*` vars is load-bearing: compiled bundles already in the field bake `: "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email)}"` into `${CLAUDE_PLUGIN_ROOT}/env` (sourced BEFORE `actor.sh`), whose `$( )` runs at hook-fire time inside the sandbox — so a plugin update can only repair those installs by distrusting a poisoned value. The compile scripts no longer emit that pre-seed; don't add it back, and never fall back to a plausible-looking name — the last resort is the `unknown` marker.
 - **Fail-open is layered** — the dispatcher emits `{}` on missing API key or any HTTP failure, and every command string ends `; exit 0` so a dead dispatcher (missing binary, crashed script) is a silent success with empty stdout rather than a visible hook error. Never reintroduce `|| echo '{}'`-style wrappers — `||` is a PS 5.1 parse error (see the polyglot rules).
 - **`x-rogue-event` must match the hook's key** in `hooks.json`. The server routes on this header. There is **no** `x-rogue-source` header (that is cursor-only).
-- Block detection covers `"decision":"block"`, `"continue":false`, `"permissionDecision":"deny"`, `"behavior":"deny"`; reason from `permissionDecisionReason`→`reason`→`stopReason`→`message`. It exists for LOGGING ONLY (`outcome=block reason=...` in the hook log) — both dispatchers relay the response verbatim and Claude (CLI and Desktop/Cowork) renders the block natively. Don't reintroduce a local modal/notification.
+- Block detection covers `"decision":"block"`, `"continue":false`, `"permissionDecision":"deny"`, `"behavior":"deny"`; reason from `permissionDecisionReason`→`reason`→`stopReason`→`message`. It drives the hook log (`outcome=block reason=...`) and, on Claude Cowork local sessions ONLY, the native modal below. Both dispatchers still relay the response **verbatim** — the modal is a side-channel, never a substitute for the decision. The CLI and the Claude Desktop app render blocks natively and must NEVER get a modal; don't widen it to them.
 - Timeouts: every hook `timeout` in `hooks.json` is **20s**; the synchronous dispatcher's HTTP client (`hook.sh` `curl --max-time`, `hook.ps1` `Invoke-WebRequest -TimeoutSec`) is **15s** so a slow request fails *inside* the hook budget (clean fail-open) rather than being hard-killed at the timeout. The budget is generous because Windows pays a PowerShell cold-start before the request even begins; the happy path is unaffected (the timeout only bites on a hung request). The detached SessionStart scripts (`heartbeat`, `auto-update`) run in the background, so their own HTTP timeouts are independent of the hook timeout.
 
+### The Cowork block modal (Claude Cowork local sessions ONLY)
+
+`c31ee5a` deleted `security-alert.{sh,ps1}` on the grounds that "Claude Desktop
+now displays hook blocks natively, so the plugin is pure relay". That was true for
+the surfaces that existed then — the CLI and the Desktop app — and it is still
+true for both. **It is not true for Claude Cowork**, which was not a surface when
+that commit landed, so the modal is back — for Cowork alone.
+
+**Cowork's client discards hook-authored text on every documented channel.**
+Measured 2026-08-18, one session per surface, with a probe plugin that recorded
+its own `uname`/`whoami`/`HOME`/process ancestry/env from inside the hook process:
+
+| block channel | Cowork cloud | Cowork local |
+|---|---|---|
+| `{"decision":"block","reason":R}` | spinner hangs forever, no text | turn stops, **no text** |
+| `{"continue":false,"stopReason":R}` | spinner hangs forever, no text | turn stops, **no text** |
+| `systemMessage` alongside a block | — | turn stops, **no text** |
+| hook exit code 2 + message on stderr | — | turn stops, **no text** |
+| `hookSpecificOutput.additionalContext` | renders (the model relays it) | renders (the model relays it) |
+| native `osascript` modal | impossible — no GUI | **works** |
+
+Four independent documented channels all reach the same dead end, so no JSON shape
+fixes this. In a local session the OS modal is the only channel that reaches the
+user; `additionalContext` is not a substitute (it reaches the *model*, which may or
+may not repeat it).
+
+**Where the hook actually runs** — this is what the gate keys off, and why cloud is
+excluded rather than left to fail silently:
+
+| | Cowork **local** | Cowork **cloud** |
+|---|---|---|
+| `CLAUDE_CODE_ENTRYPOINT` | `local-agent` | `remote_cowork` |
+| `CLAUDE_CODE_IS_COWORK` | `1` | **unset** |
+| `CLAUDE_CODE_REMOTE` | **unset** | `true` |
+| `CLAUDE_CODE_HOST_PLATFORM` | `darwin` | unset |
+| hook process runs on | the macOS host, `uid=501`, `HOME=/Users/<user>`, parent `Claude.app` | a Linux container, `root`, `HOME=/root` |
+| `osascript` | `/usr/bin/osascript`, works | **ABSENT** (Linux, no `DISPLAY`, no `DBUS`) |
+
+Note that **local Cowork's entrypoint is `local-agent`, not a `*cowork*` value** —
+entrypoint matching alone files it as the CLI. `CLAUDE_CODE_IS_COWORK` is what
+identifies it, which is why `install-id.sh` checks that first.
+
+**The gate** is `_rogue_want_alert` in `hook.sh` and `Test-WantAlert` in `hook.ps1`
+(kept in lockstep; there is no shared seam between the shells, the same trap
+`install-id.sh` documents for the actor/surface cascade). Four tests, cheap ones
+first:
+
+1. **Cowork only** — reuses `ROGUE_INSTALL_AGENT == "claude_cowork"` from
+   `install-id.sh` rather than re-deriving the surface. A second copy of that
+   cascade would drift from the roster's.
+2. **Local only** — `CLAUDE_CODE_REMOTE` set means the cloud container; skip.
+3. **Escape hatches** — `ROGUE_ALERT=0` disables entirely; `ROGUE_ALERT_EVENTS`,
+   when set, is a space-separated event allowlist (see the open question below).
+4. **Capability last** — `command -v osascript`. The env vars above are
+   undocumented and will move; a GUI channel that isn't there means no modal
+   whatever they say. (`hook.ps1` has no capability probe — `security-alert.ps1`
+   uses a native `WScript.Shell` popup rather than an external binary, so
+   `alert_launched` / `alert_error` logging is what catches a UI failure.)
+
+A declined alert logs `alert_skipped=1 entrypoint=… cowork=… remote=… agent=…`
+with every gate input, so a future surface change is diagnosable from
+`~/.rogue/hook.log` alone. A fired one logs `alert_rc=<status> entrypoint=…`, plus
+`alert_err="…"` when that status is non-zero.
+
+**`security-alert.sh` must propagate the real `osascript` status** — each branch
+ends `exit $?`, never `|| true` followed by `exit 0`. The whole point of `alert_rc`
+is to make TCC denials, AppleScript errors and missing GUI sessions visible, and
+the restored pre-`c31ee5a` script swallowed every one of them with `|| true` and
+reported 0, so the log line carried no signal at all. The caller can afford the
+real status because it backgrounds the helper in a subshell that only *logs* it —
+a non-zero exit there can never fail the hook decision. Its stderr is preserved
+for the same reason (`2>&1 >/dev/null`, in that order): osascript returns 1 for a
+TCC denial, a syntax error, a missing GUI session **and** for "User canceled"
+(-128), so `alert_err` is the only thing that tells them apart. Reaching the
+no-channel-at-all fallback exits **127**, not 0 — an alert nobody saw must not log
+as a success. `tests/test_hook_sh.sh` asserts the exact `alert_rc=1` and the
+captured text; a bare `alert_rc=` assertion passes against the broken version.
+
+**Two things must not be simplified.**
+
+- **The sh side's `( … ) >/dev/null 2>&1 </dev/null &`** redirects the *subshell's
+  own* fds, not just `security-alert.sh`'s. This was a real fail-open leak, fixed
+  in `dbfd3ee`: without it the subshell inherits `hook.sh`'s stdout — the pipe
+  Claude reads — and because it waits on the modal to capture `alert_rc`, it holds
+  that pipe open until the dialog is dismissed. Claude waits for stdout EOF up to
+  the hook `timeout`, so a dismissal slower than the timeout makes Claude time the
+  hook out and **fail open, silently letting the blocked prompt through**.
+  `tests/test_hook_sh.sh` regression-tests this with a hanging `osascript` stub and
+  asserts the dispatcher returns immediately.
+- **The ps1 side relays before it launches**, and launches detached via
+  `Start-Process -EncodedCommand` (Base64 UTF-16LE). Same hazard, plus:
+  `Start-Process` joins `-ArgumentList` with spaces and does not quote elements, so
+  a `-Command` scriptblock bootstrap reaches the child mangled and silently never
+  runs. `tests/test_hook_ps1.ps1` pins the ordering and both flags.
+
+**Open question, deliberately left open.** `PreToolUse` `permissionDecision:deny`
+**does** render in Cowork **cloud** (observed twice — `CREDENTIAL_THEFT`,
+`DANGEROUS_OPERATION`, reason text visible, no hang). It has **not** been tested in
+Cowork **local**. If tool denials render locally too, the modal should narrow to
+`UserPromptSubmit` — the one event with no visible channel — otherwise tool blocks
+get reported twice. Until that is measured, firing on every block event matches the
+pre-`c31ee5a` behaviour and is the safe default, and
+`ROGUE_ALERT_EVENTS="UserPromptSubmit"` narrows it **without a release**.
+
+**Delete this whole path once Cowork renders the reason itself**, exactly as it was
+deleted once Claude Desktop did.
 ## The log shipper
 
 The hook log is also **uploaded** to `POST /api/v1/hooks/logs`, so a support engineer can read a customer's log without an endpoint agent on the box. Full design, rationale and the state-machine proof: `docs/plugin-log-shipper.md`; the backend/agent side that receives it is `docs/log-shipping-backend.md`. What matters when editing:
@@ -247,6 +355,8 @@ The hook log is also **uploaded** to `POST /api/v1/hooks/logs`, so a support eng
 - **Only the claude plugin gets its per-turn heartbeat from `hooks.json`.** The other five fire theirs from inside the dispatcher, which looks like a pointless asymmetry and is not: Codex, Copilot and Gemini fingerprint the hook definition and skip untrusted command hooks until the user runs `/hooks`, so a new entry would have disabled every Rogue hook on every existing install until each user re-approved. Claude Code has no such gate. Full table in the heartbeat section.
 - Release tarballs deliberately omit BOTH the version and an OS suffix from the filename, so `/releases/latest/download/rogue-plugin-claude.tar.gz` stays stable. The package is cross-platform by content (ships `.sh` and `.ps1`).
 - `install.sh` / `install.ps1` install via the Claude CLI marketplace (git clone), NOT by downloading the tarball. The tarball exists for `compile-customer-plugin.sh` (MDM bundles).
+- The dispatchers are "pure relay" on every Claude surface **except** Cowork local, where they also fire an OS modal. That asymmetry looks like the `security-alert` hack `c31ee5a` deleted, and it is the same code — restored because Cowork hides the block reason the way the old Claude app did. It is gated to one surface and never alters the relayed body. See "The Cowork block modal".
+- `security-alert.sh` is invoked with `bash` from a script that is otherwise strictly POSIX `sh`. Deliberate: its literal-`\n`-to-newline conversion is a bash-only substitution, and it only ever runs on a macOS Cowork host, where `bash` is guaranteed.
 - Log rotation is checked on **every** `log()` call rather than by a scheduled job, which looks wasteful (one `wc -c` per hook). It is the only placement that holds: an unconfigured install runs nothing but the dispatcher, and that dispatcher logs a line per event.
 - The hook log's `provider=` token intentionally differs from the heartbeat's `agent_family`/`agent` for Codex, Gemini and Copilot. It tracks the log **file name**, not the server's roster vocabulary — see **The hook log**.
 - `rgx!` prompt prefix is a server-side convention (false-positive escape hatch). The plugin itself doesn't parse it — the API does.

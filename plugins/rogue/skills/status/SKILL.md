@@ -58,17 +58,43 @@ plugin version exists. The plugin version is read from the manifest without
 . /tmp/rogue-source-env.sh
 PJ=$(find "$HOME/.claude/plugins" -path '*rogue*/.claude-plugin/plugin.json' 2>/dev/null | head -1)
 VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PJ" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-case "$(printf '%s' "${CLAUDE_CODE_ENTRYPOINT:-}" | tr '[:upper:]' '[:lower:]')" in
-  *cowork*)  AGENT="Claude Cowork" ;;
-  *desktop*) AGENT="Claude Code - Desktop" ;;
-  *)         AGENT="Claude Code - CLI" ;;
-esac
+# Resolve the actor through the SAME cascade every hook uses, instead of posting
+# whatever the env files happen to hold. A bundle compiled before the cascade fix
+# pre-seeds ROGUE_ACTOR_* from `git config` at read time, which in a sandbox is
+# Anthropic's synthetic "Claude <noreply@anthropic.com>" — posting that raw would
+# register a roster row under the wrong actor, and the fingerprint is
+# host|actor|family|agent, so it would be a SECOND row for this install.
+PLUGIN_ROOT=$(dirname "$(dirname "$PJ")")
+if [ -r "$PLUGIN_ROOT/scripts/actor.sh" ]; then
+  . "$PLUGIN_ROOT/scripts/actor.sh"
+else
+  echo "WARNING: actor.sh not found under $PLUGIN_ROOT — reporting raw env values"
+fi
+# Surface id from the SHARED table in scripts/surface.sh — the same one the hooks
+# and the heartbeat read, so this command can never report a different surface than
+# the row it just registered. It is a stable snake_case id, not a display label,
+# because the backend resolves the latest release from this exact value, and it
+# checks CLAUDE_CODE_IS_COWORK first (Cowork spawns Claude Code with
+# CLAUDE_CODE_ENTRYPOINT=local-agent, so the entrypoint alone files it as the CLI).
+AGENT=""
+if [ -r "$PLUGIN_ROOT/scripts/surface.sh" ]; then
+  . "$PLUGIN_ROOT/scripts/surface.sh"
+  AGENT=$(rogue_surface_agent_id 2>/dev/null)
+fi
+[ -n "$AGENT" ] || AGENT="claude_code"
+# POST a JSON body, exactly as scripts/heartbeat.sh does: /hooks/status is
+# registered POST-only and validates body.agent_family, so the old GET with
+# x-rogue-agent-* headers could only ever fail. Escape each value so a name or
+# host containing " or \ can't break the JSON.
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+BODY=$(printf '{"agent_family":"claude","agent":"%s","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
+  "$(esc "$AGENT")" "$(esc "${VER:-unknown}")" "$(esc "$(hostname 2>/dev/null || echo unknown)")" \
+  "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")")
 curl -s -w "\n%{http_code}" -X POST \
   "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
   -H "x-rogue-api-key: $ROGUE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"agent_family\":\"claude\",\"agent\":\"$(esc "$AGENT")\",\"version\":\"${VER:-unknown}\",\"host\":\"$(esc "$(hostname)")\",\"actor_email\":\"$(esc "${ROGUE_ACTOR_EMAIL:-}")\",\"actor_name\":\"$(esc "${ROGUE_ACTOR_NAME:-}")\"}"
+  -d "$BODY"
 ```
 
 **A POST with a JSON body, not a GET with `x-rogue-agent-*` headers.** The route is
@@ -117,8 +143,25 @@ Parse the JSON response and display in a clear format:
 
 ```bash
 . /tmp/rogue-source-env.sh
-echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unset)}"
-echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unset)}"
+RAW_EMAIL="${ROGUE_ACTOR_EMAIL:-}"; RAW_NAME="${ROGUE_ACTOR_NAME:-}"
+# Report what the hooks ACTUALLY send, which is the cascade's output — not the
+# raw env-file values. Those two differ whenever the file carries an identity the
+# cascade rejects (a bundle compiled before the fix pre-seeds ROGUE_ACTOR_* from
+# `git config`, which in a sandbox is Anthropic's synthetic Claude identity), and
+# reporting the raw one would contradict the row Step 2 just registered.
+PJ=$(find "$HOME/.claude/plugins" -path '*rogue*/.claude-plugin/plugin.json' 2>/dev/null | head -1)
+PLUGIN_ROOT=$(dirname "$(dirname "$PJ")")
+if [ -r "$PLUGIN_ROOT/scripts/actor.sh" ]; then
+  . "$PLUGIN_ROOT/scripts/actor.sh"
+else
+  echo "WARNING: actor.sh not found under $PLUGIN_ROOT — showing raw env values"
+fi
+echo "Actor email: ${ROGUE_ACTOR_EMAIL:-(unresolved)}"
+echo "Actor name:  ${ROGUE_ACTOR_NAME:-(unresolved)}"
+[ "$RAW_EMAIL" = "${ROGUE_ACTOR_EMAIL:-}" ] || \
+  echo "  note: env file holds \"${RAW_EMAIL:-(unset)}\", replaced by the cascade"
+[ "$RAW_NAME" = "${ROGUE_ACTOR_NAME:-}" ] || \
+  echo "  note: env file holds \"${RAW_NAME:-(unset)}\", replaced by the cascade"
 echo "--- recent hook activity ---"
 # Same precedence as the dispatcher: the env files first (system, then per-user),
 # with the process environment winning over both. Read with sed, never by
@@ -149,11 +192,20 @@ missing file with a healthy connection just means no events have fired yet.
 
 If either is unset:
 
-- **Managed deployment**: the MDM script (`mdm-provision-actor.sh`) hasn't run
-  yet or ran with empty placeholders. Events are POSTing with blank actor
-  headers until MDM provisioning completes. Force an enforcement run on your
-  MDM (Kandji "Run library item now", `sudo jamf policy`).
-- **Individual user**: re-run `/rogue:setup` to populate identity.
+- **A real address and name** — nothing to do.
+- **`unknown@<host>` / `unknown`** — no usable identity was found anywhere: the
+  cascade tried `ROGUE_ACTOR_*`, `CLAUDE_CODE_USER_EMAIL`, `git config --global`
+  and `whoami`, and either found them empty or rejected them as the sandbox's
+  synthetic `Claude <noreply@anthropic.com>`. Events still POST and are still
+  enforced; they are just attributed to a marker instead of a person. Fix by
+  setting a real git identity, or by provisioning `ROGUE_ACTOR_*` explicitly:
+  - **Managed deployment**: the MDM script (`mdm-provision-actor.sh`) hasn't run
+    yet or ran with empty placeholders. Force an enforcement run on your MDM
+    (Kandji "Run library item now", `sudo jamf policy`).
+  - **Individual user**: re-run `/rogue:setup` to populate identity.
+- **A `note:` line** — the credential file carries an identity the cascade
+  rejected or superseded. Harmless, and expected from bundles compiled before
+  the cascade fix; the reported value is the one actually sent.
 
 ### Upload the log to Rogue support
 
@@ -345,13 +397,65 @@ $key = $creds['ROGUE_API_KEY']
 if (-not $key) { 'API key: not resolved — run /rogue:setup'; return }
 'API key resolved: ...' + $key.Substring([Math]::Max(0,$key.Length-4))
 $base = if ($creds['ROGUE_BASE_URL']) { $creds['ROGUE_BASE_URL'].TrimEnd('/') } else { 'https://api.rogue.security' }
-$body = @{ agent_family='claude'; agent='Claude Code - CLI'; host=$env:COMPUTERNAME; actor_email=[string]$creds['ROGUE_ACTOR_EMAIL'] } | ConvertTo-Json -Compress
+$ep = ([string]$env:CLAUDE_CODE_ENTRYPOINT).ToLower()
+if ($env:CLAUDE_CODE_IS_COWORK)     { $agent = 'claude_cowork' }
+elseif ($ep -like '*cowork*')       { $agent = 'claude_cowork' }
+elseif ($ep -like '*desktop*')      { $agent = 'claude_code_desktop' }
+else                                { $agent = 'claude_code' }
+$pj = Get-ChildItem "$env:USERPROFILE\.claude\plugins" -Recurse -Filter plugin.json -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -like '*rogue*' } | Select-Object -First 1
+$ver = 'unknown'
+if ($pj) {
+  $m = [regex]::Match((Get-Content -Raw -LiteralPath $pj.FullName), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+  if ($m.Success) { $ver = $m.Groups[1].Value }
+}
+# Resolve the actor through hook.ps1's own screen rather than trusting the env
+# files. A bundle compiled before the cascade fix pre-seeds ROGUE_ACTOR_* from
+# `git config` at read time, which in a sandbox is Anthropic's synthetic
+# "Claude <noreply@anthropic.com>"; posting that raw registers a roster row under
+# the wrong actor, and the row is fingerprinted on host|actor|family|agent.
+# ROGUE_PS_LIB_ONLY loads hook.ps1's helpers without running its dispatcher.
+# Host for the roster row, resolved exactly as hook.ps1 and heartbeat.ps1 do.
+# COMPUTERNAME is unset in some service contexts, and the row is fingerprinted on
+# host|actor|family|agent — so posting a bare (empty) host here while ordinary
+# hook traffic posts the DNS name would open a SECOND row for this install.
+$dnsHost = ''
+try { $dnsHost = [System.Net.Dns]::GetHostName() } catch {}
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { $hostName = $dnsHost }
+if (-not $hostName) { $hostName = 'unknown' }
+$hookPs1 = Get-ChildItem "$env:USERPROFILE\.claude\plugins" -Recurse -Filter hook.ps1 -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -like '*rogue*' } | Select-Object -First 1
+$actorEmail = [string]$creds['ROGUE_ACTOR_EMAIL']; $actorName = [string]$creds['ROGUE_ACTOR_NAME']
+if ($hookPs1) {
+  $env:ROGUE_PS_LIB_ONLY = '1'; . $hookPs1.FullName; $env:ROGUE_PS_LIB_ONLY = $null
+  # Mirrors the cascade in hook.ps1 / heartbeat.ps1 — keep all three in step.
+  $hostMail  = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)
+  $actorName = Select-ActorValue @($creds['ROGUE_ACTOR_NAME'], (($hostMail -split '@')[0]))
+  if (-not $actorName) {
+    $gn = ''; try { $gn = (& git config --global user.name 2>$null | Out-String).Trim() } catch {}
+    $actorName = Select-ActorValue @($gn, $env:USERNAME, [Environment]::UserName)
+  }
+  if (-not $actorName) { $actorName = 'unknown' }
+  $actorEmail = Select-ActorValue @($creds['ROGUE_ACTOR_EMAIL'], $env:CLAUDE_CODE_USER_EMAIL)
+  if (-not $actorEmail) {
+    $ge = ''; try { $ge = (& git config --global user.email 2>$null | Out-String).Trim() } catch {}
+    $actorEmail = Select-ActorValue @($ge)
+  }
+  if (-not $actorEmail) {
+    $h = Select-ActorValue @($env:COMPUTERNAME, $dnsHost)
+    if ($h) { $actorEmail = "unknown@$h" } else { $actorEmail = 'unknown' }
+  }
+} else {
+  'WARNING: hook.ps1 not found - reporting raw env values, which may be a sandbox identity'
+}
+$body = @{ agent_family='claude'; agent=$agent; version=$ver; host=$hostName; actor_email=$actorEmail; actor_name=$actorName } | ConvertTo-Json -Compress
 try {
   $r = Invoke-WebRequest -Uri "$base/api/v1/hooks/status" -Method Post -Headers @{ 'x-rogue-api-key'=$key } -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -UseBasicParsing -TimeoutSec 10
   "Connected (HTTP $($r.StatusCode)): $($r.Content)"
 } catch { "Status check failed: $($_.Exception.Message)" }
-"Actor email: $($creds['ROGUE_ACTOR_EMAIL'])"
-"Actor name:  $($creds['ROGUE_ACTOR_NAME'])"
+"Actor email: $actorEmail"
+"Actor name:  $actorName"
 '--- recent hook activity ---'
 # The process environment wins over every file, exactly as it does in the
 # dispatcher - overlay it before deriving the path, or an operator who exported

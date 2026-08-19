@@ -187,8 +187,8 @@ if ($ApiKey) {
         # Prefer claude when it's a target (its heartbeat backs the row,
         # preserving prior behavior); otherwise use the first selected agent.
         # Values mirror each heartbeat.
-        $scFamily = 'claude'; $scAgent = 'Claude Code - CLI'
-        if ($hasClaude)      { $scFamily = 'claude';  $scAgent = 'Claude Code - CLI' }
+        $scFamily = 'claude'; $scAgent = 'claude_code'
+        if ($hasClaude)      { $scFamily = 'claude';  $scAgent = 'claude_code' }
         elseif ($hasCodex)   { $scFamily = 'openai';  $scAgent = 'codex_cli' }
         elseif ($hasCursor)  { $scFamily = 'cursor';  $scAgent = 'cursor' }
         elseif ($hasGemini)  { $scFamily = 'gemini';  $scAgent = 'gemini_cli' }

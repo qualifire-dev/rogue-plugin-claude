@@ -396,7 +396,7 @@ STATUS_UPDATE=""
 status_agent_ctx() { # sets SC_FAMILY / SC_AGENT from $agents
   local a
   for a in ${agents:-}; do
-    [ "$a" = claude ] && { SC_FAMILY="claude"; SC_AGENT="Claude Code - CLI"; return; }
+    [ "$a" = claude ] && { SC_FAMILY="claude"; SC_AGENT="claude_code"; return; }
   done
   set -- ${agents:-claude}
   case "${1:-claude}" in
@@ -404,7 +404,7 @@ status_agent_ctx() { # sets SC_FAMILY / SC_AGENT from $agents
     cursor)  SC_FAMILY="cursor";  SC_AGENT="cursor" ;;
     gemini)  SC_FAMILY="gemini";  SC_AGENT="gemini_cli" ;;
     copilot) SC_FAMILY="copilot"; SC_AGENT="github_copilot" ;;
-    *)       SC_FAMILY="claude";  SC_AGENT="Claude Code - CLI" ;;
+    *)       SC_FAMILY="claude";  SC_AGENT="claude_code" ;;
   esac
 }
 status_check() { # status_check <api-key> <actor-email>

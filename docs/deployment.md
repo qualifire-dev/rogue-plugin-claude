@@ -282,7 +282,7 @@ overwrites `/etc/rogue/env` with the new identity. No manual cleanup.
 | `/rogue:status` says "not configured" | Plugin didn't deploy, or `${CLAUDE_PLUGIN_ROOT}/env` was stripped | Re-upload via Claude management UI; verify zip has `env` at root |
 | Events in dashboard have blank actor | Plugin landed before MDM script (race during rollout) | Wait for next MDM enforcement cycle, or kick it manually |
 | No events at all in dashboard | Hooks fail-open silently on curl timeout or network error | Check device can reach `api.rogue.security`; inspect `~/.rogue/auto-update.log` for clues |
-| macOS modal alert doesn't fire on blocked prompts | Either running in CLI mode (`CLAUDE_CODE_ENTRYPOINT=cli` correctly suppresses it), or System Events automation permission denied for the terminal app | Confirm context; grant automation in System Settings → Privacy & Security → Automation |
+| macOS modal alert doesn't fire on blocked prompts | Expected on every surface except **Claude Cowork local** — the CLI and the Desktop app render the block reason natively and are suppressed deliberately. Otherwise: a cloud Cowork session (`CLAUDE_CODE_REMOTE=true`, a headless container with no GUI), `ROGUE_ALERT=0`, an event excluded by `ROGUE_ALERT_EVENTS`, or no `osascript` on `PATH` | Read `~/.rogue/hook.log`: `alert_skipped=1` names the gate input that declined (`entrypoint=` / `cowork=` / `remote=` / `agent=`), and `alert_rc=<status>` (plus `alert_err="…"`) reports a modal that was attempted and failed. **No Automation permission is needed** — the alert does not use `tell application "System Events"`, so a Privacy & Security → Automation grant is not the fix |
 | Plugin upload rejected by Claude management UI | Hooks file declares unsupported events, or marketplace.json missing | Recompile with the latest `compile-customer-plugin.sh` — the script filters hooks and generates marketplace.json |
 
 ## Security notes
@@ -330,8 +330,12 @@ overwrites `/etc/rogue/env` with the new identity. No manual cleanup.
   exactly one runs per machine. Install with the PowerShell one-liner
   (`iwr -useb .../install.ps1 | iex`). Credentials live at
   `%USERPROFILE%\.rogue-env` (per-user) or `C:\ProgramData\rogue\env` (MDM);
-  the block modal uses `System.Windows.Forms.MessageBox`. On Linux the modal
-  uses `notify-send` (silent fall-through if absent); everything else works.
+  the block modal uses `WScript.Shell.Popup` (**not**
+  `System.Windows.Forms.MessageBox`, which silently no-ops from the detached,
+  hidden process the hook launches it in). On Linux the modal uses `notify-send`
+  (silent fall-through if absent); everything else works. Note the modal itself
+  fires **only in Claude Cowork local sessions** — the CLI and the Desktop app
+  display block reasons natively and get no modal on any platform.
 
 ---
 

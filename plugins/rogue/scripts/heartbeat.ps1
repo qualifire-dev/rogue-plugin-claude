@@ -101,6 +101,24 @@ function ConvertFrom-ShellQuoted {
     return $sb.ToString()
 }
 
+function Test-SyntheticActor {
+    # Duplicated from hook.ps1 (heartbeat.ps1 is standalone, like its copy of
+    # ConvertFrom-ShellQuoted). Keep in lockstep with actor.sh's
+    # _rogue_is_synthetic: empty/whitespace, "claude", "claude code" and
+    # "noreply@anthropic.com" are the sandbox identity, never a human.
+    param([string]$Value)
+    if ($null -eq $Value) { return $true }
+    $v = ($Value -replace '\s+', ' ').Trim().ToLowerInvariant()
+    return ($v -eq '' -or $v -eq 'claude' -or $v -eq 'claude code' -or $v -eq 'noreply@anthropic.com')
+}
+
+function Select-ActorValue {
+    param([string[]]$Candidates)
+    if ($null -eq $Candidates) { return '' }
+    foreach ($c in $Candidates) { if (-not (Test-SyntheticActor $c)) { return $c } }
+    return ''
+}
+
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -142,18 +160,40 @@ if (-not $apiKey) { Dbg 'not configured -> no-op'; exit 0 }
 $baseUrl = $creds['ROGUE_BASE_URL']; if (-not $baseUrl) { $baseUrl = 'https://api.rogue.security' }
 $baseUrl = $baseUrl.TrimEnd('/')
 
-# -- actor resolution (mirrors actor.sh) ------------------------------------
-$actorName = $creds['ROGUE_ACTOR_NAME']
-if (-not $actorName) { try { $actorName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorName -and $env:CLAUDE_CODE_USER_EMAIL) { $actorName = ($env:CLAUDE_CODE_USER_EMAIL -split '@')[0] }
-if (-not $actorName) { $actorName = $env:USERNAME }
+# -- actor resolution (mirrors actor.sh / hook.ps1: first non-synthetic wins) -
+# Screen the WHOLE address before splitting it. Taking the local-part first
+# smuggles the sandbox identity past the screen: noreply@anthropic.com is
+# rejected as an email, but its local-part "noreply" is not on the list.
+$hostMail = Select-ActorValue @($env:CLAUDE_CODE_USER_EMAIL)
+$actorName = Select-ActorValue @(
+    $creds['ROGUE_ACTOR_NAME'],
+    (($hostMail -split '@')[0])
+)
+if (-not $actorName) {
+    $gitName = ''
+    try { $gitName = (& git config --global user.name 2>$null | Out-String).Trim() } catch {}
+    # POSIX ends this cascade at `whoami`. Windows deliberately does NOT shell out
+    # to whoami.exe: its output is DOMAIN\user, a different identity string that
+    # would re-fingerprint every existing roster row, and it costs a process per
+    # hook. [Environment]::UserName is the true twin — it reads the process token,
+    # so it still answers in the service contexts where USERNAME is unset.
+    $actorName = Select-ActorValue @($gitName, $env:USERNAME, [Environment]::UserName)
+}
+if (-not $actorName) { $actorName = 'unknown' }
 
-$actorEmail = $creds['ROGUE_ACTOR_EMAIL']
-if (-not $actorEmail) { try { $actorEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {} }
-if (-not $actorEmail -and $env:CLAUDE_CODE_USER_EMAIL) { $actorEmail = $env:CLAUDE_CODE_USER_EMAIL }
+$actorEmail = Select-ActorValue @($creds['ROGUE_ACTOR_EMAIL'], $env:CLAUDE_CODE_USER_EMAIL)
 if (-not $actorEmail) {
-    if ($env:USERNAME -and $env:COMPUTERNAME) { $actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
-    elseif ($env:USERNAME) { $actorEmail = $env:USERNAME } else { $actorEmail = $env:COMPUTERNAME }
+    $gitEmail = ''
+    try { $gitEmail = (& git config --global user.email 2>$null | Out-String).Trim() } catch {}
+    $actorEmail = Select-ActorValue @($gitEmail)
+}
+if (-not $actorEmail) {
+    # Same fallback the roster host below already uses: COMPUTERNAME can be unset
+    # in service contexts, where the sh twin's `hostname` still answers.
+    $dnsHost = ''
+    try { $dnsHost = [System.Net.Dns]::GetHostName() } catch {}
+    $hostForActor = Select-ActorValue @($env:COMPUTERNAME, $dnsHost)
+    if ($hostForActor) { $actorEmail = "unknown@$hostForActor" } else { $actorEmail = 'unknown' }
 }
 
 # -- plugin version (regex from manifest, no python) ------------------------
@@ -166,19 +206,26 @@ if (Test-Path -LiteralPath $pj) {
 
 # -- agent display label from entrypoint (family is the fixed enum "claude") -
 # One table, in scripts/surface.ps1, shared with hook.ps1 - which stamps the
-# matching SLUG on each log line. Two copies of this mapping would eventually
-# drift, and a log line naming a different surface than the roster row for the same
-# session is worse than a line that names none. The literal below is a last-resort
-# guard for a damaged install, not a second copy of the mapping.
+# matching SLUG on each log line and sends this same id as x-rogue-agent. Two
+# copies of this mapping would eventually drift, and a log line naming a different
+# surface than the roster row for the same session is worse than a line that names
+# none. That table also checks CLAUDE_CODE_IS_COWORK FIRST: Cowork spawns Claude
+# Code with CLAUDE_CODE_ENTRYPOINT=local-agent, so entrypoint matching alone
+# reported every LOCAL Cowork install under the CLI surface.
+#
+# It answers a surface ID, not a display label: the id doubles as the backend's
+# latest-version key (PLUGIN_REPOS), which a label never matched - so every Claude
+# row carried update_available=false however old the install was. The literal below
+# is a last-resort guard for a damaged install, not a second copy of the mapping.
 $agent = ''
 try {
     $surfaceLib = Join-Path $pluginRoot 'scripts\surface.ps1'
     if (Test-Path -LiteralPath $surfaceLib) {
         . $surfaceLib
-        $agent = [string](Get-RogueSurfaceLabel)
+        $agent = [string](Get-RogueSurfaceAgentId)
     }
 } catch { $agent = '' }
-if (-not $agent) { $agent = 'Claude Code - CLI' }
+if (-not $agent) { $agent = 'claude_code' }
 
 $host_ = $env:COMPUTERNAME; if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 
