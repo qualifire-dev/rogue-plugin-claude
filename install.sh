@@ -299,11 +299,19 @@ gemini_install_extension() {
   src="$(dirname "$src")"
 
   # Reinstall cleanly so a re-run upgrades. Ignore uninstall errors (first run).
-  gemini extensions uninstall rogue >/dev/null 2>&1 || true
-  if gemini extensions install "$src" --consent >/dev/null 2>&1; then
+  # GEMINI_CLI_TRUST_WORKSPACE=true is Gemini's documented headless bypass for
+  # its folder-trust gate (default-ON): without it the install prompts "Do you
+  # trust the files in this folder?" for our own just-extracted temp dir, the
+  # prompt is invisible here (output swallowed), non-interactive default is No,
+  # and the install aborts with 'Installation aborted: Folder "..." is not
+  # trusted.' Scoped to these two commands only — no persistent trust granted.
+  GEMINI_CLI_TRUST_WORKSPACE=true gemini extensions uninstall rogue >/dev/null 2>&1 || true
+  if GEMINI_CLI_TRUST_WORKSPACE=true gemini extensions install "$src" --consent >/dev/null 2>&1; then
     ok "Extension installed via ${C_DIM}gemini extensions install${C_RESET}"
   else
-    warn "gemini extensions install failed. Run 'gemini extensions install $src' to see the error."
+    # No recovery command in the message: $src lives under $tmp, which the RETURN
+    # trap deletes on the way out of this function (same rule as install_antigravity).
+    warn "gemini extensions install failed — re-run the installer, or install manually: extract ${asset} from the GitHub release and run 'GEMINI_CLI_TRUST_WORKSPACE=true gemini extensions install <extracted-dir> --consent'."
     return 1
   fi
 }
