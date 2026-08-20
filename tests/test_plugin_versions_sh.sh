@@ -89,6 +89,30 @@ echo '{"version":"9.9.9"}' > "$fixture/plugins/copilot/plugin.json"
 if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then
   bad "empty VERSION file fails" "exited 0"; else ok "empty VERSION file fails"; fi
 
+# ── build-release.sh must publish the manifest, not re-read the files ────────
+# Two readers is how the manifest and the tarballs drift apart.
+if grep -qE '\|\| echo "unknown"' "$REPO/scripts/build-release.sh"; then
+  bad "no soft-fail version read" "build-release.sh still has || echo \"unknown\""
+else
+  ok "no soft-fail version read"
+fi
+
+reads=$(grep -cE 'grep -oE .\"version\"' "$REPO/scripts/build-release.sh" || true)
+if [ "$reads" = "0" ]; then ok "build-release.sh does not re-read version files"; else
+  bad "build-release.sh does not re-read version files" "$reads direct read(s) remain"; fi
+
+if grep -q 'plugin-versions.sh' "$REPO/scripts/build-release.sh"; then
+  ok "build-release.sh calls plugin-versions.sh"
+else
+  bad "build-release.sh calls plugin-versions.sh" "no reference found"
+fi
+
+if grep -q 'versions.json' "$REPO/scripts/build-release.sh"; then
+  ok "build-release.sh writes versions.json"
+else
+  bad "build-release.sh writes versions.json" "no reference found"
+fi
+
 echo ""
 if [ "$fails" = 0 ]; then echo "plugin-versions.sh: all checks passed"; else
   echo "plugin-versions.sh: $fails failure(s)"; exit 1; fi
