@@ -64,6 +64,21 @@ if ($null -eq (Get-RogueManifestVersion -Json 'not json' -Slug 'claude')) {
     Ok 'garbage is null'
 } else { Bad 'garbage is null' 'returned a value' }
 
+if ($null -eq (Get-RogueManifestVersion -Json $null -Slug 'claude')) {
+    Ok 'a null body is null'
+} else { Bad 'a null body is null' 'returned a value' }
+
+# GitHub serves release assets as application/octet-stream, and Windows
+# PowerShell 5.1 hands back a BYTE ARRAY for that content type where pwsh 7 hands
+# back a string. A byte[] coerced into a [string] becomes "123 34 115 ..." and
+# every regex misses - which would make the updater log "could not resolve" and
+# silently never update on Windows while macOS worked fine. Only a Windows run
+# hits the real code path, so the decode itself is asserted here.
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($manifest)
+if ((Get-RogueManifestVersion -Json $bytes -Slug 'claude') -eq '1.0.29') {
+    Ok 'decodes a byte[] body (Windows PowerShell 5.1 octet-stream shape)'
+} else { Bad 'decodes a byte[] body' 'byte array was not decoded before matching' }
+
 if (Test-RogueNewer -Installed '1.0.28' -Latest '1.0.29') { Ok '1.0.28 -> 1.0.29 is newer' }
 else { Bad '1.0.28 -> 1.0.29 is newer' 'returned false' }
 

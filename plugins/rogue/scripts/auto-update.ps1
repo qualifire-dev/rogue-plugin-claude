@@ -19,13 +19,29 @@
 # tests/test_auto_update_ps1.ps1 can dot-source them on Linux. Below the
 # stand-down they would never be defined there.
 
+# GitHub serves every release asset as application/octet-stream with an
+# attachment disposition (verified against a real asset). On Windows PowerShell
+# 5.1 that makes Invoke-WebRequest return a WebResponseObject whose .Content is a
+# BYTE ARRAY, not a string - pwsh 7 always gives a string. Coercing that byte[]
+# into a [string] parameter yields "123 34 115 ..." and every regex below misses,
+# so without this decode the updater would log "could not resolve" and silently
+# never update on Windows, forever, while macOS worked fine. Body, not param
+# type, because a [string] param would have already done the bad coercion.
+function ConvertTo-RogueText {
+    param($Body)
+    if ($null -eq $Body) { return '' }
+    if ($Body -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($Body) }
+    return [string]$Body
+}
+
 # Read one slug's version out of the manifest by regex rather than
 # ConvertFrom-Json, so the compact and pretty-printed forms behave identically and
 # a malformed body is a null instead of a throw. Mirrors the sh half's grep.
 function Get-RogueManifestVersion {
-    param([string]$Json, [string]$Slug)
-    if (-not $Json) { return $null }
-    $m = [regex]::Match($Json, '"' + [regex]::Escape($Slug) + '"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
+    param($Json, [string]$Slug)
+    $text = ConvertTo-RogueText $Json
+    if (-not $text) { return $null }
+    $m = [regex]::Match($text, '"' + [regex]::Escape($Slug) + '"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
     if ($m.Success) { return $m.Groups[1].Value }
     return $null
 }
