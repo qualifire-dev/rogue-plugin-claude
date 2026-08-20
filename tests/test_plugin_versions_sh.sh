@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Unit tests for scripts/plugin-versions.sh — the ONLY reader of the six plugin
+# version files.
+#
+# This script's output is the contract the backend resolves "outdated" from, so a
+# regression here is silent in the worst way: a missing key reads as "up to date"
+# forever, and a malformed value makes semver.coerce return null, which also reads
+# as "up to date". Both must fail the BUILD instead.
+set -u
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT="$REPO/scripts/plugin-versions.sh"
+fails=0
+
+ok() { echo "  ok: $1"; }
+bad() { echo "FAIL [$1]: $2"; fails=$((fails + 1)); }
+
+# ── Against the real tree ────────────────────────────────────────────────────
+out=$(bash "$SCRIPT" "$REPO" 2>/dev/null) || { bad "real tree" "exited non-zero"; out=""; }
+
+flat=$(printf '%s' "$out" | tr -d ' \t\n\r')
+
+for slug in claude codex cursor copilot gemini antigravity; do
+  case "$flat" in
+    *"\"$slug\":\""*) ok "emits $slug" ;;
+    *) bad "emits $slug" "key missing from: $out" ;;
+  esac
+done
+
+case "$flat" in
+  *'"schema":1'*) ok "carries schema 1" ;;
+  *) bad "carries schema 1" "not found in: $out" ;;
+esac
+
+# Exactly six plugin keys — an extra key means a plugin was added without a
+# matching backend mapping, which resolves to null (never outdated).
+keys=$(printf '%s' "$flat" | grep -oE '"[a-z]+":"[0-9]+\.[0-9]+\.[0-9]+"' | wc -l | tr -d ' ')
+if [ "$keys" = "6" ]; then ok "exactly six plugin versions"; else
+  bad "exactly six plugin versions" "found $keys"; fi
+
+# Every value must be a bare X.Y.Z. "unknown", "v1.2.3" and "1.2" all coerce
+# wrong on the consumer side.
+bogus=$(printf '%s' "$flat" | grep -oE '"[a-z]+":"[^"]*"' | grep -vE '"schema"' \
+  | grep -vE '"[a-z]+":"[0-9]+\.[0-9]+\.[0-9]+"' || true)
+if [ -z "$bogus" ]; then ok "all values are bare X.Y.Z"; else
+  bad "all values are bare X.Y.Z" "$bogus"; fi
+
+# Each value must equal what the plugin's own manifest says.
+claude_expected=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
+  "$REPO/plugins/rogue/.claude-plugin/plugin.json" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+case "$flat" in
+  *"\"claude\":\"$claude_expected\""*) ok "claude matches its manifest ($claude_expected)" ;;
+  *) bad "claude matches its manifest" "expected $claude_expected in: $out" ;;
+esac
+agv_expected=$(head -n1 "$REPO/plugins/antigravity/VERSION" | tr -d ' \r\n')
+case "$flat" in
+  *"\"antigravity\":\"$agv_expected\""*) ok "antigravity matches its VERSION file ($agv_expected)" ;;
+  *) bad "antigravity matches its VERSION file" "expected $agv_expected in: $out" ;;
+esac
+
+# ── Fail-hard cases, against fixture trees ───────────────────────────────────
+# A build that emits a manifest with a hole is worse than a build that fails:
+# the hole is invisible and reads as "up to date".
+fixture=$(mktemp -d)
+trap 'rm -rf "$fixture"' EXIT
+mkdir -p "$fixture/plugins/rogue/.claude-plugin" "$fixture/plugins/codex/.codex-plugin" \
+         "$fixture/plugins/cursor/.cursor-plugin" "$fixture/plugins/copilot" \
+         "$fixture/plugins/gemini" "$fixture/plugins/antigravity"
+echo '{"version":"9.9.9"}' > "$fixture/plugins/rogue/.claude-plugin/plugin.json"
+echo '{"version":"9.9.9"}' > "$fixture/plugins/codex/.codex-plugin/plugin.json"
+echo '{"version":"9.9.9"}' > "$fixture/plugins/cursor/.cursor-plugin/plugin.json"
+echo '{"version":"9.9.9"}' > "$fixture/plugins/copilot/plugin.json"
+echo '{"version":"9.9.9"}' > "$fixture/plugins/gemini/gemini-extension.json"
+echo '9.9.9' > "$fixture/plugins/antigravity/VERSION"
+
+if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then ok "complete fixture tree succeeds"; else
+  bad "complete fixture tree succeeds" "exited non-zero"; fi
+
+rm -f "$fixture/plugins/gemini/gemini-extension.json"
+if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then
+  bad "missing manifest fails" "exited 0"; else ok "missing manifest fails"; fi
+echo '{"version":"9.9.9"}' > "$fixture/plugins/gemini/gemini-extension.json"
+
+echo '{"name":"rogue"}' > "$fixture/plugins/copilot/plugin.json"
+if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then
+  bad "manifest with no version fails" "exited 0"; else ok "manifest with no version fails"; fi
+echo '{"version":"9.9.9"}' > "$fixture/plugins/copilot/plugin.json"
+
+: > "$fixture/plugins/antigravity/VERSION"
+if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then
+  bad "empty VERSION file fails" "exited 0"; else ok "empty VERSION file fails"; fi
+
+echo ""
+if [ "$fails" = 0 ]; then echo "plugin-versions.sh: all checks passed"; else
+  echo "plugin-versions.sh: $fails failure(s)"; exit 1; fi
