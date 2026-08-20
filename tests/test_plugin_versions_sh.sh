@@ -113,6 +113,65 @@ echo '{"version":"9.9.9"}' > "$fixture/plugins/copilot/plugin.json"
 : > "$fixture/plugins/antigravity/VERSION"
 if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then
   bad "empty VERSION file fails" "exited 0"; else ok "empty VERSION file fails"; fi
+echo '9.9.9' > "$fixture/plugins/antigravity/VERSION"
+
+# ── The whole field must be validated, not a substring ───────────────────────
+# Both readers used to extract a THREE-FIELD SUBSTRING out of the value and throw
+# the rest away, so "1.2.3-beta" was published as "1.2.3" — a manifest stating a
+# version the plugin does not have. That is the same silent-lie class this whole
+# manifest exists to end, and it defeated the documented build-hard guarantee.
+# Antigravity's was worse: a `[0-9]*.[0-9]*.[0-9]*` GLOB, where `*` is a wildcard,
+# so "1a.2b.3c" and "9.9.9junk" were accepted and emitted VERBATIM.
+CV_JSON="$fixture/plugins/copilot/plugin.json"
+for bogus in '1.2.3-beta' '1.2.3+build7' '1.2.3.4' '1.2' '1.2.3beta' 'v1.2.3' '1.2.3 '; do
+  printf '{"version":"%s"}\n' "$bogus" > "$CV_JSON"
+  if got=$(bash "$SCRIPT" "$fixture" 2>/dev/null); then
+    emitted=$(printf '%s' "$got" | tr -d ' \t\n\r' \
+      | grep -oE '"copilot":"[^"]*"' | sed -E 's/.*:"//; s/"$//')
+    bad "JSON version '$bogus' fails the build" "exited 0 and published '$emitted'"
+  else
+    ok "JSON version '$bogus' fails the build"
+  fi
+done
+echo '{"version":"9.9.9"}' > "$CV_JSON"
+
+AGV="$fixture/plugins/antigravity/VERSION"
+for bogus in '1.2.3-beta' '1a.2b.3c' '9.9.9junk' '1.2.3.4.5' '1.2.3-' '1.2' 'v1.2.3'; do
+  printf '%s\n' "$bogus" > "$AGV"
+  if got=$(bash "$SCRIPT" "$fixture" 2>/dev/null); then
+    emitted=$(printf '%s' "$got" | tr -d ' \t\n\r' \
+      | grep -oE '"antigravity":"[^"]*"' | sed -E 's/.*:"//; s/"$//')
+    bad "VERSION '$bogus' fails the build" "exited 0 and published '$emitted'"
+  else
+    ok "VERSION '$bogus' fails the build"
+  fi
+done
+
+# ...and the shapes that MUST still pass: surrounding whitespace and a CRLF line
+# ending are stripped, not rejected. Tightening validation must not start failing
+# a VERSION file that a Windows editor saved.
+printf '  1.2.3  \n' > "$AGV"
+if bash "$SCRIPT" "$fixture" 2>/dev/null | tr -d ' \t\n\r' | grep -q '"antigravity":"1.2.3"'; then
+  ok "VERSION tolerates surrounding whitespace"; else
+  bad "VERSION tolerates surrounding whitespace" "did not yield 1.2.3"; fi
+printf '1.2.3\r\n' > "$AGV"
+if bash "$SCRIPT" "$fixture" 2>/dev/null | tr -d ' \t\n\r' | grep -q '"antigravity":"1.2.3"'; then
+  ok "VERSION tolerates a CRLF line ending"; else
+  bad "VERSION tolerates a CRLF line ending" "did not yield 1.2.3"; fi
+# Wide numbers are legitimate semver and must not be rejected.
+printf '11.22.33\n' > "$AGV"
+if bash "$SCRIPT" "$fixture" 2>/dev/null | tr -d ' \t\n\r' | grep -q '"antigravity":"11.22.33"'; then
+  ok "multi-digit fields are accepted"; else
+  bad "multi-digit fields are accepted" "11.22.33 was rejected"; fi
+echo '9.9.9' > "$AGV"
+
+# A JSON manifest whose FIRST version field is bogus must fail, not skip ahead to
+# a later well-formed one — the first is the authoritative field.
+printf '{"version":"1.2.3-beta","other":{"version":"9.9.9"}}\n' > "$CV_JSON"
+if bash "$SCRIPT" "$fixture" >/dev/null 2>&1; then
+  bad "a bogus first version field fails" "exited 0, so it read a later field"; else
+  ok "a bogus first version field fails"; fi
+echo '{"version":"9.9.9"}' > "$CV_JSON"
 
 # ── build-release.sh must publish the manifest, not re-read the files ────────
 # Two readers is how the manifest and the tarballs drift apart.
