@@ -44,18 +44,43 @@ bogus=$(printf '%s' "$flat" | grep -oE '"[a-z]+":"[^"]*"' | grep -vE '"schema"' 
 if [ -z "$bogus" ]; then ok "all values are bare X.Y.Z"; else
   bad "all values are bare X.Y.Z" "$bogus"; fi
 
-# Each value must equal what the plugin's own manifest says.
-claude_expected=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
-  "$REPO/plugins/rogue/.claude-plugin/plugin.json" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-case "$flat" in
-  *"\"claude\":\"$claude_expected\""*) ok "claude matches its manifest ($claude_expected)" ;;
-  *) bad "claude matches its manifest" "expected $claude_expected in: $out" ;;
-esac
+# Every value must equal what that plugin's OWN version file says — all six, not
+# a sample. The slug-to-file mapping is hand-written per plugin, so a slug reading
+# from the wrong file produces a valid-looking X.Y.Z that every other check here
+# accepts. That is precisely the bug this manifest exists to end: a version key
+# that reads as something it is not.
+expect_json() { # <slug> <path-relative-to-repo>
+  _exp=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$REPO/$2" \
+    | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  if [ -z "$_exp" ]; then bad "$1 matches its manifest" "could not read a version from $2"; return; fi
+  case "$flat" in
+    *"\"$1\":\"$_exp\""*) ok "$1 matches $2 ($_exp)" ;;
+    *) bad "$1 matches $2" "expected $_exp in: $out" ;;
+  esac
+}
+
+expect_json claude  plugins/rogue/.claude-plugin/plugin.json
+expect_json codex   plugins/codex/.codex-plugin/plugin.json
+expect_json cursor  plugins/cursor/.cursor-plugin/plugin.json
+expect_json copilot plugins/copilot/plugin.json
+expect_json gemini  plugins/gemini/gemini-extension.json
+
+# Antigravity is the one plugin whose version is NOT in a JSON manifest: its CLI
+# schema is additionalProperties:false, so the version of record is a bare file.
 agv_expected=$(head -n1 "$REPO/plugins/antigravity/VERSION" | tr -d ' \r\n')
 case "$flat" in
   *"\"antigravity\":\"$agv_expected\""*) ok "antigravity matches its VERSION file ($agv_expected)" ;;
   *) bad "antigravity matches its VERSION file" "expected $agv_expected in: $out" ;;
 esac
+
+# The six must be DISTINCT reads, not one file echoed six times. A mapping bug
+# that pointed several slugs at the same manifest would satisfy every assertion
+# above only if those plugins happened to share a version - so assert the shape
+# of the real tree instead: not all six versions are equal today.
+uniq_count=$(printf '%s' "$flat" | grep -oE '"(claude|codex|cursor|copilot|gemini|antigravity)":"[0-9]+\.[0-9]+\.[0-9]+"' \
+  | sed -E 's/.*:"//; s/"//' | sort -u | wc -l | tr -d ' ')
+if [ "$uniq_count" -gt 1 ]; then ok "the six versions are not one value repeated ($uniq_count distinct)"; else
+  bad "the six versions are not one value repeated" "all six read $uniq_count distinct value(s)"; fi
 
 # ── Fail-hard cases, against fixture trees ───────────────────────────────────
 # A build that emits a manifest with a hole is worse than a build that fails:

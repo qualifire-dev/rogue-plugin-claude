@@ -12,6 +12,17 @@
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/plugins/rogue/scripts/auto-update.sh"
+
+# Run the script under the shell PRODUCTION uses, not the one its shebang names.
+# hooks.json fires it as `sh "$CLAUDE_PLUGIN_ROOT/scripts/auto-update.sh"`, and an
+# explicit interpreter overrides the `#!/usr/bin/env bash` line entirely - so on
+# Ubuntu this really executes under dash. Running the test with bash would leave
+# a bashism in the version compare undetected by every gate: the "Shell scripts
+# parse" step keys off the shebang and checks it with `bash -n` for the same
+# reason. CI runs this file twice, TEST_SH=sh and TEST_SH=dash.
+SH="${TEST_SH:-sh}"
+command -v "$SH" >/dev/null 2>&1 || { echo "SKIP: $SH not available"; exit 0; }
+echo "== auto-update.sh under $SH =="
 fails=0
 
 ok() { echo "  ok: $1"; }
@@ -54,7 +65,7 @@ run() { # run <manifest-body> [VAR=VALUE ...]
   env -i PATH="$BIN:$PATH" HOME="$home" MARKER="$marker" \
     MANIFEST_BODY="$body" CLAUDE_CODE_ENTRYPOINT=cli \
     CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" "$@" \
-    bash "$SCRIPT" >/dev/null 2>&1
+    "$SH" "$SCRIPT" >/dev/null 2>&1
   LAST_LOG="$home/.rogue/auto-update.log"
   [ -f "$marker" ] && echo ran || echo skipped
 }
@@ -124,5 +135,5 @@ grep -q 'tag_name' "$SCRIPT" \
   || ok "no longer reads tag_name"
 
 echo ""
-if [ "$fails" = 0 ]; then echo "auto-update.sh: all checks passed"; else
-  echo "auto-update.sh: $fails failure(s)"; exit 1; fi
+if [ "$fails" = 0 ]; then echo "auto-update.sh: all checks passed (SH=$SH)"; else
+  echo "auto-update.sh: $fails failure(s) (SH=$SH)"; exit 1; fi
