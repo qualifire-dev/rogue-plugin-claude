@@ -304,6 +304,7 @@ jobs:
           pwsh -NoProfile -File tests/test_hook_logs.ps1
           pwsh -NoProfile -File tests/test_ship_logs.ps1
           pwsh -NoProfile -File tests/test_heartbeat_ps1.ps1
+          pwsh -NoProfile -File tests/test_auto_update_ps1.ps1
 
   windows:
     # The job the seam CANNOT stand in for. Every PowerShell test in the job above
@@ -351,4 +352,6 @@ jobs:
           powershell -NoProfile -File tests/test_ship_logs.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_heartbeat_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_auto_update_ps1.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
