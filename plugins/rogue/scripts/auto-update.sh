@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Silent plugin auto-updater. Fires from the SessionStart hook in the
 # background so it never blocks Claude Code startup. Compares the installed
-# plugin version against the latest GitHub release; if newer, re-runs the
-# one-line installer to upgrade in place. New version takes effect on the
-# next session.
+# plugin version against the "claude" key of the latest release's versions.json;
+# if newer, re-runs the one-line installer to upgrade in place. New version takes
+# effect on the next session.
 #
 # Opt-outs:
 #   ROGUE_AUTO_UPDATE=0       — disable entirely
-#   ROGUE_PLUGIN_VERSION=v1.x — pinned, never updates
+#   ROGUE_PLUGIN_VERSION=<release> — pinned, never updates
 #
 # Runs at most once per 24h (cached in ~/.rogue/.auto-update-check).
 # Silent on every failure path. All activity logs to ~/.rogue/auto-update.log
@@ -57,7 +57,30 @@ if [ -f "$CACHE" ]; then
 fi
 touch "$CACHE" 2>/dev/null
 
-REPO="${ROGUE_PLUGIN_REPO:-qualifire-dev/rogue-plugins}"
+# ROGUE_PLUGIN_REPO is load-bearing beyond its default: rogue-ui's
+# hooks-matcher.ts whitelists Rogue's own updater by matching a repo slug AND one
+# of ROGUE_NON_INTERACTIVE / ROGUE_AUTO_UPDATE / ROGUE_INSTALLER_URL /
+# ROGUE_PLUGIN_REPO. Drop it and this script starts reading as a suspicious hook
+# on every install in the field.
+REPO="${ROGUE_PLUGIN_REPO:-rogue-security/rogue-plugins}"
+
+# True when $2 is strictly newer than $1, comparing X.Y.Z field by field as
+# NUMBERS. The old code string-compared the release tag against "v${installed}",
+# which cannot tell newer from older: once a release name stops carrying a
+# version, a manifest sitting BEHIND the install would re-run the installer every
+# 24h forever. Both inputs are bare X.Y.Z (plugin.json and the manifest are both
+# validated to that shape), so three fields is the whole domain.
+_rogue_newer() { # <installed> <candidate>
+  _a="$1"; _b="$2"
+  _a1=${_a%%.*}; _ar=${_a#*.}; _a2=${_ar%%.*}; _a3=${_ar##*.}
+  _b1=${_b%%.*}; _br=${_b#*.}; _b2=${_br%%.*}; _b3=${_br##*.}
+  [ "$_b1" -gt "$_a1" ] && return 0
+  [ "$_b1" -lt "$_a1" ] && return 1
+  [ "$_b2" -gt "$_a2" ] && return 0
+  [ "$_b2" -lt "$_a2" ] && return 1
+  [ "$_b3" -gt "$_a3" ] && return 0
+  return 1
+}
 
 PLUGIN_JSON="${CLAUDE_PLUGIN_ROOT:-}/.claude-plugin/plugin.json"
 if [ ! -f "$PLUGIN_JSON" ]; then
@@ -66,33 +89,36 @@ if [ ! -f "$PLUGIN_JSON" ]; then
 fi
 # Read the version WITHOUT python3 — the /usr/bin/python3 stub fails silently on
 # a fresh macOS (no Xcode CLT), which would mask updates. grep/sed are always
-# present (same approach as heartbeat.sh / build-release.sh).
+# present (same approach as heartbeat.sh / plugin-versions.sh).
 INSTALLED=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$PLUGIN_JSON" 2>/dev/null \
   | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 if [ -z "$INSTALLED" ]; then
   echo "no installed version found"
   exit 0
 fi
-INSTALLED_TAG="v${INSTALLED}"
 
-LATEST=$(curl -fsSL --max-time 5 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-  | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
-  | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+# The release NAME is not a version — the monorepo ships six independently
+# versioned plugins. versions.json is the contract; this plugin's key is "claude".
+MANIFEST_URL="https://github.com/${REPO}/releases/latest/download/versions.json"
+LATEST=$(curl -fsSL --max-time 5 "$MANIFEST_URL" 2>/dev/null \
+  | tr -d ' \t\n\r' \
+  | grep -oE '"claude":"[0-9]+\.[0-9]+\.[0-9]+"' | head -1 \
+  | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 if [ -z "$LATEST" ]; then
-  echo "could not resolve latest release"
+  echo "could not resolve latest claude version from $MANIFEST_URL"
   exit 0
 fi
 
-if [ "$LATEST" = "$INSTALLED_TAG" ]; then
-  echo "up to date at $INSTALLED_TAG"
+if ! _rogue_newer "$INSTALLED" "$LATEST"; then
+  echo "up to date at $INSTALLED (manifest says $LATEST)"
   exit 0
 fi
 
-echo "upgrade available: $INSTALLED_TAG -> $LATEST, running installer"
+echo "upgrade available: $INSTALLED -> $LATEST, running installer"
 
 # Re-run the one-line installer in non-interactive mode. Creds already in env
 # from sourcing ~/.rogue-env above, so no prompts.
-INSTALLER_URL="${ROGUE_INSTALLER_URL:-https://raw.githubusercontent.com/qualifire-dev/rogue-plugins/main/install.sh}"
+INSTALLER_URL="${ROGUE_INSTALLER_URL:-https://raw.githubusercontent.com/rogue-security/rogue-plugins/main/install.sh}"
 curl -fsSL --max-time 60 "$INSTALLER_URL" | ROGUE_NON_INTERACTIVE=1 bash
 RC=$?
 echo "installer exited rc=$RC"
