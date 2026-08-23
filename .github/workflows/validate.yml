@@ -98,6 +98,13 @@ jobs:
           TEST_SH=dash bash tests/test_actor_sh.sh
           TEST_SH=dash bash tests/test_install_id_sh.sh
           TEST_SH=dash bash tests/test_status_skill_sh.sh
+          bash tests/test_plugin_versions_sh.sh
+          # Twice, because hooks.json fires auto-update.sh as `sh <script>` - an
+          # explicit interpreter overrides its bash shebang, so production really
+          # runs it under dash on Linux. The "Shell scripts parse" step keys off
+          # the shebang and checks it with bash -n, so dash is only covered here.
+          TEST_SH=sh bash tests/test_auto_update_sh.sh
+          TEST_SH=dash bash tests/test_auto_update_sh.sh
           bash tests/test_gitignore_bundles.sh
       - name: Command and skill snippets parse
         # Every fenced sh/bash and powershell block in a /rogue:setup or /rogue:status
@@ -302,6 +309,7 @@ jobs:
           pwsh -NoProfile -File tests/test_hook_logs.ps1
           pwsh -NoProfile -File tests/test_ship_logs.ps1
           pwsh -NoProfile -File tests/test_heartbeat_ps1.ps1
+          pwsh -NoProfile -File tests/test_auto_update_ps1.ps1
 
   windows:
     # The job the seam CANNOT stand in for. Every PowerShell test in the job above
@@ -349,4 +357,6 @@ jobs:
           powershell -NoProfile -File tests/test_ship_logs.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_heartbeat_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_auto_update_ps1.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }

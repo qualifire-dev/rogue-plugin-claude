@@ -14,12 +14,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 DIST="$ROOT/dist"
-# Read the plugin version WITHOUT python3 (absent on a fresh macOS — same reason
-# the runtime scripts avoid it). grep/sed are always present.
-PLUGIN_VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
-  plugins/rogue/.claude-plugin/plugin.json | head -1 \
-  | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+# Every version comes from ONE reader, so the manifest we publish and the
+# tarballs we build beside it cannot disagree. See scripts/plugin-versions.sh.
+VERSIONS_JSON=$("$ROOT/scripts/plugin-versions.sh" "$ROOT")
 
+plugin_version() { # <slug>
+  printf '%s' "$VERSIONS_JSON" | tr -d ' \t\n\r' \
+    | grep -oE "\"$1\":\"[0-9]+\.[0-9]+\.[0-9]+\"" | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+}
+
+PLUGIN_VERSION=$(plugin_version claude)
 echo "→ plugin version: $PLUGIN_VERSION"
 
 rm -rf "$DIST"
@@ -52,15 +57,7 @@ echo "✓ $OUT  ($SIZE bytes, version $PLUGIN_VERSION)"
 # we also ship a versionless tarball so /releases/latest/download URLs are stable
 # (used by compiled-key MDM bundles and any download-based install).
 if [ -d "plugins/codex" ]; then
-  # Fail hard: the manifest is the version source of truth, and release.yml uploads
-  # every dist/*.tar.gz — a missing/malformed manifest must not ship as "unknown".
-  # Read the version WITHOUT python3 (absent on a fresh macOS), matching the claude
-  # build above.
-  CODEX_VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
-    plugins/codex/.codex-plugin/plugin.json 2>/dev/null | head -1 \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && [ -n "$CODEX_VERSION" ] || {
-    echo "✗ unable to read plugins/codex/.codex-plugin/plugin.json" >&2; exit 1
-  }
+  CODEX_VERSION=$(plugin_version codex)
   echo "→ codex plugin version: $CODEX_VERSION"
   # Single cross-platform tarball (no OS suffix), matching the claude artifact —
   # the package ships both .sh and .ps1, so /latest/download/ stays stable.
@@ -83,11 +80,7 @@ fi
 # the /releases/latest/download/ URL stable. Cross-platform by content (the hook is
 # python3). The Team Marketplace imports the repo directly, not this tarball.
 if [ -d "plugins/cursor" ]; then
-  CURSOR_VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
-    plugins/cursor/.cursor-plugin/plugin.json 2>/dev/null | head -1 \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && [ -n "$CURSOR_VERSION" ] || {
-    echo "✗ unable to read plugins/cursor/.cursor-plugin/plugin.json" >&2; exit 1
-  }
+  CURSOR_VERSION=$(plugin_version cursor)
   echo "→ cursor plugin version: $CURSOR_VERSION"
   CRSTAGE=$(mktemp -d)
   CRTOP="$CRSTAGE/rogue-plugin-cursor"
@@ -114,11 +107,7 @@ fi
 # Versionless name keeps the /releases/latest/download/ URL stable. Cross-platform
 # by content (one Node .mjs hook; no OS-specific scripts to split).
 if [ -d "plugins/gemini" ]; then
-  GEMINI_VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
-    plugins/gemini/gemini-extension.json 2>/dev/null | head -1 \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && [ -n "$GEMINI_VERSION" ] || {
-    echo "✗ unable to read plugins/gemini/gemini-extension.json" >&2; exit 1
-  }
+  GEMINI_VERSION=$(plugin_version gemini)
   echo "→ gemini extension version: $GEMINI_VERSION"
   GMSTAGE=$(mktemp -d)
   GMTOP="$GMSTAGE/rogue-plugin-gemini"
@@ -144,8 +133,7 @@ fi
 # instead. Versionless tarball name keeps the /releases/latest/download/ URL
 # stable. Cross-platform by content (ships both hook.sh and hook.ps1).
 if [ -d "plugins/antigravity" ]; then
-  AGV_VER="$(head -n1 plugins/antigravity/VERSION 2>/dev/null | tr -d ' \r\n')"
-  [ -n "$AGV_VER" ] || { echo "✗ unable to read plugins/antigravity/VERSION" >&2; exit 1; }
+  AGV_VER=$(plugin_version antigravity)
   echo "→ antigravity plugin version: $AGV_VER"
   AGVSTAGE=$(mktemp -d)
   AGVTOP="$AGVSTAGE/rogue-plugin-antigravity"
@@ -171,11 +159,7 @@ fi
 # plugins/copilot/ alongside its marketplace file (.github/plugin/marketplace.json).
 # Cross-platform by content (ships both hook.sh and hook.ps1).
 if [ -d "plugins/copilot" ]; then
-  COPILOT_VERSION=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' \
-    plugins/copilot/plugin.json 2>/dev/null | head -1 \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && [ -n "$COPILOT_VERSION" ] || {
-    echo "✗ unable to read plugins/copilot/plugin.json" >&2; exit 1
-  }
+  COPILOT_VERSION=$(plugin_version copilot)
   echo "→ copilot plugin version: $COPILOT_VERSION"
   CPSTAGE=$(mktemp -d)
   CPTOP="$CPSTAGE/rogue-plugin-copilot"
@@ -189,6 +173,13 @@ if [ -d "plugins/copilot" ]; then
   echo "✓ $CPOUT  ($CPSIZE bytes, version $COPILOT_VERSION)"
   rm -rf "$CPSTAGE"
 fi
+
+# ── Version manifest ────────────────────────────────────────────────────────
+# The backend resolves every surface's "latest version" from THIS file, fetched
+# from /releases/latest/download/versions.json. It is the reason a release name
+# no longer has to encode any plugin's version.
+printf '%s\n' "$VERSIONS_JSON" > "$DIST/versions.json"
+echo "✓ $DIST/versions.json"
 
 echo ""
 echo "dist/:"

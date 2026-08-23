@@ -3,7 +3,13 @@ name: Release
 on:
   push:
     tags:
+      # 'r*' is the current scheme: a release name carries NO plugin version
+      # (the repo ships six independently versioned plugins), so names are
+      # date-based identifiers like r2026.08.20. 'v*' stays for the historical
+      # tags and for the one transitional v1.0.28 release that lets installs
+      # running the old tag-comparing auto-updater upgrade themselves.
       - 'v*'
+      - 'r*'
   workflow_dispatch:
     inputs:
       tag:
@@ -37,10 +43,10 @@ jobs:
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists — uploading assets"
-            gh release upload "$TAG" dist/*.tar.gz --clobber
+            gh release upload "$TAG" dist/*.tar.gz dist/versions.json --clobber
           else
             gh release create "$TAG" \
               --title "$TAG" \
               --generate-notes \
-              dist/*.tar.gz
+              dist/*.tar.gz dist/versions.json
           fi

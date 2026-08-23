@@ -340,9 +340,35 @@ The hook log is also **uploaded** to `POST /api/v1/hooks/logs`, so a support eng
 
 ## Releasing
 
-1. Bump `version` in **both** `plugins/rogue/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the marketplace lists the plugin's version too — keep them in sync).
-2. Commit, tag `vX.Y.Z`, push the tag. The `release.yml` workflow checks out the tag, runs `scripts/build-release.sh`, and creates the GitHub Release with the single `rogue-plugin-claude.tar.gz`.
-3. `auto-update.{sh,ps1}` on user machines pick up the new release on the next `SessionStart` (rate-limited 24h). One-line users can also re-run the installer.
+**A release name carries NO plugin version.** This repo ships six independently
+versioned plugins; a tag can only ever describe one of them, and it drifts
+immediately (tag `v1.0.27` shipped Claude 1.0.26). Release names are date-based
+identifiers — `r2026.08.20`, with `-2` for a second release the same day.
+
+1. Bump the version in the plugin(s) you changed, and only those:
+   `plugins/rogue/.claude-plugin/plugin.json`, `plugins/codex/.codex-plugin/plugin.json`,
+   `plugins/cursor/.cursor-plugin/plugin.json`, `plugins/copilot/plugin.json`,
+   `plugins/gemini/gemini-extension.json`, `plugins/antigravity/VERSION`.
+   For claude/codex/cursor/copilot also bump the matching `marketplace.json`
+   entry — `validate.yml` enforces the pair.
+2. **Never merge a version bump to `main` without releasing it.** Claude, Codex
+   and Copilot install by git-cloning `main` while Cursor, Gemini and Antigravity
+   download release tarballs, and the backend resolves "latest" from the release
+   asset. A bump that sits unreleased on `main` makes those three read as up to
+   date when they are not.
+3. Commit, tag `rYYYY.MM.DD`, push the tag. `release.yml` runs
+   `scripts/build-release.sh` and attaches the six tarballs **plus
+   `versions.json`**, the manifest the backend resolves every surface's latest
+   version from.
+4. `auto-update.{sh,ps1}` pick the new Claude version up from `versions.json` on
+   the next `SessionStart` (rate-limited 24h). The other five plugins have no
+   updater; users re-run the installer or use their agent's native update path.
+
+**`scripts/plugin-versions.sh` is the only reader of the six version files.**
+`build-release.sh` calls it once and derives every per-tarball echo from the
+result. Reading a version file twice is how the manifest and the tarballs drift
+apart. Every read fails the build hard — a manifest with a hole reads as "up to
+date" on the dashboard forever.
 
 ## Things that look weird but are intentional
 
@@ -360,3 +386,16 @@ The hook log is also **uploaded** to `POST /api/v1/hooks/logs`, so a support eng
 - Log rotation is checked on **every** `log()` call rather than by a scheduled job, which looks wasteful (one `wc -c` per hook). It is the only placement that holds: an unconfigured install runs nothing but the dispatcher, and that dispatcher logs a line per event.
 - The hook log's `provider=` token intentionally differs from the heartbeat's `agent_family`/`agent` for Codex, Gemini and Copilot. It tracks the log **file name**, not the server's roster vocabulary — see **The hook log**.
 - `rgx!` prompt prefix is a server-side convention (false-positive escape hatch). The plugin itself doesn't parse it — the API does.
+- Release names look meaningless (`r2026.08.20`) and are. Six independently
+  versioned plugins ship from one release, so a name that encoded any single
+  plugin's version would be wrong for the other five — and was: the backend used
+  to resolve Codex, Gemini and Antigravity currency from the *Claude* version in
+  the tag, so a current install of each read "Outdated". `versions.json` carries
+  the six real versions; the name is just an identifier. `release.yml` still
+  accepts `v*` for the historical tags.
+- `auto-update.{sh,ps1}` keep the `ROGUE_PLUGIN_REPO` env var even though the
+  manifest URL could be a constant. rogue-ui's
+  `packages/exposure-matching/src/hooks-matcher.ts` whitelists Rogue's own
+  updater by matching a repo slug AND one of four env markers, of which that is
+  one — drop it and our own hook starts reading as a suspicious hook on every
+  install in the field.

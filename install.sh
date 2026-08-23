@@ -389,11 +389,10 @@ antigravity_install_plugin() {
 # ── Credentials ───────────────────────────────────────────────────────────────
 # Validate the key AND register this install via /api/v1/hooks/status (the same
 # heartbeat the SessionStart hook calls). Echoes the HTTP status code (empty on
-# transport failure). On 200, also populates STATUS_ORG / STATUS_UPDATE for the
-# caller to surface. Sending a stable host + actor-email keeps the dashboard
-# roster row deduped with the later heartbeats.
+# transport failure). On 200, also populates STATUS_ORG for the caller to
+# surface. Sending a stable host + actor-email keeps the dashboard roster row
+# deduped with the later heartbeats.
 STATUS_ORG=""
-STATUS_UPDATE=""
 # /api/v1/hooks/status has side effects (it registers/updates the roster row), so
 # the key-validation POST must register under an agent that is actually being
 # installed — a Copilot-only or Codex-only install must NOT create a bogus Claude
@@ -436,7 +435,6 @@ status_check() { # status_check <api-key> <actor-email>
   body="${resp%$'\n'*}"
   if [ "$code" = "200" ]; then
     STATUS_ORG=$(printf '%s' "$body" | sed -E -n 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
-    printf '%s' "$body" | grep -qE '"update_available"[[:space:]]*:[[:space:]]*true' && STATUS_UPDATE=1
   fi
   printf '%s' "$code"
 }
@@ -510,7 +508,6 @@ configure_credentials() {
     code="$(status_check "$key" "$def_email")"
     case "$code" in
       200)        ok "Key validated${STATUS_ORG:+ — org: $STATUS_ORG}"
-                  [ -n "$STATUS_UPDATE" ] && note "A newer plugin version is available (auto-update will pick it up)."
                   break ;;
       401|403)    tries=$((tries+1)); warn "Invalid key (HTTP $code)."
                   if [ "$tries" -ge 3 ]; then
