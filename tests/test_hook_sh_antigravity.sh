@@ -905,5 +905,63 @@ for surface in antigravity-cli antigravity; do
 done
 rm -rf "$DBT" "$CLI_DIR"
 
+# ── Case: Windows delivery-model invariance of the hooks.json sh command ────
+# Native-Windows Antigravity execs the first token and hands EVERYTHING after
+# it to the child as one mangled argument, no shell involved (observed live:
+#   /usr/bin/bash: \./scripts/hook.sh" PreToolUse: No such file or directory).
+# The `env -Ssh` command form must deliver the event identically whether the
+# rest of the line arrives as one blob or split on spaces. env -S needs
+# coreutils >= 8.30 (2018) or BSD env (macOS): skip, not fail, without it.
+if env '-Strue' >/dev/null 2>&1; then
+  PLUGIN_DIR="$REPO/plugins/antigravity"
+
+  run_env_form() {  # $1 = "blob" | "split"
+    local tmp_home rc
+    tmp_home="$(mktemp -d)"
+    cp "$ENV_FILE" "$tmp_home/.rogue-env"
+    set +e
+    if [ "$1" = "blob" ]; then
+      ( cd "$PLUGIN_DIR" && \
+        HOME="$tmp_home" \
+        ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
+        ROGUE_LOG_FILE="$tmp_home/hook.log" \
+        env '-Ssh ./scripts/hook.sh PreToolUse' > "$OUT_FILE" ) <<< '{"toolCall":null}'
+    else
+      ( cd "$PLUGIN_DIR" && \
+        HOME="$tmp_home" \
+        ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
+        ROGUE_LOG_FILE="$tmp_home/hook.log" \
+        env -Ssh ./scripts/hook.sh PreToolUse > "$OUT_FILE" ) <<< '{"toolCall":null}'
+    fi
+    rc=$?
+    set -e
+    rm -rf "$tmp_home"
+    return $rc
+  }
+
+  restart_mock '{"decision":"allow"}'
+  set +e; run_env_form blob; rc=$?; set -e
+  assert_eq "$rc" "0" "env -S blob delivery: exit 0"
+  assert_eq "$(cat "$OUT_FILE")" '{"decision":"allow"}' "env -S blob delivery: response relayed"
+  assert_header "x-rogue-event" "PreToolUse" "env -S blob delivery: event arg reached hook.sh"
+
+  restart_mock '{"decision":"allow"}'
+  set +e; run_env_form split; rc=$?; set -e
+  assert_eq "$rc" "0" "env -S split delivery: exit 0"
+  assert_eq "$(cat "$OUT_FILE")" '{"decision":"allow"}' "env -S split delivery: response relayed"
+  assert_header "x-rogue-event" "PreToolUse" "env -S split delivery: event arg reached hook.sh"
+  stop_mock
+else
+  echo "  skip: local env lacks -S (coreutils < 8.30); delivery-model cases not run"
+fi
+
+# Pin the bug the env -S form fixes: the pre-fix quoted command, delivered as
+# one blob the way native-Windows Antigravity delivers it, is an exec failure.
+set +e
+sh '"./scripts/hook.sh" PreToolUse' </dev/null >/dev/null 2>&1
+OLD_RC=$?
+set -e
+assert_eq "$OLD_RC" "127" "old quoted form under blob delivery exits 127"
+
 echo
 echo "All antigravity hook.sh tests passed (SH=$SH)."
