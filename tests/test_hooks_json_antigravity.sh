@@ -7,8 +7,11 @@
 # note at docs/superpowers/plans/2026-07-20-rogue-antigravity-plugin.md:960.
 # This test enforces the structural invariants instead: valid JSON, the
 # top-level "rogue" key, exactly the five events, matcher ".*" on the two
-# tool events, exactly two handlers (sh + powershell) per event each passing
-# the matching Event arg, and timeout 30 on every handler.
+# tool events, exactly two handlers (sh + powershell) per event each exactly
+# matching the delivery-model-invariant command form for its event, timeout 30
+# on every handler, and no shell-special characters (", ', \, $, &, ^, %, |, <,
+# >, ;) — on native Windows, Antigravity execs commands with no shell, so these
+# characters arrive literally and break the handler.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -99,30 +102,44 @@ for event, arr in hooks.items():
         sh_entries = []
         ps_entries = []
 
+        EXPECTED_SH = f"env -Ssh ./scripts/hook.sh {event}"
+        EXPECTED_PS = (
+            "cmd /d /c powershell -NoProfile -NonInteractive -Command "
+            ". ([scriptblock]::Create((Get-Content -Raw -LiteralPath scripts/hook.ps1))) "
+            f"{event} (Get-Location).Path"
+        )
+        # Root-cause guard: on native Windows, Antigravity execs the first
+        # whitespace token and delivers the rest with NO shell -- quote
+        # characters arrive literally (observed mangled:
+        #   /usr/bin/bash: \./scripts/hook.sh" PreToolUse: No such file...).
+        # Any shell-special character in a command string is latent Windows
+        # breakage, so the whole set is banned outright.
+        BANNED = ['"', "'", "\\", "$", "&", "^", "%", "|", "<", ">", ";"]
+
         for h in entries:
             cmd = h.get("command", "")
-            where = f"{where_g}"
 
             if h.get("type") != "command":
-                fail(f"{where} non-command hook type: {h.get('type')}", cmd)
+                fail(f"{where_g} non-command hook type: {h.get('type')}", cmd)
 
             if h.get("timeout") != 30:
-                fail(f"{where} timeout must be 30, got {h.get('timeout')}", cmd)
+                fail(f"{where_g} timeout must be 30, got {h.get('timeout')}", cmd)
 
-            if cmd.startswith("sh "):
+            bad = [ch for ch in BANNED if ch in cmd]
+            if bad:
+                fail(f"{where_g} command contains banned character(s) {bad} -- "
+                     "Windows Antigravity delivers hook args with no shell, so "
+                     "quoting/expansion characters arrive literally and break "
+                     "the handler", cmd)
+
+            if cmd == EXPECTED_SH:
                 sh_entries.append(cmd)
-                if "scripts/hook.sh" not in cmd:
-                    fail(f"{where} sh entry must reference scripts/hook.sh", cmd)
-                if event not in cmd:
-                    fail(f"{where} sh entry must pass '{event}' as the Event arg", cmd)
-            elif cmd.startswith("powershell"):
+            elif cmd == EXPECTED_PS:
                 ps_entries.append(cmd)
-                if "hook.ps1" not in cmd:
-                    fail(f"{where} powershell entry must reference hook.ps1", cmd)
-                if event not in cmd:
-                    fail(f"{where} powershell entry must pass '{event}' as the Event arg", cmd)
             else:
-                fail(f"{where} command starts with neither 'sh ' nor 'powershell'", cmd)
+                fail(f"{where_g} command matches neither the env -S sh form nor "
+                     f"the cmd /d /c powershell form for {event} "
+                     f"(expected one of:\n      {EXPECTED_SH}\n      {EXPECTED_PS})", cmd)
 
         if len(sh_entries) != 1:
             fail(f"{where_g} must have exactly 1 sh entry, got {len(sh_entries)}")
