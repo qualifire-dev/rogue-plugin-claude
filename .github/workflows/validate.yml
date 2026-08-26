@@ -352,6 +352,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_hook_ps1_antigravity.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_antigravity_windows_delivery.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_hook_logs.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_ship_logs.ps1
