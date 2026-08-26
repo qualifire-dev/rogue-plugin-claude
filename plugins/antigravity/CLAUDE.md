@@ -136,10 +136,42 @@ then by event name. The two event kinds take **different array shapes**:
   for parity with the other plugins.
 
 - **cwd is the plugin root.** Both handlers are cwd-relative
-  (`sh "./scripts/hook.sh"`, and `-LiteralPath 'scripts/hook.ps1'`), and
-  `hook.ps1` receives `(Get-Location).Path` as its 2nd arg because
-  `$PSCommandPath` is empty under `[scriptblock]::Create`. Confirmed working on
-  the CLI — if the handler could not resolve, nothing would be logged at all.
+  (`./scripts/hook.sh`, `-LiteralPath scripts/hook.ps1`), and `hook.ps1`
+  receives `(Get-Location).Path` as its 2nd arg because `$PSCommandPath` is
+  empty under `[scriptblock]::Create`. Confirmed working on the CLI.
+
+- **Command strings are quote-free and delivery-model invariant — do not
+  reintroduce quotes or any shell-special character.** On macOS/Linux
+  Antigravity hands the string to `sh -c`; on native Windows it uses NO
+  shell — the first whitespace token becomes the executable and the rest
+  reaches the child as one argument with quote characters mangled in place
+  (observed live, Windows + Git Bash, every event:
+  `/usr/bin/bash: \./scripts/hook.sh" PreToolUse: No such file or directory`,
+  exit 127 — the event name and a literal quote INSIDE the one "filename").
+  Both forms therefore re-split their own argument:
+
+  - sh handler `env -Ssh ./scripts/hook.sh <Event>`: `env -S` is the
+    shebang-line splitter (coreutils >= 8.30, BSD env, Git for Windows
+    `usr\bin\env.exe`) and yields identical argv under sh -c, one-blob, and
+    naive-split delivery. On Windows `hook.sh` still stands down under MSYS;
+    a machine whose PATH lacks `env.exe` fails open exactly as loudly as the
+    old form did.
+  - powershell handler `cmd /d /c powershell -NoProfile -NonInteractive
+    -Command . ([scriptblock]::Create((Get-Content -Raw -LiteralPath
+    scripts/hook.ps1))) <Event> (Get-Location).Path`: `cmd.exe` re-parses
+    everything after `/c` (`/d` suppresses AutoRun), and the PS code is
+    quote-free on purpose — `-LiteralPath` takes a bareword, and the call
+    operator is `.` rather than `&` because `&` is cmd's command separator.
+    On macOS this string is an `sh -c` syntax error (exit 2, nothing
+    executes) — the same E-level noise class as the old
+    `powershell: command not found` line.
+
+  `tests/test_hooks_json_antigravity.sh` pins the exact strings and bans the
+  character set `" ' \ $ & ^ % | < > ;`;
+  `tests/test_antigravity_windows_delivery.ps1` (windows-latest) executes
+  both strings under both Windows delivery models against the real
+  dispatchers. This is a workaround for an Antigravity bug (any Windows
+  command hook taking arguments breaks); reported upstream.
 
 - **No `; exit 0`** on the command strings, unlike every other plugin in this
   repo. The dispatchers self-`exit 0`, and Antigravity has no documented
@@ -658,7 +690,7 @@ stand-downs keep exactly one contributing a decision:
 
 | Environment | `sh` handler | PowerShell handler |
 |---|---|---|
-| macOS / Linux / WSL | runs (curl POST) | `powershell` missing → exit 127, logged, ignored |
+| macOS / Linux / WSL | runs (curl POST) | string is an `sh -c` syntax error → exit 2, logged, ignored — nothing executes |
 | native Windows | `uname` = MINGW/MSYS/CYGWIN → **emits nothing**, exits 0 | runs |
 
 The Git Bash stand-down emits **empty stdout**, not `{}` like the Claude plugin.
@@ -695,7 +727,8 @@ multi-agent installer run.
 
 ```sh
 sh tests/test_hook_sh_antigravity.sh      # passes — dispatcher behavior under dash
-sh tests/test_hooks_json_antigravity.sh   # FAILS today (asserts the pre-fix nested shape)
+sh tests/test_hooks_json_antigravity.sh   # static lint: exact command forms + banned character set
+# windows-latest CI: executes both command forms under both delivery models
 ```
 
 `test_hook_sh_antigravity.sh` covers the invariants worth protecting: per-event
@@ -703,6 +736,8 @@ fail-open defaults, always-exit-0, empty stdout on Git Bash stand-down,
 heartbeat trigger mapping (a new conversation vs a continuation vs `Stop`),
 transcript enrichment on the three content-less events and *not* on `PreToolUse`,
 and that the base64 round-trips.
+
+`tests/test_antigravity_windows_delivery.ps1` executes both command forms under both Windows delivery models against the real dispatchers.
 
 ## Things that look weird but are intentional
 
@@ -714,6 +749,12 @@ and that the base64 round-trips.
 - `PreToolUse` fails open to `{"decision":"allow"}`, never `{}`.
 - Heartbeat rides `PreInvocation` for its session trigger and `Stop` for its
   per-turn one — there is no `SessionStart` event to hang either on.
+- The sh handler is `env -Ssh ...`, not `sh ...`, and the PowerShell handler
+  goes through `cmd /d /c` — Windows Antigravity delivers hook arguments
+  without a shell, so both commands must re-split their own argument. See
+  the command-string bullet in the hooks.json section.
+- No quotes anywhere in `hooks.json` command strings — quote characters
+  arrive literally (and mangled) on Windows.
 
 ## Open items
 
