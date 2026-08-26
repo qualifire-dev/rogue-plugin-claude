@@ -10,8 +10,8 @@
 # tool events, exactly two handlers (sh + powershell) per event each exactly
 # matching the delivery-model-invariant command form for its event, timeout 30
 # on every handler, and no shell-special characters (", ', \, $, &, ^, %, |, <,
-# >, ;) — on native Windows, Antigravity execs commands with no shell, so these
-# characters arrive literally and break the handler.
+# >, ;, `, #) — on native Windows, Antigravity execs commands with no shell, so
+# these characters arrive literally and break the handler.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -114,7 +114,7 @@ for event, arr in hooks.items():
         #   /usr/bin/bash: \./scripts/hook.sh" PreToolUse: No such file...).
         # Any shell-special character in a command string is latent Windows
         # breakage, so the whole set is banned outright.
-        BANNED = ['"', "'", "\\", "$", "&", "^", "%", "|", "<", ">", ";"]
+        BANNED = ['"', "'", "\\", "$", "&", "^", "%", "|", "<", ">", ";", "`", "#"]
 
         for h in entries:
             cmd = h.get("command", "")

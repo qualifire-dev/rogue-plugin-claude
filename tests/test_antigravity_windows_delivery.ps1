@@ -42,8 +42,17 @@ if (-not (Get-Command env.exe -ErrorAction SilentlyContinue)) { Write-Host 'FAIL
 
 # Isolation: no ROGUE_* config -> hook.ps1 takes the unconfigured path and
 # hook.sh stands down before config matters. Keep the log out of the profile.
+# hook.ps1 reads credentials from disk each invocation (%USERPROFILE%\.rogue-env,
+# falling back to HOME) -- nulling ROGUE_API_KEY alone is not enough isolation
+# on a configured machine, so also point USERPROFILE/HOME at a fresh temp dir.
+# (C:\ProgramData\rogue\env cannot be redirected this way; a machine with an
+# MDM-managed env file is out of scope.)
 $env:ROGUE_LOG_DIR = Join-Path $env:TEMP ('rogue-agy-delivery-' + [guid]::NewGuid())
 $env:ROGUE_API_KEY = $null
+$tempHome = Join-Path $env:TEMP ('rogue-agy-delivery-home-' + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tempHome | Out-Null
+$env:USERPROFILE = $tempHome
+$env:HOME = $tempHome
 
 Set-Location $pluginRoot
 $script:fails = 0
@@ -102,6 +111,8 @@ Assert-Eq $r[0] '{"decision":"allow"}' 'powershell command, split delivery: unco
 if ($script:fails) { Show-StderrOnFail }
 
 Remove-Item -Force -ErrorAction SilentlyContinue $errFile
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $env:ROGUE_LOG_DIR
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempHome
 if ($script:fails) { Write-Host "FAIL: $script:fails assertion(s)"; exit 1 }
 Write-Host 'OK: both hooks.json command forms survive blob and split delivery on Windows'
 exit 0

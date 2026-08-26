@@ -171,7 +171,7 @@ then by event name. The two event kinds take **different array shapes**:
   `tests/test_antigravity_windows_delivery.ps1` (windows-latest) executes
   both strings under both Windows delivery models against the real
   dispatchers. This is a workaround for an Antigravity bug (any Windows
-  command hook taking arguments breaks); reported upstream.
+  command hook taking arguments breaks); to be reported upstream.
 
 - **No `; exit 0`** on the command strings, unlike every other plugin in this
   repo. The dispatchers self-`exit 0`, and Antigravity has no documented
