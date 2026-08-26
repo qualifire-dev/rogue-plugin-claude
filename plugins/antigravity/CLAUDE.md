@@ -176,22 +176,24 @@ then by event name. The two event kinds take **different array shapes**:
 - **No `; exit 0`** on the command strings, unlike every other plugin in this
   repo. The dispatchers self-`exit 0`, and Antigravity has no documented
   "visible hook error on non-zero exit" behavior. The observed cost of that
-  choice is real, though: on macOS the PowerShell handler dies with
-  `sh: powershell: command not found` → exit 127, and Antigravity logs an
-  E-level failure for **every event, every turn**:
+  choice is real, though: on macOS the PowerShell handler's command string is
+  an `sh -c` syntax error, and Antigravity logs an E-level failure for
+  **every event, every turn**:
 
   ```
   E … pre-tool hook failed: JSON hook "jsonhook__rogue_PreToolUse_0_1" command failed:
-      command failed: exit status 127, stderr: sh: powershell: command not found
+      command failed: exit status 2, stderr: sh: -c: line 0: syntax error near unexpected token '('
   ```
 
   This is noise, not breakage: the `sh` handler still ran and its decision was
   used, and a failing handler does **not** block the tool (verified — the
   `run_command` under a failed `PreToolUse_0_1` executed normally, so Antigravity
   treats handler failure as fail-open). `curl -sS` also leaks its transport
-  errors into the same log. If the noise becomes a support problem, the fix is
-  to append `; exit 0` and update `test_hooks_json_antigravity.sh`, which
-  currently *forbids* it.
+  errors into the same log. Suppressing the noise can no longer use `; exit 0`
+  at all — the lint bans `;` (and every shell metacharacter) in command strings
+  because native-Windows Antigravity delivers arguments with no shell; if the
+  noise ever becomes a support problem, the handler split itself has to change,
+  not the command suffix.
 
 ## The five events
 
@@ -728,7 +730,7 @@ multi-agent installer run.
 ```sh
 sh tests/test_hook_sh_antigravity.sh      # passes — dispatcher behavior under dash
 sh tests/test_hooks_json_antigravity.sh   # static lint: exact command forms + banned character set
-# windows-latest CI: executes both command forms under both delivery models
+pwsh -NoProfile -File tests/test_antigravity_windows_delivery.ps1   # windows-latest CI: executes both command forms under both delivery models (self-skips off-Windows)
 ```
 
 `test_hook_sh_antigravity.sh` covers the invariants worth protecting: per-event
