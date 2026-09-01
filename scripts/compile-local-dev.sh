@@ -101,6 +101,14 @@ fi
 # Optionally bake the API key + config into ${CLAUDE_PLUGIN_ROOT}/env. Hooks
 # source this before /etc/rogue/env and ~/.rogue-env, so per-user overrides
 # still win.
+#
+# Deliberately NO actor pre-seed here. This file used to emit
+#   : "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email)}"
+# which runs at hook-fire time and short-circuits the dispatcher's cascade with
+# whatever git identity the process has — inside Claude Cowork that is the
+# sandbox's synthetic "Claude <noreply@anthropic.com>", so every user was
+# reported as Claude. plugins/rogue/scripts/actor.sh now derives identity itself
+# (CLAUDE_CODE_USER_EMAIL first, synthetic values rejected). Don't add it back.
 if [ -n "$KEY" ]; then
   {
     echo "# Compiled by compile-local-dev.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -109,13 +117,6 @@ if [ -n "$KEY" ]; then
     printf 'export ROGUE_PRETOOLUSE_ON_BLOCK=%q\n'  "$MODE"
     [ -n "$BASE_URL" ] && printf 'export ROGUE_BASE_URL=%q\n' "$BASE_URL"
     echo 'export ROGUE_AUTO_UPDATE=0'
-    cat <<'ACTOR'
-
-# Best-effort actor identity from git config on the end-user's machine.
-: "${ROGUE_ACTOR_EMAIL:=$(git config --global user.email 2>/dev/null)}"
-: "${ROGUE_ACTOR_NAME:=$(git config --global user.name 2>/dev/null)}"
-export ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME
-ACTOR
   } > "$STAGE/env"
   chmod 600 "$STAGE/env"
 fi

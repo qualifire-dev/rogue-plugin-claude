@@ -69,24 +69,107 @@ function ConvertFrom-ShellQuoted {
 }
 
 # ── logging ────────────────────────────────────────────────────────────────
-# $env:ROGUE_LOG_FILE overrides; default ~/.rogue/hook.log (mirrors hook.sh).
+# ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
+# machine running Copilot CLI + Claude Code + Cursor + … used to interleave all of
+# them into a single hook.log with no way to tell whose line was whose.
+# Precedence: ROGUE_LOG_FILE → ROGUE_LOG_DIR/copilot.log → default, each read from
+# the merged credential map (so process env still wins, but the env files count).
 # $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
 # through the ROGUE_PS_LIB_ONLY seam below (tests).
-$logFile = $env:ROGUE_LOG_FILE
-if (-not $logFile) {
-    $userHome = $env:USERPROFILE
-    if (-not $userHome) { $userHome = $HOME }
-    if ($userHome) { $logFile = Join-Path (Join-Path $userHome '.rogue') 'hook.log' }
+#
+# Resolved by Initialize-Logging AFTER the credential files are parsed, exactly
+# like hook.sh resolves these after sourcing them — so `~/.rogue-env`,
+# `C:\ProgramData\rogue\env` (MDM) and a bundled `env` can all relocate the log.
+# Reading $env: directly here instead would silently ignore every one of those
+# files, which is a real defect for a fleet that relocates logs by policy AND
+# would make the log shipper and the dispatcher disagree on the path.
+# Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
+# dot-source the helpers, and so Log is safe to call before initialisation.
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no '=', so a reader finds the value by scanning to the next 'key=' token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+$script:surface = 'github_copilot'
+$script:logFile = $null
+$script:logMaxBytes = 10485760
+
+function Initialize-Logging {
+    # $Creds is the merged credential map (bundled env → MDM → per-user file, then
+    # process env last), so precedence is already correct by the time we read it.
+    # $HOME backs up USERPROFILE so this also works dot-sourced on macOS/Linux.
+    param([hashtable]$Creds = @{})
+    $f = $Creds['ROGUE_LOG_FILE']
+    if (-not $f) {
+        $d = $Creds['ROGUE_LOG_DIR']
+        if (-not $d) {
+            $userHome = $env:USERPROFILE
+            if (-not $userHome) { $userHome = $HOME }
+            if ($userHome) { $d = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+        }
+        if ($d) { $f = Join-Path $d 'copilot.log' }
+    }
+    $script:logFile = $f
+    # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+    # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+    # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+    # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
+    # zero disables too — matching hook.sh's `-gt 0` test).
+    $cap = $Creds['ROGUE_LOG_MAX_BYTES']
+    # TryParse, NOT a plain [int64] cast: the cast raises "Value was either too
+    # large or too small for an Int64" on an all-digit value too wide for 64
+    # bits. The file-scope $ErrorActionPreference = 'SilentlyContinue' swallows
+    # that error and the assignment is skipped, so the cap happens to keep its
+    # default - the right answer, but reached by accident and invisible if the
+    # preference ever changes. TryParse states the fallback instead, and keeps
+    # this reading like the other two dispatchers, where the same input IS a
+    # live bug (sh disables rotation, Node yields Infinity). '00' still parses
+    # to 0, so a zero-padded zero keeps disabling rotation.
+    $capValue = [int64]0
+    if ($cap -match '^[0-9]+$' -and [int64]::TryParse($cap, [ref]$capValue)) { $script:logMaxBytes = $capValue }
+    else { $script:logMaxBytes = 10485760 }
 }
+
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+
+# Rotation is enforced on the WRITE PATH rather than by a periodic job because an
+# UNCONFIGURED install writes a line per event and never runs anything else - a
+# cap enforced anywhere else would not hold.
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            # Delete the previous generation first: `Move-Item -Force` onto an
+            # EXISTING destination is not reliable on Windows PowerShell 5.1, and
+            # with -ErrorAction SilentlyContinue a failure here would silently
+            # stop all further rotation and let the live log grow unbounded.
+            Remove-Item -LiteralPath "$logFile.1" -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
 function Log {
     param([string]$Msg)
     try {
         if (-not $logFile) { return }
         $dir = Split-Path $logFile
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp provider=github_copilot event=$EventName $Msg" -Encoding UTF8
+        # AppendAllText with an explicit BOM-less UTF-8, NOT `Add-Content -Encoding
+        # UTF8`: on Windows PowerShell 5.1 that switch writes a UTF-8 BOM when it
+        # creates the file, so the first line of every new log (and of every file
+        # produced by a rotation) would start with EF BB BF and fail any parser
+        # that anchors on the timestamp. "`n" keeps the line ending identical to
+        # what the sh dispatchers write, so one log format covers both platforms.
+        # A constant: this plugin has exactly one surface, so there is nothing to
+        # detect and nothing that can fail. Written through the same conditional as
+        # the multi-surface plugins so all six dispatchers share one emit shape.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
+        [System.IO.File]::AppendAllText(
+            $logFile,
+            "$stamp provider=copilot$surfaceToken event=$EventName $Msg`n",
+            (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
 
@@ -203,9 +286,18 @@ foreach ($f in @((Join-Path $PluginRoot 'env'), 'C:\ProgramData\rogue\env', (Joi
         }
     }
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL') {
+# ROGUE_LOG_* ride the same list so a process-env value still beats the files,
+# which is what makes the resolved precedence identical to hook.sh's.
+foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL',
+               'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES') {
     $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $creds[$k] = $val }
 }
+
+# Logging is initialised HERE - after the credential files are parsed, so they can
+# relocate the log - but BEFORE the API-key check below, so an unconfigured
+# install still records `outcome=unconfigured`.
+Initialize-Logging $creds
+Dbg "logFile=$logFile cap=$logMaxBytes"
 
 $apiKey = $creds['ROGUE_API_KEY']
 
@@ -420,14 +512,90 @@ if ($EventName -eq 'agentStop' -or $EventName -eq 'subagentStop') {
     } catch { Dbg "transcript augment failed: $($_.Exception.Message)" }
 }
 
+# ── per-turn presence heartbeat + log ship (agentStop only) ────────────────
+# The PowerShell twin of hook.sh's agentStop block. sessionStart's heartbeat is
+# spawned by hooks.json; this is its per-TURN sibling, fired from HERE rather than
+# from a second hooks.json entry because Copilot skips untrusted command hooks until
+# reviewed via /hooks - a new entry would silently disable every Rogue hook on every
+# existing install until each user re-approved. heartbeat.ps1 throttles the beacon
+# itself (scripts/beacon.ps1, 900s default) and the shipper throttles itself, so a
+# per-turn trigger is not a per-turn request.
+#
+# MAIN AGENT ONLY: Copilot fires agentStop for a subagent too, and $subagentId is
+# already resolved by this point, so this skips those - a subagent's stop is not a
+# user turn.
+#
+# A SEPARATE, HIDDEN PROCESS, for the same two reasons every PowerShell caller here
+# spawns one: in-process, heartbeat.ps1's `$script:` writes would land on this
+# dispatcher's variables and its `exit 0` would end the dispatcher before it relays
+# the response. -EncodedCommand with the path in an env var, so the command is a
+# constant with nothing to escape (Start-Process -ArgumentList quoting is unreliable
+# on Windows PowerShell 5.1). Start-Process without -Wait returns immediately.
+#
+# COPILOT_PLUGIN_ROOT is set explicitly because heartbeat.ps1 self-locates from
+# $PSCommandPath, which is EMPTY under [scriptblock]::Create - the -File spawn in
+# hooks.json has it, this one does not, and COPILOT_PLUGIN_ROOT is its documented
+# next fallback. Without it the child would resolve its root from the CWD and find no
+# bundled env, no manifest version and no shipper.
+if ($EventName -eq 'agentStop' -and -not $subagentId) {
+    $hbScript = Join-Path $pluginRoot 'scripts\heartbeat.ps1'
+    if (Test-Path -LiteralPath $hbScript) {
+        try {
+            $env:COPILOT_PLUGIN_ROOT    = $pluginRoot
+            $env:ROGUE_HEARTBEAT_SCRIPT = $hbScript
+            $hbInner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath' +
+                       ' $env:ROGUE_HEARTBEAT_SCRIPT))) agentStop'
+            $hbEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($hbInner))
+            $hbExe = 'powershell'
+            try { if ((Get-Process -Id $PID).Path) { $hbExe = (Get-Process -Id $PID).Path } } catch {}
+            Start-Process -FilePath $hbExe `
+                -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $hbEncoded `
+                -WindowStyle Hidden -ErrorAction Stop | Out-Null
+            Dbg 'stop heartbeat started'
+        } catch { Dbg "stop heartbeat not started: $($_.Exception.Message)" }
+    }
+}
+# ── install identity: host + version ───────────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only heartbeat.ps1 ever sent them, once, at session start. A session still
+# working a day later therefore aged out as disconnected. Sending them as headers
+# on EVERY event lets the backend refresh this exact row from ordinary hook
+# traffic. Resolved exactly as heartbeat.ps1 does (its sh sibling shares
+# scripts/install-id.sh instead; PowerShell has no such seam here). Any drift
+# between the two is a duplicate roster row.
+$installError = @()
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
+if (-not $hostName) { $hostName = 'unknown'; $installError += 'host-unresolved' }
+
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $PluginRoot 'plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $pluginJson), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+    if ($m.Success) { $pluginVersion = $m.Groups[1].Value }
+    # Manifest is there but carries no semver: schema drift, not a bad install.
+    else { $installError += "version-unparsed:$pluginJson" }
+} else {
+    $installError += "manifest-missing:$pluginJson"
+}
+# A degraded value is still SENT rather than failing the hook: it identifies the
+# install well enough to keep the roster fresh, and no liveness bookkeeping is
+# worth breaking a session over. But "unknown" in the roster is a real symptom,
+# so it is reported as an error once per event.
+if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
+
+
 # ── POST (fail-open) → relay verbatim ──────────────────────────────────────
 $headers = @{
     'x-rogue-api-key'     = $apiKey
     'x-rogue-event'       = $EventName
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
+    'x-rogue-agent'       = 'github_copilot'
 }
-# Every event POSTs the same four headers; a re-attributed subagent event adds the
+# Every event POSTs the same seven headers; a re-attributed subagent event adds the
 # agent tag as two more — x-rogue-agent-id and x-rogue-agent-name-b64, the same
 # pair the Antigravity dispatcher sends. In HEADERS and not in the body so the
 # POSTed event stays the vendor's own bytes. The name is base64 because a display

@@ -11,6 +11,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$REPO/plugins/antigravity/scripts/hook.sh"
 ACTOR="$REPO/plugins/antigravity/scripts/actor.sh"
+INSTALL_ID="$REPO/plugins/antigravity/scripts/install-id.sh"
 SH="${TEST_SH:-sh}"
 
 PORT=$((RANDOM % 10000 + 30000))
@@ -113,6 +114,14 @@ assert_no_header() {
   assert_eq "$actual" "False" "$label"
 }
 
+# Presence-only: the value is this machine's hostname / installed version, so the
+# test can assert it is sent and non-empty but not what it says.
+assert_header_present() {
+  local key="$1" label="$2" actual
+  actual=$(python3 -c 'import json,sys; print(bool(json.load(open(sys.argv[1]))["headers"].get(sys.argv[2])))' "$HEADERS_FILE" "$key")
+  assert_eq "$actual" "True" "$label"
+}
+
 # ── Case 1: PreToolUse deny relayed verbatim + headers + path + exit 0 ─────
 start_mock '{"decision":"deny","reason":"x"}'
 set +e; run_dispatcher PreToolUse '{"toolName":"bash","toolArgs":{"command":"rm -rf /"}}'; LAST_RC=$?; set -e
@@ -124,7 +133,13 @@ assert_header "x-rogue-api-key"     "test-key"         "x-rogue-api-key forwarde
 assert_header "x-rogue-actor-email" "test@example.com" "x-rogue-actor-email forwarded"
 assert_header "x-rogue-actor-name"  "Test User"        "x-rogue-actor-name forwarded (with space)"
 assert_no_header "x-rogue-source"   "no x-rogue-source header (cursor-only)"
-assert_no_header "x-rogue-agent"    "no x-rogue-agent header (codex-only)"
+# Fleet-liveness trio: the same host/version/agent the heartbeat sends, on EVERY
+# event, so the roster row is refreshed by ordinary traffic and not only at the
+# session's first PreInvocation. This payload has no transcriptPath, so the
+# surface falls back to the 2.0 app, matching the backend's own default.
+assert_header "x-rogue-agent"       "antigravity"      "x-rogue-agent falls back to the 2.0 surface"
+assert_header_present "x-rogue-host"    "x-rogue-host sent on every event"
+assert_header_present "x-rogue-version" "x-rogue-version sent on every event"
 path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$HEADERS_FILE")
 assert_eq "$path" "/api/v1/hooks/antigravity" "POST path is /api/v1/hooks/antigravity"
 body=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$HEADERS_FILE")
@@ -185,25 +200,33 @@ STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
+cp "$INSTALL_ID" "$STAGE/scripts/install-id.sh"
 MARKER="$STAGE/heartbeat-fired"
-# The stub records its first argument: the heartbeat is told which surface fired
-# it, because three products share one install and only the hook can tell them
-# apart (from the event's transcriptPath).
+# The stub records BOTH arguments: the heartbeat is told which surface fired it
+# (three products share one install and only the hook can tell them apart, from the
+# event's transcriptPath) AND which trigger, since a per-turn Stop beacon is
+# throttled where a new conversation's is not.
 cat > "$STAGE/scripts/heartbeat.sh" <<EOF
 #!/bin/sh
-printf '%s' "\$1" > "$MARKER"
+printf '%s|%s' "\$1" "\$2" > "$MARKER"
 EOF
 chmod +x "$STAGE/scripts/hook.sh" "$STAGE/scripts/heartbeat.sh"
 
 # Run the staged hook.sh (PLUGIN_ROOT resolves to $STAGE) and echo its exit code.
+# The hook log goes to a path OUTSIDE the per-run sandbox, so an assertion can read
+# the line back after the run (the sandbox is deleted below). Truncated per call so
+# each case reads only its own output.
+LAST_LOG="$(mktemp -d)/antigravity.log"
+
 run_staged() {
   local tmp_home rc
   tmp_home="$(mktemp -d)"
   cp "$ENV_FILE" "$tmp_home/.rogue-env"
+  : > "$LAST_LOG"
   set +e
   HOME="$tmp_home" \
     ROGUE_API_KEY='' ROGUE_ACTOR_EMAIL='' ROGUE_ACTOR_NAME='' ROGUE_BASE_URL='' \
-    ROGUE_LOG_FILE="$tmp_home/hook.log" \
+    ROGUE_LOG_FILE="$LAST_LOG" \
     "$SH" "$STAGE/scripts/hook.sh" "$1" <<< "$2" > "$OUT_FILE"
   rc=$?
   set -e
@@ -211,7 +234,11 @@ run_staged() {
   return $rc
 }
 
-set +e; run_staged PreInvocation '{"invocationNum":0}'; rc=$?; set -e
+# A NEW CONVERSATION is invocationNum 0 AND initialNumSteps <= 1. invocationNum
+# alone is not per-session - it resets on every prompt - so gating on it sent an
+# unthrottled beacon per turn AND shipped the log a turn late, since PreInvocation
+# runs before the turn's own transcript rows exist.
+set +e; run_staged PreInvocation '{"invocationNum":0,"initialNumSteps":0}'; rc=$?; set -e
 assert_eq "$rc" "0" "PreInvocation invocationNum:0 exits 0"
 # heartbeat.sh is launched via a backgrounded `nohup ... &`; give it a moment
 # to actually run before asserting the marker.
@@ -220,12 +247,52 @@ for _ in $(seq 1 30); do
   sleep 0.1
 done
 if [ -f "$MARKER" ]; then
-  echo "  ok: PreInvocation invocationNum:0 launches heartbeat.sh"
+  echo "  ok: a new conversation's PreInvocation launches heartbeat.sh"
 else
   echo "FAIL [heartbeat launch]: marker file $MARKER was never created" >&2
   exit 1
 fi
-assert_eq "$(cat "$MARKER")" "" "no transcriptPath → no surface passed (heartbeat falls back)"
+# No transcriptPath: the launcher passes the SAME fallback the event headers carry
+# (the 2.0 app), never an empty surface. Handing the heartbeat nothing let it sniff
+# the filesystem and pick antigravity_cli whenever `agy` was installed, so one
+# first-PreInvocation wrote `antigravity` from the event and `antigravity_cli` from
+# the heartbeat: two roster rows for one install.
+assert_eq "$(cat "$MARKER")" "antigravity|SessionStart" \
+  "no transcriptPath -> heartbeat gets the headers' fallback surface, trigger SessionStart"
+
+# initialNumSteps 1: the pending prompt has already been recorded as a step, so this
+# is still the start of a conversation.
+rm -f "$MARKER"
+restart_mock '{}'
+set +e; run_staged PreInvocation '{"invocationNum":0,"initialNumSteps":1}'; rc=$?; set -e
+assert_eq "$rc" "0" "initialNumSteps:1 exits 0"
+for _ in $(seq 1 30); do [ -s "$MARKER" ] && break; sleep 0.1; done
+assert_eq "$(cat "$MARKER" 2>/dev/null)" "antigravity|SessionStart" "initialNumSteps:1 is still a session start"
+
+# A CONTINUATION (invocationNum 0 but steps already recorded, e.g. `agy -c`) fires
+# NOTHING here: its Stop covers it, and treating it as a session start would hand an
+# unthrottled beacon to every resumed conversation.
+rm -f "$MARKER"
+restart_mock '{}'
+set +e; run_staged PreInvocation '{"invocationNum":0,"initialNumSteps":18}'; rc=$?; set -e
+assert_eq "$rc" "0" "a continuation's PreInvocation exits 0"
+sleep 0.5
+if [ -f "$MARKER" ]; then
+  echo "FAIL [heartbeat]: a continuation invocation fired a SessionStart beacon" >&2
+  exit 1
+fi
+echo "  ok: invocationNum:0 with steps already recorded fires no heartbeat"
+
+# Stop is the PER-TURN trigger, and it is what makes a long session keep reporting:
+# on PreInvocation alone the log shipper riding inside heartbeat.sh only ever saw
+# turns 1..N-1, because PreInvocation runs before turn N's rows are written.
+rm -f "$MARKER"
+restart_mock '{}'
+set +e; run_staged Stop '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}'; rc=$?; set -e
+assert_eq "$rc" "0" "Stop exits 0"
+for _ in $(seq 1 30); do [ -s "$MARKER" ] && break; sleep 0.1; done
+assert_eq "$(cat "$MARKER" 2>/dev/null)" "antigravity|Stop" "Stop launches the heartbeat with the Stop trigger"
+rm -f "$MARKER"
 
 # The surface rides the transcriptPath: without it every surface on a machine
 # with the CLI installed collapses into one antigravity_cli roster row.
@@ -238,11 +305,19 @@ for surface in antigravity_cli antigravity_ide antigravity; do
   esac
   restart_mock '{}'
   set +e
-  run_staged PreInvocation "$(printf '{"invocationNum":0,"transcriptPath":"/h/.gemini/%s/brain/c/x/transcript_full.jsonl"}' "$dir")"
+  run_staged PreInvocation "$(printf '{"invocationNum":0,"initialNumSteps":0,"transcriptPath":"/h/.gemini/%s/brain/c/x/transcript_full.jsonl"}' "$dir")"
   rc=$?; set -e
   assert_eq "$rc" "0" "$surface heartbeat exits 0"
   for _ in $(seq 1 30); do [ -s "$MARKER" ] && break; sleep 0.1; done
-  assert_eq "$(cat "$MARKER" 2>/dev/null)" "$surface" "heartbeat is told the $surface surface"
+  assert_eq "$(cat "$MARKER" 2>/dev/null)" "$surface|SessionStart" "heartbeat is told the $surface surface"
+  # The SAME resolution stamps the log line. One value, two consumers: if these
+  # ever disagree, a line and the roster row for one session name different
+  # surfaces - worse than the line naming none. (The unconfigured path has no
+  # payload to resolve from and correctly emits no token at all; that case is
+  # covered in tests/test_hook_logs.sh.)
+  logged=$(sed -n 's/.*provider=antigravity surface=\([a-z_]*\) event=.*/\1/p' \
+             "$LAST_LOG" 2>/dev/null | tail -1)
+  assert_eq "$logged" "$surface" "the log line is stamped surface=$surface"
 done
 rm -rf "$STAGE"
 
@@ -252,6 +327,7 @@ STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/scripts"
 cp "$HOOK" "$STAGE/scripts/hook.sh"
 cp "$ACTOR" "$STAGE/scripts/actor.sh"
+cp "$INSTALL_ID" "$STAGE/scripts/install-id.sh"
 MARKER="$STAGE/heartbeat-fired"
 cat > "$STAGE/scripts/heartbeat.sh" <<EOF
 #!/bin/sh

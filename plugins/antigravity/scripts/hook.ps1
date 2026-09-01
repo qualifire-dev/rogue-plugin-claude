@@ -91,7 +91,15 @@ function ConvertFrom-ShellQuoted {
 # reading a script variable from a function is implicit, but ASSIGNING one needs
 # the `$script:` prefix or the write lands in a function-local copy and silently
 # vanishes. Every write to shared state below is therefore `$script:`-qualified.
-$logFile    = ''   # resolved in Initialize-Logging
+# Which SURFACE of Antigravity wrote each line - antigravity, antigravity_ide or
+# antigravity_cli. Resolved from the payload's transcriptPath, the ONLY reliable
+# signal (three products share one install, so a filesystem probe cannot tell which
+# is running), and the same value the heartbeat reports. Empty for an event whose
+# payload carries no transcriptPath, and for every line written before the payload
+# is read: the token is then OMITTED, never `surface=` and never `surface=unknown`.
+$script:surface     = ''
+$script:logFile     = ''       # resolved in Initialize-Logging
+$script:logMaxBytes = 10485760  # ditto; the default stands until then
 $creds      = @{}  # credential files + process env, by Import-Credentials
 $apiKey     = ''
 $url        = ''
@@ -131,11 +139,51 @@ function Resolve-PluginRoot {
     }
 }
 
+# ONE FILE PER AGENT (mirrors hook.sh). Every Rogue plugin shares ~/.rogue, so a
+# machine running Antigravity + Claude Code + Cursor + … used to interleave all of
+# them into a single hook.log with no way to tell whose line was whose.
+# Resolved AFTER Import-Credentials, exactly like hook.sh's load_env resolves
+# these after sourcing the env files — so `~/.rogue-env`, `C:\ProgramData\rogue\env`
+# (MDM) and a bundled `env` can all relocate the log. Reading $env: directly here
+# instead would silently ignore every one of those files, which is a real defect
+# for a fleet that relocates logs by policy AND would make the log shipper and the
+# dispatcher disagree on the path.
 function Initialize-Logging {
-    $script:logFile = $env:ROGUE_LOG_FILE
-    if (-not $script:logFile) {
-        $script:logFile = Join-Path (Join-Path $env:USERPROFILE '.rogue') 'hook.log'
+    # $Creds is the merged credential map (bundled env → MDM → per-user file, then
+    # process env last), so precedence is already correct by the time we read it.
+    # $HOME backs up USERPROFILE so this also works dot-sourced on macOS/Linux
+    # through the ROGUE_PS_LIB_ONLY seam (tests) — without it $logFile resolves to
+    # $null there and every line is silently dropped.
+    param([hashtable]$Creds = @{})
+    $f = $Creds['ROGUE_LOG_FILE']
+    if (-not $f) {
+        $logDir = $Creds['ROGUE_LOG_DIR']
+        if (-not $logDir) {
+            $userHome = $env:USERPROFILE
+            if (-not $userHome) { $userHome = $HOME }
+            if ($userHome) { $logDir = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+        }
+        if ($logDir) { $f = Join-Path $logDir 'antigravity.log' }
     }
+    $script:logFile = $f
+    # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+    # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+    # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+    # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
+    # zero disables too — matching hook.sh's `-gt 0` test).
+    $cap = $Creds['ROGUE_LOG_MAX_BYTES']
+    # TryParse, NOT a plain [int64] cast: the cast raises "Value was either too
+    # large or too small for an Int64" on an all-digit value too wide for 64
+    # bits. The file-scope $ErrorActionPreference = 'SilentlyContinue' swallows
+    # that error and the assignment is skipped, so the cap happens to keep its
+    # default - the right answer, but reached by accident and invisible if the
+    # preference ever changes. TryParse states the fallback instead, and keeps
+    # this reading like the other two dispatchers, where the same input IS a
+    # live bug (sh disables rotation, Node yields Infinity). '00' still parses
+    # to 0, so a zero-padded zero keeps disabling rotation.
+    $capValue = [int64]0
+    if ($cap -match '^[0-9]+$' -and [int64]::TryParse($cap, [ref]$capValue)) { $script:logMaxBytes = $capValue }
+    else { $script:logMaxBytes = 10485760 }
 }
 
 function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
@@ -153,13 +201,45 @@ function Add-JsonFields {
     return $p + $Fields + '}'
 }
 
+# Trim the log before appending. Rotation lives on the WRITE PATH and not in a
+# periodic job on purpose: an UNCONFIGURED install writes a line per event and
+# never runs anything else, so a cap enforced anywhere else would not hold.
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            # Delete the previous generation first: `Move-Item -Force` onto an
+            # EXISTING destination is not reliable on Windows PowerShell 5.1, and
+            # with -ErrorAction SilentlyContinue a failure here would silently
+            # stop all further rotation and let the live log grow unbounded.
+            Remove-Item -LiteralPath "$logFile.1" -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
 function Log {
     param([string]$Msg)
     try {
+        if (-not $logFile) { return }
         $dir = Split-Path $logFile
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Add-Content -LiteralPath $logFile -Value "$stamp provider=antigravity event=$EventName $Msg" -Encoding UTF8
+        # AppendAllText with an explicit BOM-less UTF-8, NOT `Add-Content -Encoding
+        # UTF8`: on Windows PowerShell 5.1 that switch writes a UTF-8 BOM when it
+        # creates the file, so the first line of every new log (and of every file
+        # produced by a rotation) would start with EF BB BF and fail any parser
+        # that anchors on the timestamp. "`n" keeps the line ending identical to
+        # what the sh dispatchers write, so one log format covers both platforms.
+        # Empty slug -> empty string, so the line is byte-identical to what an
+        # older version wrote. Optional means optional.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
+        [System.IO.File]::AppendAllText(
+            $logFile,
+            "$stamp provider=antigravity$surfaceToken event=$EventName $Msg`n",
+            (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
 
@@ -174,7 +254,10 @@ function Import-Credentials {
             }
         }
     }
-    foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL') {
+    # ROGUE_LOG_* ride the same list so a process-env value still beats the files,
+    # which is what makes the resolved precedence identical to hook.sh's load_env.
+    foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL','ROGUE_API_URL',
+                   'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES') {
         $val = [Environment]::GetEnvironmentVariable($k); if ($val) { $script:creds[$k] = $val }
     }
     $script:apiKey = $script:creds['ROGUE_API_KEY']
@@ -254,22 +337,54 @@ function Get-PayloadTranscriptPath {
     return $m.Groups[1].Value.Replace('\/', '/').Replace('\\', '\').Replace('\', '/')
 }
 
-# Heartbeat on the first invocation of a session (invocationNum == 0). Fire
-# detached (Start-Process -WindowStyle Hidden) so the hook itself returns
-# immediately regardless of heartbeat.ps1's own latency — mirrors hook.sh's
+# Heartbeat, fired detached (Start-Process -WindowStyle Hidden) so the hook itself
+# returns immediately regardless of heartbeat.ps1's own latency — mirrors hook.sh's
 # `( nohup sh heartbeat.sh & )`.
+#
+# TWO TRIGGERS, and the mapping is Antigravity's own because it has no SessionStart
+# event. Kept identical to hook.sh's maybe_heartbeat, including the reasoning:
+# `invocationNum == 0` is NOT once per session (it resets on every new prompt), so
+# gating on it alone sent an unthrottled beacon per turn AND shipped the hook log a
+# turn late, since PreInvocation runs before the turn's own transcript rows exist.
+#
+#   SessionStart  first invocation of a NEW CONVERSATION - invocationNum 0 AND
+#                 initialNumSteps 0 or 1. Never throttled.
+#   Stop          every agent run's end: the per-TURN trigger, throttled by
+#                 scripts/beacon.ps1, and late enough for the shipper.
+#
+# A continuation invocation (invocationNum 0 with steps already recorded, e.g.
+# `agy -c`) fires nothing here - its Stop covers it.
 function Invoke-Heartbeat {
-    if ($EventName -ne 'PreInvocation') { return }
-    if (-not ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) { return }
+    $hbTrigger = ''
+    if ($EventName -eq 'Stop') {
+        $hbTrigger = 'Stop'
+    } elseif ($EventName -eq 'PreInvocation' -and
+              ($payload -like '*"invocationNum":0*' -or $payload -like '*"invocationNum": 0*')) {
+        # The step count is EXTRACTED and compared numerically, never -like matched.
+        # A glob is what a first attempt used and it is wrong in a way that reads as
+        # correct: '*"initialNumSteps":1*' also matches 18, so every continuation of a
+        # long conversation looked like a fresh one and got an unthrottled beacon.
+        #
+        # The boundary is the step count BEFORE this invocation: 0 on a fresh
+        # conversation, 1 once the pending prompt has been recorded as a step.
+        $stepsMatch = [regex]::Match($payload, '"initialNumSteps"\s*:\s*([0-9]+)')
+        if ($stepsMatch.Success -and [int]$stepsMatch.Groups[1].Value -le 1) {
+            $hbTrigger = 'SessionStart'
+        }
+    }
+    if (-not $hbTrigger) { return }
     try {
         $hbPath = Join-Path $PluginRoot 'scripts/heartbeat.ps1'
-        # Pass the surface along: only the hook can know it (three products share
-        # one install, and the event's transcriptPath names which state dir it
-        # lives in). Mirrors hook.sh's `heartbeat.sh "$_hb_agent"`.
-        $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath)
-        $hbTp = [regex]::Match($payload, '"transcriptPath"\s*:\s*"([^"]*)"').Groups[1].Value
-        $hbAgent = Get-AntigravitySurface $hbTp
-        if ($hbAgent) { $hbArgs += @('-Agent', $hbAgent) }
+        # Pass the SAME surface the event headers carry ($install.agent, resolved
+        # first off the same transcriptPath), never a freshly-derived one and never
+        # the possibly empty log token. An unattributable payload yields an empty
+        # surface, and heartbeat.ps1's own fallback then sniffs the filesystem and
+        # picks antigravity_cli whenever `agy` is installed, so this event would
+        # report `antigravity` while its heartbeat reported `antigravity_cli`, and one
+        # install would own two roster rows. One resolution, one row. Mirrors
+        # hook.sh's `heartbeat.sh "$ROGUE_INSTALL_AGENT" "$_hb_trigger"`.
+        $hbArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$hbPath,'-Agent',$install.agent)
+        $hbArgs += @('-Trigger', $hbTrigger)
         Start-Process -FilePath 'powershell' `
             -ArgumentList $hbArgs `
             -WindowStyle Hidden -ErrorAction Stop
@@ -628,10 +743,55 @@ function Add-StoreRead {
 }
 
 # Resolved once and shared by the three IDE-gated behaviors below (store read,
-# Stop-only tail, capability flag) so they can never disagree about the surface.
+# Stop-only tail, capability flag) plus Resolve-InstallId, so nothing can
+# disagree about the surface. Called early in Invoke-Main, before the heartbeat
+# is launched with it.
 function Resolve-Surface {
     $script:payloadTp = Get-PayloadTranscriptPath $payload
     $script:isIdeSurface = $script:payloadTp -like '*/antigravity-ide/*'
+    # Same path, same table: the log token, the heartbeat's roster agent and the
+    # IDE-only enrichment branch all come from this one resolution.
+    $script:surface = [string](Get-AntigravitySurface $script:payloadTp)
+}
+
+# This install's fleet identity: host + version (from the bundled VERSION file,
+# NOT plugin.json — the Antigravity manifest schema is additionalProperties:false
+# with no version field) + the surface off this event's transcriptPath. Mirrors
+# heartbeat.ps1's Resolve-Version / Resolve-Surface, and must keep mirroring them:
+# the roster keys a row on host + actor + family + agent, so any drift between the
+# two senders is a duplicate row for one install.
+#
+# Resolved ONCE, before the heartbeat launches, and used by both senders — the
+# per-event headers in Invoke-Post and the -Agent handed to heartbeat.ps1.
+function Resolve-InstallId {
+    # A degraded value is still SENT rather than failing the hook: it identifies
+    # the install well enough to keep the roster fresh, and no liveness
+    # bookkeeping is worth breaking a session over. But "unknown" in the roster is
+    # a real symptom, so each miss is logged as an error.
+    $installError = @()
+    $h = $env:COMPUTERNAME
+    if (-not $h) { try { $h = [System.Net.Dns]::GetHostName() } catch { $h = '' } }
+    if (-not $h) { $h = 'unknown'; $installError += 'host-unresolved' }
+    $v = 'unknown'
+    $versionFile = Join-Path $PluginRoot 'VERSION'
+    if (Test-Path -LiteralPath $versionFile) {
+        try {
+            $first = Get-Content -LiteralPath $versionFile -TotalCount 1
+            if ($first) { $v = $first.Trim() } else { $installError += "version-file-empty:$versionFile" }
+        } catch { $installError += "version-file-unreadable:$versionFile" }
+    } else {
+        $installError += "version-file-missing:$versionFile"
+    }
+    if ($installError.Count) { Log "error=install-id $($installError -join ',')" }
+    # The surface comes from Resolve-Surface, which ran first off the same
+    # transcriptPath - reused, never re-derived, so the log token and this header
+    # cannot name different surfaces for one event. Unattributable payload: default
+    # to the 2.0 app, the same guess the backend's parser makes, so the roster row
+    # matches the events it stores. (The log token stays empty in that case and the
+    # line then carries no surface= at all; only the required fields default.)
+    $a = $script:surface
+    if (-not $a) { $a = 'antigravity' }
+    $script:install = @{ host = $h; version = $v; agent = $a }
 }
 
 function Add-StoreReadForEvent {
@@ -721,6 +881,9 @@ function Invoke-Post {
         'x-rogue-event'       = $EventName
         'x-rogue-actor-email' = $actorEmail
         'x-rogue-actor-name'  = $actorName
+        'x-rogue-host'        = $install.host
+        'x-rogue-version'     = $install.version
+        'x-rogue-agent'       = $install.agent
     }
     # The agent tag rides in HEADERS, never in the body: the POSTed event must stay
     # byte-identical to what Antigravity handed us, so the stored raw payload is the
@@ -774,12 +937,25 @@ function Invoke-Main {
     Dbg "event=$EventName"
 
     Resolve-PluginRoot
-    Initialize-Logging
+    # Credentials FIRST: Initialize-Logging reads ROGUE_LOG_* out of the merged
+    # map, so the env files can relocate the log exactly as they can under
+    # hook.sh's load_env. Both still precede Assert-ApiKey, so an unconfigured
+    # machine records `outcome=unconfigured` before it exits.
     Import-Credentials
+    Initialize-Logging $script:creds
     Assert-ApiKey          # exits before stdin is read when there is no key
     Resolve-Url
     Resolve-Actor
     Read-Payload
+    # Immediately after the payload, and BEFORE anything that logs or sends - the
+    # same position hook.sh resolves it in. Every log line from here on carries the
+    # surface, so the two dispatchers emit the same token for the same event; and
+    # Resolve-InstallId reuses this answer for the header, so the heartbeat body
+    # and this event's headers can never name different surfaces for one install.
+    # Re-attribution below rewrites conversationId, never transcriptPath, so
+    # reading the surface this early is the same answer it would give later.
+    Resolve-Surface
+    Resolve-InstallId
 
     Invoke-Heartbeat
     Initialize-SubagentDirs
@@ -788,7 +964,6 @@ function Invoke-Main {
     # appended base64 blob.
     Resolve-Subagent
 
-    Resolve-Surface
     Add-StoreReadForEvent
     Add-TranscriptTail
     Add-CapabilityFlag

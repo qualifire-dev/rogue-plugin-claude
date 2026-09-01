@@ -299,11 +299,19 @@ gemini_install_extension() {
   src="$(dirname "$src")"
 
   # Reinstall cleanly so a re-run upgrades. Ignore uninstall errors (first run).
-  gemini extensions uninstall rogue >/dev/null 2>&1 || true
-  if gemini extensions install "$src" --consent >/dev/null 2>&1; then
+  # GEMINI_CLI_TRUST_WORKSPACE=true is Gemini's documented headless bypass for
+  # its folder-trust gate (default-ON): without it the install prompts "Do you
+  # trust the files in this folder?" for our own just-extracted temp dir, the
+  # prompt is invisible here (output swallowed), non-interactive default is No,
+  # and the install aborts with 'Installation aborted: Folder "..." is not
+  # trusted.' Scoped to these two commands only — no persistent trust granted.
+  GEMINI_CLI_TRUST_WORKSPACE=true gemini extensions uninstall rogue >/dev/null 2>&1 || true
+  if GEMINI_CLI_TRUST_WORKSPACE=true gemini extensions install "$src" --consent >/dev/null 2>&1; then
     ok "Extension installed via ${C_DIM}gemini extensions install${C_RESET}"
   else
-    warn "gemini extensions install failed. Run 'gemini extensions install $src' to see the error."
+    # No recovery command in the message: $src lives under $tmp, which the RETURN
+    # trap deletes on the way out of this function (same rule as install_antigravity).
+    warn "gemini extensions install failed — re-run the installer, or install manually: extract ${asset} from the GitHub release and run 'GEMINI_CLI_TRUST_WORKSPACE=true gemini extensions install <extracted-dir> --consent'."
     return 1
   fi
 }
@@ -381,11 +389,10 @@ antigravity_install_plugin() {
 # ── Credentials ───────────────────────────────────────────────────────────────
 # Validate the key AND register this install via /api/v1/hooks/status (the same
 # heartbeat the SessionStart hook calls). Echoes the HTTP status code (empty on
-# transport failure). On 200, also populates STATUS_ORG / STATUS_UPDATE for the
-# caller to surface. Sending a stable host + actor-email keeps the dashboard
-# roster row deduped with the later heartbeats.
+# transport failure). On 200, also populates STATUS_ORG for the caller to
+# surface. Sending a stable host + actor-email keeps the dashboard roster row
+# deduped with the later heartbeats.
 STATUS_ORG=""
-STATUS_UPDATE=""
 # /api/v1/hooks/status has side effects (it registers/updates the roster row), so
 # the key-validation POST must register under an agent that is actually being
 # installed — a Copilot-only or Codex-only install must NOT create a bogus Claude
@@ -396,7 +403,7 @@ STATUS_UPDATE=""
 status_agent_ctx() { # sets SC_FAMILY / SC_AGENT from $agents
   local a
   for a in ${agents:-}; do
-    [ "$a" = claude ] && { SC_FAMILY="claude"; SC_AGENT="Claude Code - CLI"; return; }
+    [ "$a" = claude ] && { SC_FAMILY="claude"; SC_AGENT="claude_code"; return; }
   done
   set -- ${agents:-claude}
   case "${1:-claude}" in
@@ -404,7 +411,7 @@ status_agent_ctx() { # sets SC_FAMILY / SC_AGENT from $agents
     cursor)  SC_FAMILY="cursor";  SC_AGENT="cursor" ;;
     gemini)  SC_FAMILY="gemini";  SC_AGENT="gemini_cli" ;;
     copilot) SC_FAMILY="copilot"; SC_AGENT="github_copilot" ;;
-    *)       SC_FAMILY="claude";  SC_AGENT="Claude Code - CLI" ;;
+    *)       SC_FAMILY="claude";  SC_AGENT="claude_code" ;;
   esac
 }
 status_check() { # status_check <api-key> <actor-email>
@@ -428,7 +435,6 @@ status_check() { # status_check <api-key> <actor-email>
   body="${resp%$'\n'*}"
   if [ "$code" = "200" ]; then
     STATUS_ORG=$(printf '%s' "$body" | sed -E -n 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
-    printf '%s' "$body" | grep -qE '"update_available"[[:space:]]*:[[:space:]]*true' && STATUS_UPDATE=1
   fi
   printf '%s' "$code"
 }
@@ -502,7 +508,6 @@ configure_credentials() {
     code="$(status_check "$key" "$def_email")"
     case "$code" in
       200)        ok "Key validated${STATUS_ORG:+ — org: $STATUS_ORG}"
-                  [ -n "$STATUS_UPDATE" ] && note "A newer plugin version is available (auto-update will pick it up)."
                   break ;;
       401|403)    tries=$((tries+1)); warn "Invalid key (HTTP $code)."
                   if [ "$tries" -ge 3 ]; then

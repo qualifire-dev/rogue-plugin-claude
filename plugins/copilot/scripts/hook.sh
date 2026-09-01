@@ -44,11 +44,69 @@ PLUGIN_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)"
 [ -r /etc/rogue/env ]       && . /etc/rogue/env
 [ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
 
-ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+# Log destination — ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a
+# machine running Copilot CLI + Claude Code + Cursor + … used to interleave all of
+# them into a single hook.log with no way to tell whose line was whose.
+# Precedence: explicit file → directory override → per-agent default.
+ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/copilot.log}"
+# Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+# generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+# rotation; a NON-NUMERIC value falls back to this default, so a typo can
+# never leave the log growing unbounded. Enforced on the WRITE PATH rather
+# than by a periodic job because an UNCONFIGURED install writes a line per
+# event and never runs anything else - a cap enforced anywhere else would
+# not hold.
+ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
+# Clamp per the rule above: anything non-numeric becomes the default.
+case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
+# An all-digit value can still overflow the shell's integer type: dash answers
+# `[ "$cap" -gt 0 ]` with "Illegal number" on stderr and a FALSE, which reads
+# as "rotation disabled" and lets the log grow unbounded. Node has the same
+# bug through Number() -> Infinity; PowerShell is the only one that already
+# lands on the default, and only because its cast error is silenced. All
+# three clamp explicitly now. 18 digits is the widest value guaranteed to fit
+# a signed 64-bit int; leading zeros are stripped first so "000...0" still
+# reads as the rotation-disabling zero.
+_lcap="$ROGUE_LOG_MAX_BYTES"
+while [ "${_lcap#0}" != "$_lcap" ]; do _lcap="${_lcap#0}"; done
+if [ "${#_lcap}" -gt 18 ]; then ROGUE_LOG_MAX_BYTES=10485760; fi
+# NOTE: `_lsz` is not function-local (POSIX sh has no `local`) but is used
+# NOWHERE else in this file — unlike `_p`/`_n`, which are shared (see below).
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no `=`, so a reader finds the value by scanning to the next `key=` token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+SURFACE="github_copilot"
+
 log() {
-  mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
-  printf '%s provider=github_copilot event=%s %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
+  # 0700 dir / 0600 file. The logged text is not only ours: it carries the
+  # server's block reason, which quotes the content that tripped the rule - a
+  # secret, a command, a slice of a prompt. Under the default umask the log
+  # lands 0644 and every other account on the box can read it. The umask
+  # applies to what THIS call creates, so a 0644 log from an older version
+  # keeps its mode; Windows needs no counterpart, since another standard user
+  # cannot read %USERPROFILE% to begin with.
+  ( umask 077
+    mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+    rotate_log
+    # SURFACE is a constant here: this plugin has exactly one surface, so there is
+    # nothing to detect and nothing that can fail. It is still written through the
+    # same `${SURFACE:+ …}` expansion as the multi-surface plugins so all six
+    # dispatchers share one emit shape.
+    printf '%s provider=copilot%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 
@@ -310,6 +368,14 @@ if [ -z "${ROGUE_API_KEY:-}" ]; then
 fi
 
 [ -r "${PLUGIN_ROOT}/scripts/actor.sh" ] && . "${PLUGIN_ROOT}/scripts/actor.sh"
+# Host + version + surface, resolved exactly as heartbeat.sh does. Sent on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. See install-id.sh.
+[ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+# A degraded value is still sent (never a hard failure — see install-id.sh), but
+# it is worth knowing about: an "unknown" host or version means this install
+# reports itself imprecisely to the fleet roster.
+[ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
 
 URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/copilot}"
 
@@ -322,14 +388,42 @@ case "$EVENT" in
   agentStop|subagentStop) BODY="$(augment_with_transcript "$BODY")" ;;
 esac
 
+# ── per-turn presence heartbeat + log ship (agentStop only) ────────────────
+# sessionStart's heartbeat is spawned by hooks.json; this is its per-TURN twin, and
+# it is fired from HERE rather than from a second hooks.json entry on purpose:
+# Copilot skips untrusted command hooks until the user reviews them via /hooks, so
+# adding an entry would silently disable every Rogue hook on every existing install
+# until each user re-approved. The dispatcher already runs on agentStop, so this
+# leaves the command strings byte-identical and trust intact.
+#
+# It exists because a session left open for days used to produce exactly one beacon
+# and one log upload for its whole lifetime - the roster row went stale and the hook
+# log sat on disk unshipped. heartbeat.sh throttles the beacon itself
+# (scripts/beacon.sh, 900s default) and the shipper throttles itself, so a per-turn
+# trigger is not a per-turn request.
+#
+# MAIN AGENT ONLY. Copilot fires agentStop for a subagent too (with sessionId
+# `toolu_…`), and SUBAGENT_ID is set by the time we get here, so this skips those:
+# a subagent's stop is not a user turn, and one turn using three subagents would
+# otherwise queue four beacons that the throttle then has to absorb.
+#
+# DETACHED double-fork with every fd redirected. This is the synchronous dispatcher
+# and Copilot is waiting on our stdout, so nothing here may be awaited - and stdin is
+# closed because the child must not touch the buffered event. heartbeat.sh
+# self-locates its plugin root from $0, exactly as this script does, so there is
+# nothing to pass but the trigger.
+if [ "$EVENT" = "agentStop" ] && [ -z "$SUBAGENT_ID" ] &&
+   [ -r "${PLUGIN_ROOT}/scripts/heartbeat.sh" ]; then
+  ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" agentStop </dev/null >/dev/null 2>&1 & )
+fi
+
 # Capture body + HTTP status. -w appends a final line "<code>"; on any transport
 # failure curl exits non-zero and the code is 000. Relay the body ONLY on a clean
 # HTTP 200 so an error page (401/404/500) is never handed to Copilot as a decision.
-#
-# Every event POSTs the same four headers; a re-attributed subagent event adds the
-# agent tag as two more — x-rogue-agent-id and x-rogue-agent-name-b64, the same
-# pair the Antigravity dispatcher sends. In HEADERS and not in the body so the
-# POSTed event stays the vendor's own bytes: tagging the body meant a full jq
+# Every event POSTs the same seven headers; a re-attributed subagent event adds
+# the agent tag as two more - x-rogue-agent-id and x-rogue-agent-name-b64, the
+# same pair the Antigravity dispatcher sends. In HEADERS and not in the body so
+# the POSTed event stays the vendor's own bytes: tagging the body meant a full jq
 # re-serialization of arbitrary toolArgs. Both are omitted entirely, never sent
 # empty, on a main-agent event. The local SUBAGENT_* variables keep Copilot's own
 # terminology, since Copilot is what calls these subagents; the wire names match
@@ -341,6 +435,9 @@ esac
 # `set --` is free to rebuild the positional list here.
 set -- -H "x-rogue-api-key: $ROGUE_API_KEY" \
        -H "x-rogue-event: $EVENT" \
+       -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
+       -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+       -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
        -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
        -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME"
 # The id is a bare token from Copilot (toolu_… / call_…). Anything outside the

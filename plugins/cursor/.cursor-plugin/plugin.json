@@ -1,6 +1,6 @@
 {
   "name": "Rogue Security",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "description": "Rogue Security AIDR — real-time AI agent detection and response for Cursor",
   "author": {
     "name": "rogue-security",
