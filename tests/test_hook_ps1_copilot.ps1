@@ -231,7 +231,12 @@ Assert-Eq (Get-NameB64 ('Task "Agent" ' + $BS + ' v2')) 'VGFzayAiQWdlbnQiIFwgdjI
 Assert-Eq (Get-NameB64 'Stop Agent') 'U3RvcCBBZ2VudA==' 'the stop-event display name matches the sh dispatcher'
 # UTF-8 before base64, so a non-ASCII name cannot produce an invalid header value
 # (HTTP header values are ISO-8859-1 by spec — the whole reason for the encoding).
-Assert-Eq (Get-NameB64 'エージェント') '44Ko44O844K444Kn44Oz44OI' 'a non-ASCII name is UTF-8 base64'
+# Built from codepoints, not a literal: Windows PowerShell 5.1 reads a BOM-less
+# file as ANSI, so a non-ASCII literal here decodes to mojibake and can terminate
+# the string early (it did - the 5.1 job failed to parse this file at all). The
+# source stays pure ASCII; the VALUE under test is still non-ASCII.
+$JP = -join @(0x30A8, 0x30FC, 0x30B8, 0x30A7, 0x30F3, 0x30C8 | ForEach-Object { [char]$_ })
+Assert-Eq (Get-NameB64 $JP) '44Ko44O844K444Kn44Oz44OI' 'a non-ASCII name is UTF-8 base64'
 
 if ($fails -gt 0) {
     Write-Host ""
