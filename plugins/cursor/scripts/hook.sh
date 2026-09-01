@@ -28,6 +28,8 @@
 # empty body all yield `{}` on stdout, exit 0. Cursor
 # must never block because Rogue infrastructure is unavailable.
 #
+# Logs every invocation to $ROGUE_LOG_FILE (default ~/.rogue/logs/cursor.log).
+#
 # Credential resolution (later file wins; process env wins over all):
 #   1. ${CURSOR_PLUGIN_ROOT}/env   (baked into a compiled customer plugin)
 #   2. /etc/rogue/env              (MDM-provisioned)
@@ -49,6 +51,13 @@ emit() {
 
 # Diagnostics to stderr when ROGUE_DEBUG is set (Cursor logs stderr separately).
 dbg() { [ -n "${ROGUE_DEBUG:-}" ] && printf '[rogue] %s\n' "$*" >&2; return 0; }
+
+# Errors that the hook survives, NOT gated on ROGUE_DEBUG: this dispatcher keeps
+# no log file (unlike the claude/codex/copilot/antigravity ones), so a debug-gated
+# message would mean nobody ever learns the install is reporting itself
+# imprecisely. stderr only — stdout is the hook's JSON channel, and Cursor
+# captures stderr separately.
+err() { printf '[rogue] error: %s\n' "$*" >&2; return 0; }
 
 # ── Git Bash stand-down: let hook.ps1 own native Windows ───────────────────
 case "$(uname -s 2>/dev/null)" in
@@ -82,9 +91,82 @@ done
 [ -n "$_penv_ROGUE_ACTOR_NAME" ]  && ROGUE_ACTOR_NAME="$_penv_ROGUE_ACTOR_NAME"
 [ -n "$_penv_ROGUE_BASE_URL" ]    && ROGUE_BASE_URL="$_penv_ROGUE_BASE_URL"
 
+# ── hook log ───────────────────────────────────────────────────────────────
+# `dbg` above only writes to stderr under ROGUE_DEBUG, which Cursor keeps in its
+# own per-session log — useless for after-the-fact diagnosis and unavailable to
+# /rogue:status. So every invocation also gets one durable line here, matching the
+# other Rogue plugins' format: "<ts> provider=cursor event=<E> <k=v>".
+#
+# ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a single hook.log
+# would interleave Cursor with Claude Code / Codex / … and lose attribution.
+# Precedence: explicit file → directory override → per-agent default. Resolved
+# AFTER the env files are sourced, so `~/.rogue-env` can set either.
+ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/cursor.log}"
+# Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+# generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+# rotation; a NON-NUMERIC value falls back to this default, so a typo can
+# never leave the log growing unbounded. Enforced on the WRITE PATH rather
+# than by a periodic job because an UNCONFIGURED install writes a line per
+# event and never runs anything else - a cap enforced anywhere else would
+# not hold.
+ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
+# Clamp per the rule above: anything non-numeric becomes the default.
+case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
+# An all-digit value can still overflow the shell's integer type: dash answers
+# `[ "$cap" -gt 0 ]` with "Illegal number" on stderr and a FALSE, which reads
+# as "rotation disabled" and lets the log grow unbounded. Node has the same
+# bug through Number() -> Infinity; PowerShell is the only one that already
+# lands on the default, and only because its cast error is silenced. All
+# three clamp explicitly now. 18 digits is the widest value guaranteed to fit
+# a signed 64-bit int; leading zeros are stripped first so "000...0" still
+# reads as the rotation-disabling zero.
+_lcap="$ROGUE_LOG_MAX_BYTES"
+while [ "${_lcap#0}" != "$_lcap" ]; do _lcap="${_lcap#0}"; done
+if [ "${#_lcap}" -gt 18 ]; then ROGUE_LOG_MAX_BYTES=10485760; fi
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no `=`, so a reader finds the value by scanning to the next `key=` token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+SURFACE="cursor"
+
+log() {
+  # 0700 dir / 0600 file. The logged text is not only ours: it carries the
+  # server's block reason, which quotes the content that tripped the rule - a
+  # secret, a command, a slice of a prompt. Under the default umask the log
+  # lands 0644 and every other account on the box can read it. The umask
+  # applies to what THIS call creates, so a 0644 log from an older version
+  # keeps its mode; Windows needs no counterpart, since another standard user
+  # cannot read %USERPROFILE% to begin with.
+  ( umask 077
+    mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+    rotate_log
+    # SURFACE is a constant here: this plugin has exactly one surface, so there is
+    # nothing to detect and nothing that can fail. It is still written through the
+    # same `${SURFACE:+ …}` expansion as the multi-surface plugins so all six
+    # dispatchers share one emit shape.
+    printf '%s provider=cursor%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$event" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
+}
+# Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
+# can carry anything), and a raw newline or CR would forge extra log lines.
+sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+
 API_KEY="${ROGUE_API_KEY:-}"
 if [ -z "$API_KEY" ]; then
   dbg "no API key after cred resolution -> fail-open"
+  log "outcome=unconfigured"
   if [ "$event" = "sessionStart" ]; then
     printf '%s' '{"additional_context": "Rogue Security plugin is installed but not configured. Run /rogue:setup to connect your API key."}'
   else
@@ -111,6 +193,40 @@ if [ -z "$actor_email" ]; then
   _h="$(hostname 2>/dev/null)"
   if [ -n "$_u" ] && [ -n "$_h" ]; then actor_email="$_u@$_h"
   else actor_email="${_u:-$_h}"; fi
+fi
+
+# ── install identity: host + plugin version ────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only the heartbeat below ever sent those — once, at session start. A
+# session still working a day later therefore aged out as disconnected. Sending
+# the same values as headers on EVERY event lets the backend refresh this exact
+# row from ordinary hook traffic. They must match the heartbeat body's values
+# byte for byte, or the two writers create two rows for one install.
+#
+# Neither lookup can fail the hook: a degraded value still identifies the install
+# well enough to keep the roster fresh, and no liveness bookkeeping is worth
+# breaking a session over. Both log an error, because "unknown" in the roster is a real
+# symptom worth chasing.
+host="$(hostname 2>/dev/null)" || host=unknown
+if [ -z "$host" ]; then
+  host=unknown
+  err "hostname unresolved; reporting host=unknown to the fleet roster"
+fi
+
+# Plugin version from the manifest, without python/jq.
+plugin_version="unknown"
+_pj="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
+if [ -r "$_pj" ]; then
+  _v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$_pj" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  if [ -n "$_v" ]; then
+    plugin_version="$_v"
+  else
+    # Manifest is there but carries no semver: schema drift, not a bad install.
+    err "no version in $_pj; reporting version=unknown to the fleet roster"
+  fi
+else
+  err "plugin manifest not readable at $_pj; reporting version=unknown"
 fi
 
 # ── payload from stdin ─────────────────────────────────────────────────────
@@ -262,7 +378,9 @@ if [ "$event" = "preToolUse" ]; then
 fi
 
 # ── POST (fail-open) ───────────────────────────────────────────────────────
-command -v curl >/dev/null 2>&1 || { dbg "curl not found -> {}"; printf '{}'; exit 0; }
+command -v curl >/dev/null 2>&1 || {
+  dbg "curl not found -> {}"; log "outcome=fail-open reason=no-curl"; printf '{}'; exit 0
+}
 
 URL="$BASE_URL/api/v1/hooks/cursor"
 dbg "POST $URL actor=$actor_email"
@@ -275,40 +393,112 @@ RESP="$(printf '%s' "$PAYLOAD" | curl -fsS --max-time 10 -X POST \
   -H "x-rogue-actor-email: $actor_email" \
   -H "x-rogue-actor-name: $actor_name" \
   -H 'x-rogue-source: cursor' \
+  -H "x-rogue-host: $host" \
+  -H "x-rogue-version: $plugin_version" \
+  -H 'x-rogue-agent: cursor' \
   --data-binary @- "$URL" 2>/dev/null)"; _rc=$?
 dbg "curl rc=$_rc resp_len=${#RESP}"
+# Always log the raw response head so a relay/decision bug is diagnosable from
+# the hook log alone, without re-instrumenting the script. `-f` means a non-zero
+# rc is either a transport failure or an HTTP >= 400, and curl printed nothing.
+log "rc=$_rc raw=$(sanitize "$RESP" | head -c 400)"
 [ "$_rc" -eq 0 ] || RESP=""
 
-# ── presence heartbeat (sessionStart only, fire-and-forget) ────────────────
+# ── presence heartbeat (sessionStart + stop, fire-and-forget) ──────────────
 # POSTs /api/v1/hooks/status so this install shows in the dashboard's Coding
 # Agents roster (Connected / version / host / user). Pure side-effect: the POST
 # runs in a detached double-fork with all fds redirected, so neither the relayed
 # response below nor session start ever waits on it, and the response is
 # ignored. Creds/actor were already resolved above.
-if [ "$event" = "sessionStart" ]; then
-  # Plugin version from the manifest, without python/jq.
-  HB_VER="unknown"
-  HB_PJ="$PLUGIN_ROOT/.cursor-plugin/plugin.json"
-  if [ -r "$HB_PJ" ]; then
-    _v=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' "$HB_PJ" 2>/dev/null \
-          | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    [ -n "$_v" ] && HB_VER="$_v"
-  fi
-  HB_HOST=$(hostname 2>/dev/null) || HB_HOST=unknown
-  [ -n "$HB_HOST" ] || HB_HOST=unknown
+#
+# TWO TRIGGERS, as in every other plugin. `sessionStart` fires once per session;
+# `stop` fires once per TURN, and it exists because a session left open for days
+# used to produce exactly one beacon and one log upload for its whole lifetime -
+# the roster row went stale and the hook log sat on disk unshipped.
+#
+# There is no heartbeat.sh here to carry the trigger, so the throttle is applied
+# inline: scripts/beacon.sh (a byte-identical copy of scripts/shared/beacon.sh, the
+# same one the other four sh plugins load from their heartbeats) rate-limits the
+# beacon on a `stop`, while `sessionStart` stays unthrottled. The shipper below needs
+# no such gate - it already throttles itself, and a run with nothing new makes no
+# request at all.
+#
+# UNLIKE the other plugins this block runs INSIDE the synchronous dispatcher, so
+# everything it starts must be detached; see the shipper's comment below.
+case "$event" in
+  sessionStart) hb_unthrottled=1 ;;
+  stop)         hb_unthrottled=0 ;;
+  *)            hb_unthrottled="" ;;
+esac
+if [ -n "$hb_unthrottled" ]; then
   # `agent` is "cursor" (not a display label): the server keys its latest-version
   # lookup (PLUGIN_REPOS) on this value, so the roster can flag outdated installs.
+  # host/version come from the shared block above so this body and the per-event
+  # headers describe the same install (same fingerprint, one row).
   hb_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   HB_BODY=$(printf '{"agent_family":"cursor","agent":"cursor","version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"}' \
-    "$(hb_esc "$HB_VER")" "$(hb_esc "$HB_HOST")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
-  dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$HB_VER host=$HB_HOST"
-  ( curl -fsS --max-time 10 -X POST \
-      -H 'Content-Type: application/json' \
-      -H "x-rogue-api-key: $API_KEY" \
-      -H 'x-rogue-source: cursor' \
-      -d "$HB_BODY" \
-      "$BASE_URL/api/v1/hooks/status" \
-      </dev/null >/dev/null 2>&1 & )
+    "$(hb_esc "$plugin_version")" "$(hb_esc "$host")" "$(hb_esc "$actor_email")" "$(hb_esc "$actor_name")")
+  # ── beacon throttle ──────────────────────────────────────────────────────
+  # `-r` guarded so a partial or older install degrades to an unthrottled beacon -
+  # today's behaviour - rather than failing the hook. The knob
+  # (ROGUE_HEARTBEAT_MIN_INTERVAL, numeric zero disables, non-numeric falls back to
+  # the default) is read from the environment inside the library, which is correct
+  # because the env files were sourced at the top of this script.
+  if [ -r "$PLUGIN_ROOT/scripts/beacon.sh" ]; then
+    . "$PLUGIN_ROOT/scripts/beacon.sh"
+  else
+    rogue_beacon_claim() { return 0; }
+  fi
+
+  dbg "heartbeat POST $BASE_URL/api/v1/hooks/status ver=$plugin_version host=$host"
+  # rogue_beacon_claim writes the stamp itself, BEFORE the request - deciding and
+  # stamping are one call so a caller cannot leave the window permanently open by
+  # forgetting the second half.
+  if rogue_beacon_claim cursor "$hb_unthrottled"; then
+    # Detached, so its HTTP outcome is unobservable — record only that it fired.
+    log "heartbeat=fired ver=$plugin_version"
+    ( curl -fsS --max-time 10 -X POST \
+        -H 'Content-Type: application/json' \
+        -H "x-rogue-api-key: $API_KEY" \
+        -H 'x-rogue-source: cursor' \
+        -d "$HB_BODY" \
+        "$BASE_URL/api/v1/hooks/status" \
+        </dev/null >/dev/null 2>&1 & )
+  else
+    # Logged, unlike the other plugins' silent throttle, because this is the only
+    # plugin whose beacon decision happens in the dispatcher - so the hook log is
+    # where an operator can see it at all.
+    log "heartbeat=throttled ver=$plugin_version"
+  fi
+
+  # ── ship the hook log ────────────────────────────────────────────────────
+  # DETACHED, with the same double-fork as the heartbeat above. That is not
+  # optional here the way it is in the other plugins: their shipper call sits in
+  # heartbeat.sh, which is already a detached background process, whereas this
+  # one runs inside the SYNCHRONOUS dispatcher - Cursor is waiting on our stdout
+  # for the session-start decision, so an inline upload would delay session start
+  # by however long the POST takes.
+  #
+  # After the heartbeat, for the same reason as everywhere else: the heartbeat
+  # creates or refreshes the roster row the uploaded log attaches to.
+  #
+  # Runs on BOTH triggers and deliberately OUTSIDE the beacon throttle above: a
+  # throttled beacon still means a turn happened, and the log is worth draining
+  # either way. This is the whole point of the `stop` trigger - on `sessionStart`
+  # alone, a long session's log never left the disk.
+  #
+  # The actor MUST be passed explicitly. Unlike the other plugins, which get it
+  # from actor.sh (which exports), this dispatcher resolves the actor into plain
+  # shell LOCALS - so without this prefix the child would inherit nothing, find no
+  # identity, and skip. It also must not re-resolve: Cursor's own cascade ends at
+  # "$USER@$(hostname)" where actor.sh ends at `hostname`, so a re-resolve here
+  # would key the log's source row differently from the roster row just posted.
+  if [ -r "$PLUGIN_ROOT/scripts/ship-logs.sh" ]; then
+    ( ROGUE_ACTOR_EMAIL="$actor_email" ROGUE_ACTOR_NAME="$actor_name" \
+        sh "$PLUGIN_ROOT/scripts/ship-logs.sh" \
+          "$PLUGIN_ROOT" cursor "$plugin_version" cursor \
+        </dev/null >/dev/null 2>&1 & )
+  fi
 fi
 
 emit "$RESP"

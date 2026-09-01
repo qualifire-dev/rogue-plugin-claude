@@ -80,14 +80,20 @@ if (Test-Section 'parse') {
 
 # ── 2. every write to shared state is $script:-qualified ───────────────────
 if (Test-Section 'scope') {
-$shared = @(
-    'logFile', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail', 'payload',
-    'subagentId', 'subagentName', 'brainDir', 'submapDir', 'payloadTp',
-    'isIdeSurface', 'PluginRoot',
-    # heartbeat.ps1's own shared state
-    'pluginRoot', 'baseUrl', 'ver', 'agent'
-)
+# Shared state is PER FILE. One combined list produced false positives: `baseUrl`
+# is shared state in heartbeat.ps1 but a function-LOCAL scratch value inside
+# hook.ps1's Resolve-Url (only $script:url escapes it), so a global list demanded
+# a `$script:` prefix that would have been actively misleading there.
+$sharedByFile = @{
+    'hook.ps1' = @(
+        'logFile', 'logMaxBytes', 'creds', 'apiKey', 'url', 'actorName', 'actorEmail',
+        'payload', 'subagentId', 'subagentName', 'brainDir', 'submapDir', 'payloadTp',
+        'isIdeSurface', 'PluginRoot'
+    )
+    'heartbeat.ps1' = @('pluginRoot', 'baseUrl', 'ver', 'agent', 'creds', 'apiKey')
+}
 foreach ($file in $structural) {
+$shared = $sharedByFile[(Split-Path $file -Leaf)]
 $unscoped = @()
 # Materialised with @(): FindAll returns a lazy enumerable, and nesting a second
 # walk inside the first one's iteration silently yields null elements.
@@ -106,7 +112,7 @@ foreach ($fn in $functions) {
     }
 }
 if ($unscoped) {
-    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: — $_" }
+    $unscoped | ForEach-Object { Write-Host "FAIL [scope]: $(Split-Path $file -Leaf) assigns without `$script: - $_" }
     $failures += $unscoped.Count
 } else {
     Write-Host "  ok: $(Split-Path $file -Leaf): every shared-state write inside a function is `$script:-qualified"
@@ -189,11 +195,24 @@ $cases = @(
        expected = 'C:/Users/y/.gemini/antigravity-ide/brain/c/t.jsonl' }
     # The conversation id becomes a path component, so anything but an id
     # character is dropped rather than trusted.
+    # `foldSeparators` is set on THIS CASE ONLY. Join-Path yields backslashes on
+    # Windows and forward slashes elsewhere, and what this case is about is that the
+    # id contributed no `..` and no separator of its own - not which slash the
+    # platform builds paths with. Asserting the raw string passed on the Linux runner
+    # and failed the moment these suites also ran on windows-latest. Folding EVERY
+    # case instead - which is what this did first - silently disabled the case above:
+    # a Get-PayloadTranscriptPath regression that returned the raw `C:\Users\…` form
+    # would be folded into the expected value and pass, while on Windows no IDE
+    # session would match '/antigravity-ide/' any more.
     @{ what = 'a traversal-shaped conversationId cannot escape the marker dir'
-       actual = $marker; expected = '/tmp/rogue-test-markers/etcpasswd.missed-prompt' }
+       actual = $marker; expected = '/tmp/rogue-test-markers/etcpasswd.missed-prompt'
+       foldSeparators = $true }
 )
 foreach ($c in $cases) {
-    if ($c.actual -eq $c.expected) { Write-Host "  ok: $($c.what)" }
+    $actual = [string]$c.actual
+    $expected = [string]$c.expected
+    if ($c.foldSeparators) { $actual = $actual -replace '\\', '/'; $expected = $expected -replace '\\', '/' }
+    if ($actual -eq $expected) { Write-Host "  ok: $($c.what)" }
     else { Write-Host "FAIL [$($c.what)]: expected <$($c.expected)> but got <$($c.actual)>"; $failures++ }
 }
 }
