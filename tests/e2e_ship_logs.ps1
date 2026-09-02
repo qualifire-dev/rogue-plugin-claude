@@ -138,6 +138,22 @@ function Invoke-ProductScript {
         -NoNewWindow -PassThru -Wait
 }
 
+# setup.ps1 is the one product script NOT loaded as a scriptblock: every /rogue:setup
+# doc runs it with -File or `& <path>`, and it dot-sources its sibling env-file.ps1
+# off $PSScriptRoot - which a scriptblock leaves empty ($PSCommandPath too, so the
+# script cannot self-locate its way out of it). Loading it the hooks.json way would
+# test a shape that does not exist.
+function Invoke-SetupScript {
+    param([string]$RelativePath, [string[]]$Arguments)
+    $path = Join-Path $repo $RelativePath
+    # Quoted per element: an actor name legitimately contains a space, and
+    # Start-Process joins -ArgumentList on spaces without quoting anything itself.
+    $quoted = $Arguments | ForEach-Object { '"' + $_ + '"' }
+    return Start-Process -FilePath 'powershell' `
+        -ArgumentList (@('-NoProfile', '-NonInteractive', '-File', ('"' + $path + '"')) + $quoted) `
+        -NoNewWindow -PassThru -Wait
+}
+
 # Nothing opts these runs in: shipping is unconditional, so a configured install with
 # new bytes uploads them. That default is asserted on its own below, because every case
 # here would pass vacuously against a shipper that did nothing.
@@ -181,7 +197,7 @@ Write-Host ''
 Write-Host '== setup.ps1 writes credentials the shipper can read'
 # The product's own script, not a hand-rolled file: its quoting is exactly what
 # Import-ShipEnv has to parse back, and that round trip is part of what is under test.
-Invoke-ProductScript 'plugins/rogue/scripts/setup.ps1' 'e2e-key amos@rogue.security amos' | Out-Null
+Invoke-SetupScript 'plugins/rogue/scripts/setup.ps1' @('e2e-key', 'amos@rogue.security', 'amos') | Out-Null
 Check 'setup.ps1 wrote %USERPROFILE%\.rogue-env' 'True' `
     ([string](Test-Path -LiteralPath (Join-Path $sandboxHome '.rogue-env')))
 
@@ -289,7 +305,7 @@ Write-Host '== heartbeat.ps1 actually starts the shipper (a child process, not i
 $callerHome = Join-Path $sandbox 'home2'
 New-Item -ItemType Directory -Path (Join-Path (Join-Path $callerHome '.rogue') 'logs') -Force | Out-Null
 $env:USERPROFILE = $callerHome
-Invoke-ProductScript 'plugins/rogue/scripts/setup.ps1' "e2e-key caller@rogue.security 'Caller Person'" | Out-Null
+Invoke-SetupScript 'plugins/rogue/scripts/setup.ps1' @('e2e-key', 'caller@rogue.security', 'Caller Person') | Out-Null
 [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $callerHome '.rogue') 'logs') 'claude.log'),
     "2026-08-12T00:00:01Z provider=claude event=PreToolUse outcome=allow n=1`n",
     (New-Object System.Text.UTF8Encoding($false)))
