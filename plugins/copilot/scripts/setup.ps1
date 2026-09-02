@@ -14,40 +14,20 @@ $ErrorActionPreference = 'Stop'
 
 $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $env:USERPROFILE '.rogue-env' }
 
-# POSIX single-quote so the value is safe whether sourced by hook.sh or decoded by
-# hook.ps1's ConvertFrom-ShellQuoted. Each ' becomes '\''.
-function Format-EnvVal {
-    param([string]$Val)
-    return "'" + $Val.Replace("'", "'\''") + "'"
-}
+# Merges: replaces these keys, keeps a pinned ROGUE_BASE_URL and friends. Loaded
+# as a scriptblock so ExecutionPolicy never applies.
+. ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'env-file.ps1'))))
 
-$envLines = @(
-    '# Managed by the rogue GitHub Copilot CLI plugin. Read by hook subprocesses at runtime.',
-    '# Delete this file to revoke credentials.',
-    "export ROGUE_API_KEY=$(Format-EnvVal $ApiKey)",
-    "export ROGUE_ACTOR_EMAIL=$(Format-EnvVal $Email)",
-    "export ROGUE_ACTOR_NAME=$(Format-EnvVal $Name)"
-)
+$restricted = Write-RogueEnvFile -Path $EnvFile -Values ([ordered]@{
+    ROGUE_API_KEY     = $ApiKey
+    ROGUE_ACTOR_EMAIL = $Email
+    ROGUE_ACTOR_NAME  = $Name
+})
 
-$envDir = Split-Path $EnvFile
-if ($envDir -and -not (Test-Path $envDir)) {
-    New-Item -ItemType Directory -Path $envDir -Force | Out-Null
-}
-Set-Content -Path $EnvFile -Value $envLines -Encoding UTF8
-
-# Restrict the file to the current user only (mirrors chmod 600). If this fails the
-# API key would be left readable with inherited perms — delete it and fail rather
-# than print OK on an exposed secret.
-try {
-    $acl = Get-Acl $EnvFile
-    $acl.SetAccessRuleProtection($true, $false)
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-        'FullControl', 'Allow')
-    $acl.SetAccessRule($rule)
-    Set-Acl $EnvFile $acl
-} catch {
-    $err = $_.Exception.Message
+# Without the ACL the API key sits readable with inherited perms - delete it
+# rather than print OK on an exposed secret.
+if (-not $restricted) {
+    $err = $script:RogueEnvProtectError
     Remove-Item -LiteralPath $EnvFile -Force -ErrorAction SilentlyContinue
     Write-Error "Failed to restrict permissions on $EnvFile : $err"
     exit 1

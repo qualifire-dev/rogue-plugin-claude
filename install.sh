@@ -48,7 +48,8 @@ set -u
 
 # ── Config ──────────────────────────────────────────────────────────────────
 ROGUE_PLUGIN_REPO="${ROGUE_PLUGIN_REPO:-qualifire-dev/rogue-plugins}"
-ROGUE_BASE_URL="${ROGUE_BASE_URL:-https://api.rogue.security}"
+ROGUE_BASE_URL_DEFAULT="https://api.rogue.security"
+ROGUE_BASE_URL="${ROGUE_BASE_URL:-$ROGUE_BASE_URL_DEFAULT}"
 MARKETPLACE_NAME="rogue-marketplace"
 PLUGIN_NAME="rogue"
 CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -452,10 +453,15 @@ configure_credentials() {
   local flag_key="${ROGUE_API_KEY:-}"
   local flag_email="${ROGUE_ACTOR_EMAIL:-}"
   local flag_name="${ROGUE_ACTOR_NAME:-}"
+  local flag_base_url=""
+  [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] || flag_base_url="$ROGUE_BASE_URL"
 
   # Pull anything already on disk / in env into scope.
   [ -r /etc/rogue/env ] && . /etc/rogue/env
   [ -r "$ENV_FILE" ]    && . "$ENV_FILE"
+
+  # On-disk beats the default, an explicit --base-url beats both.
+  [ -z "$flag_base_url" ] || ROGUE_BASE_URL="$flag_base_url"
 
   local cur_key="${flag_key:-${ROGUE_API_KEY:-}}"
 
@@ -531,18 +537,35 @@ configure_credentials() {
   write_env_file
 }
 
-# Write ~/.rogue-env (mode 600), same format as setup.sh. Reads ROGUE_API_KEY /
-# ROGUE_ACTOR_EMAIL / ROGUE_ACTOR_NAME from scope.
+# Write ~/.rogue-env (mode 600). Same MERGE semantics as
+# scripts/shared/env-file.sh, inlined because this script is piped to bash on its
+# own - keep the two in step. Merging matters most here: auto-update re-runs the
+# installer unattended every 24h.
+env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 write_env_file() {
-  umask 077
-  : > "$ENV_FILE"
-  {
-    printf '# Managed by the rogue Claude plugin. Read by hook subprocesses at runtime.\n'
-    printf '# Delete this file to revoke credentials.\n'
-    printf 'export ROGUE_API_KEY=%q\n' "$ROGUE_API_KEY"
-    printf 'export ROGUE_ACTOR_EMAIL=%q\n' "$ROGUE_ACTOR_EMAIL"
-    printf 'export ROGUE_ACTOR_NAME=%q\n' "$ROGUE_ACTOR_NAME"
-  } >> "$ENV_FILE"
+  local keys="ROGUE_API_KEY|ROGUE_ACTOR_EMAIL|ROGUE_ACTOR_NAME|ROGUE_BASE_URL"
+  local tmp="$ENV_FILE.rogue-tmp.$$"
+  (
+    umask 077
+    {
+      printf '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.\n'
+      printf '# Delete this file to revoke credentials.\n'
+      printf 'export ROGUE_API_KEY=%s\n' "$(env_quote "$ROGUE_API_KEY")"
+      printf 'export ROGUE_ACTOR_EMAIL=%s\n' "$(env_quote "$ROGUE_ACTOR_EMAIL")"
+      printf 'export ROGUE_ACTOR_NAME=%s\n' "$(env_quote "$ROGUE_ACTOR_NAME")"
+      # Writing the default would bake today's hostname into every install.
+      if [ "$ROGUE_BASE_URL" != "$ROGUE_BASE_URL_DEFAULT" ]; then
+        printf 'export ROGUE_BASE_URL=%s\n' "$(env_quote "$ROGUE_BASE_URL")"
+      fi
+      # What we do not own, minus our own header (re-emitted above).
+      if [ -f "$ENV_FILE" ]; then
+        { grep -Ev "^[[:space:]]*(export[[:space:]]+)?($keys)[[:space:]]*=" "$ENV_FILE" \
+          | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'; } || :
+      fi
+    } > "$tmp"
+  ) || { rm -f "$tmp"; die "Could not write $ENV_FILE"; }
+  mv -f "$tmp" "$ENV_FILE" || { rm -f "$tmp"; die "Could not write $ENV_FILE"; }
   chmod 600 "$ENV_FILE"
   ok "Credentials written to ${C_DIM}$ENV_FILE${C_RESET} (mode 600)"
 }
@@ -772,4 +795,5 @@ main() {
   note "Open a new session in each agent, then run ${C_DIM}/rogue:status${C_RESET} to verify."
 }
 
-main "$@"
+# Set only by tests/test_setup_env.sh, to source the writer without installing.
+[ -n "${ROGUE_INSTALL_LIB_ONLY:-}" ] || main "$@"

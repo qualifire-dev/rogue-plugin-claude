@@ -19,16 +19,12 @@ ACTOR_NAME="${3:-}"
 
 ENV_FILE="${ROGUE_ENV_FILE:-$HOME/.rogue-env}"
 
-umask 077
-: > "$ENV_FILE"
-{
-  printf '# Managed by the rogue Google Antigravity plugin. Read by hook subprocesses at runtime.\n'
-  printf '# Delete this file to revoke credentials.\n'
-  printf 'export ROGUE_API_KEY=%q\n' "$API_KEY"
-  printf 'export ROGUE_ACTOR_EMAIL=%q\n' "$ACTOR_EMAIL"
-  printf 'export ROGUE_ACTOR_NAME=%q\n' "$ACTOR_NAME"
-} >> "$ENV_FILE"
-chmod 600 "$ENV_FILE"
+# Merges: replaces these keys, keeps a pinned ROGUE_BASE_URL and friends.
+. "$(dirname "$0")/env-file.sh"
+rogue_write_env_file "$ENV_FILE" \
+  ROGUE_API_KEY "$API_KEY" \
+  ROGUE_ACTOR_EMAIL "$ACTOR_EMAIL" \
+  ROGUE_ACTOR_NAME "$ACTOR_NAME"
 
 echo "OK"
 echo "ENV_FILE=$ENV_FILE"

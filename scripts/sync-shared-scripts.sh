@@ -36,6 +36,8 @@ ROWS=(
   "ship-logs.ps1|rogue codex cursor copilot antigravity"
   "beacon.sh|rogue codex cursor copilot antigravity"
   "beacon.ps1|rogue codex cursor copilot antigravity"
+  "env-file.sh|rogue codex cursor copilot antigravity"
+  "env-file.ps1|rogue codex cursor copilot antigravity"
 )
 
 # An unrecognized argument is an ERROR, not a silent write: the two modes have

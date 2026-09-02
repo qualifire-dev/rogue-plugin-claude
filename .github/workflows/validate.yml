@@ -106,6 +106,9 @@ jobs:
           TEST_SH=sh bash tests/test_auto_update_sh.sh
           TEST_SH=dash bash tests/test_auto_update_sh.sh
           bash tests/test_gitignore_bundles.sh
+          # Both shells: the library the writers source is POSIX-clean (no %q).
+          TEST_SH=dash bash tests/test_setup_env.sh
+          TEST_SH=bash bash tests/test_setup_env.sh
       - name: Command and skill snippets parse
         # Every fenced sh/bash and powershell block in a /rogue:setup or /rogue:status
         # document is RUN VERBATIM by the agent when a user invokes the command, so a
@@ -310,6 +313,7 @@ jobs:
           pwsh -NoProfile -File tests/test_ship_logs.ps1
           pwsh -NoProfile -File tests/test_heartbeat_ps1.ps1
           pwsh -NoProfile -File tests/test_auto_update_ps1.ps1
+          pwsh -NoProfile -File tests/test_setup_env.ps1
 
   windows:
     # The job the seam CANNOT stand in for. Every PowerShell test in the job above
@@ -359,4 +363,6 @@ jobs:
           powershell -NoProfile -File tests/test_heartbeat_ps1.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_auto_update_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_setup_env.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }

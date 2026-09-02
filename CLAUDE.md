@@ -72,7 +72,7 @@ The single one-line installer detects every supported agent (`have_cmd claude` /
 - `plugins/rogue/hooks/hooks.json` — 11 lifecycle hooks, all `type: "command"`. **Every event registers two entries** (an `sh` one and a PowerShell one) — see below.
 - `plugins/rogue/scripts/hook.sh` — POSIX-`sh` + `curl` dispatcher (macOS/Linux/WSL). Invoked via `sh` (NOT `bash`), so it is kept POSIX-clean (tested under `dash` via `tests/test_hook_sh.sh`). **Stands down** (emits `{}`, exits) under Git Bash (`uname` = MINGW/MSYS/CYGWIN) so the PowerShell entry owns native Windows.
 - `plugins/rogue/scripts/hook.ps1` — PowerShell + `Invoke-WebRequest` dispatcher. Owns native Windows; stands down on non-Windows (`pwsh` on macOS/Linux). Mirrors `hook.sh` stage-for-stage AND replicates Claude's block detection, the Cowork-only native modal (`Test-WantAlert`, the twin of `_rogue_want_alert`), logging, and SessionStart unconfigured hint.
-- `plugins/rogue/scripts/setup.sh` / `setup.ps1` — write `~/.rogue-env` (mode 600) / `%USERPROFILE%\.rogue-env` (ACL-restricted) with `ROGUE_API_KEY` / `ROGUE_ACTOR_EMAIL` / `ROGUE_ACTOR_NAME`. Both emit the same `export KEY=value` POSIX-quoted format. Called by `/rogue:setup`.
+- `plugins/rogue/scripts/setup.sh` / `setup.ps1` — write `~/.rogue-env` (mode 600) / `%USERPROFILE%\.rogue-env` (ACL-restricted) with `ROGUE_API_KEY` / `ROGUE_ACTOR_EMAIL` / `ROGUE_ACTOR_NAME`. Both emit the same `export KEY=value` POSIX-quoted format, through the shared writer in `scripts/env-file.{sh,ps1}` — see **The credential file** below. Called by `/rogue:setup`.
 - `plugins/rogue/scripts/auto-update.sh` / `auto-update.ps1` — fire (detached) from `SessionStart`. Rate-limited once/24h. Re-invoke the matching one-line installer (`install.sh` / `install.ps1`) when a newer release tag exists.
 - `plugins/rogue/scripts/heartbeat.sh` / `heartbeat.ps1` — presence beacon (detached), fired from `SessionStart` **and** `Stop`. POST `/api/v1/hooks/status`, then the log shipper. Takes the trigger as its one argument; the `Stop` beacon is throttled via `scripts/beacon.{sh,ps1}`.
 - `plugins/rogue/scripts/warn.sh` — SessionStart "not configured" nudge (sh path only; the ps1 path emits the hint inline from `hook.ps1`).
@@ -309,6 +309,35 @@ pre-`c31ee5a` behaviour and is the safe default, and
 
 **Delete this whole path once Cowork renders the reason itself**, exactly as it was
 deleted once Claude Desktop did.
+## The credential file (`~/.rogue-env`)
+
+**Every writer MERGES; none may truncate.** The file is shared by all six plugins
+and is where a machine pins settings setup never asks about — `ROGUE_BASE_URL`
+for a self-hosted API, `ROGUE_LOG_DIR`, `ROGUE_DEBUG`. Every writer used to
+`: > "$ENV_FILE"` and put back only the credential keys, so any `/rogue:setup` in
+any of the six agents deleted the lot — and **`auto-update` re-runs `install.sh`
+unattended once per 24h at `SessionStart`**, so a machine silently lost its base
+URL and started POSTing to production days after anyone had touched it. That
+delay is why this has a section: nothing connects the two events.
+
+The rule: rewrite the keys the caller owns, keep every other line, re-emit the
+two header comments (stripped from the preserved lines, or they pile up per
+write).
+
+- **`scripts/shared/env-file.{sh,ps1}` is the ONLY editable copy** — same harness
+  and rules as `ship-logs` and `beacon` above; Gemini inlines it in `setup.mjs`.
+- **`install.sh` / `install.ps1` inline their own copy**, kept in step by hand:
+  they are piped to `bash`/`iex` with no plugin tree beside them. They are also
+  the only writers that emit `ROGUE_BASE_URL`, and only when it differs from the
+  default — writing the default would bake today's hostname into every install.
+- **All writers produce the same bytes** (BOM-less UTF-8, LF, POSIX single-quoted
+  values), since one file is written by whichever agent was set up last and read
+  by every dispatcher. `tests/test_setup_env.{sh,ps1}` assert that byte-identity
+  alongside the merge.
+- **`env-file.sh` is POSIX-clean** (no `printf %q`), unlike the `setup.sh` scripts
+  sourcing it: a doc that invokes one through `sh` gets dash, where `%q` prints
+  literally and writes a corrupt credential file.
+
 ## The log shipper
 
 The hook log is also **uploaded** to `POST /api/v1/hooks/logs`, so a support engineer can read a customer's log without an endpoint agent on the box. Full design, rationale and the state-machine proof: `docs/plugin-log-shipper.md`; the backend/agent side that receives it is `docs/log-shipping-backend.md`. What matters when editing:
@@ -320,7 +349,7 @@ The hook log is also **uploaded** to `POST /api/v1/hooks/logs`, so a support eng
 - **Every fenced `sh`/`bash`/`powershell` block in `plugins/*/{skills/*/SKILL.md,commands/*.md}` is parse-checked by `validate.yml`** ("Command and skill snippets parse"). The agent runs those blocks verbatim, nothing else in CI reads those files, and an unbalanced quote there is a silent failure of the only diagnostic path support has. Parse-only, so a block referencing a variable from an earlier block still passes.
 - **A PowerShell status snippet must run `ship-logs.ps1` as a CHILD process**, never `& ([scriptblock]::Create(...))` in-process: the shipper ends in `exit 0`, which in-process ends the *operator's* session instead. The five Windows snippets use the same `-EncodedCommand` shape as `heartbeat.ps1` — path in an env var, command a constant — because `-ArgumentList` quoting is unreliable on Windows PowerShell 5.1.
 
-- **`scripts/shared/ship-logs.{sh,ps1}` is the ONLY editable copy.** Each of the five sh/ps plugins carries a committed **byte-identical** copy under `plugins/<x>/scripts/`, regenerated by `scripts/sync-shared-scripts.sh` and enforced by `--check` in `validate.yml`. An edit made to a plugin's copy is silently reverted by the next sync. The copies exist because each plugin installs as a self-contained directory, and are *committed* rather than generated at release because claude/codex/copilot install from a git clone of this monorepo with no build step. **Gemini is not in the table** — `plugins/gemini/scripts/ship-logs.mjs` is a single Node implementation, same rule as `hook.mjs`. **`scripts/shared/beacon.{sh,ps1}` (the beacon throttle) rides the same harness, the same five plugins and the same rules** — see the heartbeat section above.
+- **`scripts/shared/ship-logs.{sh,ps1}` is the ONLY editable copy.** Each of the five sh/ps plugins carries a committed **byte-identical** copy under `plugins/<x>/scripts/`, regenerated by `scripts/sync-shared-scripts.sh` and enforced by `--check` in `validate.yml`. An edit made to a plugin's copy is silently reverted by the next sync. The copies exist because each plugin installs as a self-contained directory, and are *committed* rather than generated at release because claude/codex/copilot install from a git clone of this monorepo with no build step. **Gemini is not in the table** — `plugins/gemini/scripts/ship-logs.mjs` is a single Node implementation, same rule as `hook.mjs`. **`scripts/shared/beacon.{sh,ps1}` (the beacon throttle) rides the same harness, the same five plugins and the same rules** — see the heartbeat section above. **`scripts/shared/env-file.{sh,ps1}` (the credential-file writer) rides it too** — see **The credential file** below.
 - **Every per-plugin difference is an ARGUMENT** — `ship-logs <plugin-root> <slug> <version> <family>` — which is what makes byte-identical copies possible. Never read a plugin-specific env var (`CLAUDE_PLUGIN_ROOT` / `PLUGIN_ROOT` / `CURSOR_PLUGIN_ROOT`) inside it, and never derive the family from the slug: codex ships `codex.log` under family `openai`. **No arguments** = ship every known agent's log, reporting shipper `unknown` — the documented support invocation, printed by each `/rogue:status`.
 - **The actor is INHERITED, never re-resolved.** The six plugins' cascades differ (`actor.sh` ends at `hostname`, Cursor's at `$USER@$(hostname)`), so a private cascade inside the shipper produces a *second* identity for one machine and the uploaded logs join to nothing — uploaded, billed, stored, orphaned. Missing identity is a `outcome=skip reason=no-actor`, never a guess.
 - **The offset advances ONLY on a 2xx.** State is `~/.rogue/ship/<key>.state` (`offset=` / `head=` / `size=` / `path=`), shared by all three implementations, so their encodings must agree byte for byte: `head=` is base64 of the first line (not a checksum — sh has no guaranteed hasher) over a **4096**-byte window, and `path=` is **lexically normalized** (`//`, `/.`, `..` collapsed; symlinks never resolved) or two implementations disagree about one file and each re-ships it whole.

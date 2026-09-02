@@ -210,19 +210,34 @@ if ($ApiKey) {
         }
     }
 
-    # Write %USERPROFILE%\.rogue-env via setup.ps1's format (POSIX single-quoted).
+    # Write %USERPROFILE%\.rogue-env. Same MERGE semantics as
+    # scripts/shared/env-file.ps1, inlined because this script is piped to iex on
+    # its own - keep the two in step. Merging matters most here: auto-update
+    # re-runs the installer unattended every 24h.
     function Format-EnvVal { param([string]$Val) return "'" + $Val.Replace("'", "'\''") + "'" }
+    $managed = @('ROGUE_API_KEY', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME', 'ROGUE_BASE_URL')
     $envLines = @(
-        '# Managed by the rogue Claude plugin installer. Read by hook subprocesses at runtime.',
+        '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.',
         '# Delete this file to revoke credentials.',
         "export ROGUE_API_KEY=$(Format-EnvVal $ApiKey)",
         "export ROGUE_ACTOR_EMAIL=$(Format-EnvVal $Email)",
         "export ROGUE_ACTOR_NAME=$(Format-EnvVal $Name)"
     )
+    # Writing the default would bake today's hostname into every install.
     if ($BaseUrl -ne $ROGUE_BASE_URL_DEFAULT) { $envLines += "export ROGUE_BASE_URL=$(Format-EnvVal $BaseUrl)" }
+    if (Test-Path -LiteralPath $EnvFile) {
+        $owned = '^\s*(?:export\s+)?(?:' + ($managed -join '|') + ')\s*='
+        $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
+        foreach ($line in (Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue)) {
+            if ($line -match $owned -or $line -match $header) { continue }
+            $envLines += $line
+        }
+    }
     $envDir = Split-Path $EnvFile
     if ($envDir -and -not (Test-Path $envDir)) { New-Item -ItemType Directory -Path $envDir -Force | Out-Null }
-    Set-Content -Path $EnvFile -Value $envLines -Encoding UTF8
+    # BOM-less UTF-8 with LF - the same bytes install.sh writes.
+    [System.IO.File]::WriteAllText($EnvFile, (($envLines -join "`n") + "`n"),
+        (New-Object System.Text.UTF8Encoding($false)))
     try {
         $acl = Get-Acl $EnvFile
         $acl.SetAccessRuleProtection($true, $false)
