@@ -322,9 +322,16 @@ Check 'install.ps1: apostrophe survives a rewrite' $apos $script:Name
 Check 'install.ps1: apostrophe not re-escaped on disk' "export ROGUE_ACTOR_NAME='O'\''Brien'" `
     (@(Get-Content -LiteralPath $aposFile -Encoding UTF8 |
        Where-Object { $_ -match '^export ROGUE_ACTOR_NAME=' })[0])
-# sh is the other half of the fleet: it must read back the same value.
-if ($bashForApos = Get-Command bash -ErrorAction SilentlyContinue) {
-    $viaSh = & $bashForApos.Source -c ". `"$aposFile`"; printf %s `"`$ROGUE_ACTOR_NAME`""
+# sh is the other half of the fleet: it must read back the same value. POSIX
+# paths only - under Git Bash this sandbox path is C:\Users\..., whose
+# backslashes bash eats as escapes, so the source silently reads nothing. The
+# path goes through the environment rather than the -c string for the same
+# reason. tests/test_setup_env.sh covers the sh side natively on this platform.
+$bashForApos = Get-Command bash -ErrorAction SilentlyContinue
+if ($bashForApos -and -not $env:OS) {
+    $env:ROGUE_APOS_FILE = $aposFile
+    $viaSh = & $bashForApos.Source -c '. "$ROGUE_APOS_FILE"; printf %s "$ROGUE_ACTOR_NAME"'
+    Remove-Item Env:ROGUE_APOS_FILE -ErrorAction SilentlyContinue
     Check 'install.ps1: apostrophe reads the same under sh' $apos $viaSh
 }
 $env:USERPROFILE = $saveProfile
