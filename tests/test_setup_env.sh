@@ -166,18 +166,84 @@ check "auto-update path: key rotated"  "rotated-key"           "$(sourced "$auto
 check "auto-update path: base url kept" "http://localhost:8007" "$(sourced "$auto_env" ROGUE_BASE_URL)"
 check "auto-update path: log dir kept"  "/var/log/rogue"        "$(sourced "$auto_env" ROGUE_LOG_DIR)"
 
-# An explicit --base-url outranks the one already on disk.
+# An explicit --base-url outranks the one already on disk. Set before sourcing,
+# the way the real `ROGUE_BASE_URL=... install.sh` invocation reaches it.
 flag_env="$SANDBOX/base-url-flag.env"
 seed "$flag_env"
+ROGUE_INSTALL_LIB_ONLY=1 ROGUE_BASE_URL="https://staging.example.com" bash -c '
+  . "$1"
+  ENV_FILE="$2"
+  NON_INTERACTIVE=1
+  ROGUE_API_KEY="k"
+  configure_credentials >/dev/null 2>&1
+' _ "$REPO/install.sh" "$flag_env"
+check "explicit base url wins" "https://staging.example.com" "$(sourced "$flag_env" ROGUE_BASE_URL)"
+
+# ...and an explicit SaaS URL must be able to clear a stale custom one. The
+# default is never written, so "cleared" means the key is gone entirely.
+back_env="$SANDBOX/base-url-back-to-saas.env"
+seed "$back_env"
+ROGUE_INSTALL_LIB_ONLY=1 ROGUE_BASE_URL="https://api.rogue.security" bash -c '
+  . "$1"
+  ENV_FILE="$2"
+  NON_INTERACTIVE=1
+  ROGUE_API_KEY="k"
+  configure_credentials >/dev/null 2>&1
+' _ "$REPO/install.sh" "$back_env"
+check "explicit default clears stale custom url" "0" "$(count_lines "$back_env" '^export ROGUE_BASE_URL=')"
+check "explicit default keeps other settings"    "/var/log/rogue" "$(sourced "$back_env" ROGUE_LOG_DIR)"
+
+# The --base-url flag is the same signal as the env var.
+argv_env="$SANDBOX/base-url-argv.env"
+seed "$argv_env"
 ROGUE_INSTALL_LIB_ONLY=1 bash -c '
   . "$1"
   ENV_FILE="$2"
   NON_INTERACTIVE=1
   ROGUE_API_KEY="k"
-  ROGUE_BASE_URL="https://staging.example.com"
+  parse_args --base-url https://api.rogue.security
   configure_credentials >/dev/null 2>&1
-' _ "$REPO/install.sh" "$flag_env"
-check "explicit base url wins" "https://staging.example.com" "$(sourced "$flag_env" ROGUE_BASE_URL)"
+' _ "$REPO/install.sh" "$argv_env"
+check "--base-url default clears stale custom url" "0" "$(count_lines "$argv_env" '^export ROGUE_BASE_URL=')"
+
+# With no base URL named at all, the on-disk one stays put.
+keep_env="$SANDBOX/base-url-untouched.env"
+seed "$keep_env"
+ROGUE_INSTALL_LIB_ONLY=1 bash -c '
+  . "$1"
+  ENV_FILE="$2"
+  NON_INTERACTIVE=1
+  ROGUE_API_KEY="k"
+  configure_credentials >/dev/null 2>&1
+' _ "$REPO/install.sh" "$keep_env"
+check "silent run keeps on-disk base url" "http://localhost:8007" "$(sourced "$keep_env" ROGUE_BASE_URL)"
+
+# ── A failed write must leave the old file alone ─────────────────────────────
+# The temp file lands beside the target, so a read-only directory is what a full
+# disk looks like from here: the writer must fail rather than mv a partial file
+# over a credential file that was fine.
+ro_dir="$SANDBOX/readonly"
+mkdir -p "$ro_dir"
+ro_env="$ro_dir/rogue.env"
+seed "$ro_env"
+before="$(cat "$ro_env")"
+chmod 500 "$ro_dir"
+if : 2>/dev/null > "$ro_dir/.probe"; then
+  # root ignores the mode bits, so there is no failure to observe.
+  rm -f "$ro_dir/.probe"
+  chmod 700 "$ro_dir"
+  echo "  skip: directory is writable anyway (running as root?)"
+else
+set +e
+"$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "should-not-land" ROGUE_ACTOR_EMAIL "x@y.z" ROGUE_ACTOR_NAME "X"' \
+  _ "$REPO/scripts/shared/env-file.sh" "$ro_env" >/dev/null 2>&1
+ro_rc=$?
+set -e
+chmod 700 "$ro_dir"
+check "failed write reports failure"   "1"        "$ro_rc"
+check "failed write keeps the old file" "$before" "$(cat "$ro_env")"
+check "failed write leaves no temp"     "0"       "$(find "$ro_dir" -name '*.rogue-tmp.*' | wc -l | tr -d ' ')"
+fi
 
 # Writing the default would bake today's hostname in.
 def_env="$SANDBOX/install-default.env"

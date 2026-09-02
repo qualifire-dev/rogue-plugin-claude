@@ -33,10 +33,15 @@ function Protect-RogueEnvFile {
 }
 
 # $Values: an [ordered] hashtable of the keys this caller owns.
+# -RequireProtection: leave the file on disk untouched when the ACL cannot be
+# applied, rather than replacing it with one whose API key is readable. Callers
+# that treat protection as fatal pass it - they used to delete the file after
+# the fact, which took the settings the other five plugins pin in it as well.
 function Write-RogueEnvFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Values
+        [Parameter(Mandatory = $true)]$Values,
+        [switch]$RequireProtection
     )
 
     $managed = @($Values.Keys)
@@ -63,10 +68,27 @@ function Write-RogueEnvFile {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
 
+    # Temp then rename, like the sh twin: a failed or interrupted write must not
+    # truncate a file five other plugins read. The ACL lands on the temp, so the
+    # key is never briefly readable at the real path and the rename carries the
+    # restricted descriptor with it.
+    #
     # Set-Content -Encoding UTF8 writes a BOM on 5.1, plus CRLF, and a CR rides
     # into every value a POSIX shell sources.
+    $tmp = "$Path.rogue-tmp.$PID"
     $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, (($lines -join "`n") + "`n"), $utf8)
+    try {
+        [System.IO.File]::WriteAllText($tmp, (($lines -join "`n") + "`n"), $utf8)
+        $protected = Protect-RogueEnvFile $tmp
+        if ($RequireProtection -and -not $protected) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
 
-    return (Protect-RogueEnvFile $Path)
+    return $protected
 }

@@ -330,6 +330,25 @@ write).
   they are piped to `bash`/`iex` with no plugin tree beside them. They are also
   the only writers that emit `ROGUE_BASE_URL`, and only when it differs from the
   default — writing the default would bake today's hostname into every install.
+- **"Explicit" means the caller NAMED a base URL, not that the value differs
+  from the default** (`BASE_URL_EXPLICIT` / `$BaseUrlExplicit`, set by `--base-url`
+  / `-BaseUrl` and by the `ROGUE_BASE_URL` env var). Inferring it from the value
+  made `--base-url https://api.rogue.security` a no-op: the on-disk custom URL
+  outranked it and got written straight back, so a machine pinned to a staging
+  host could never be moved back to SaaS. Since the default is never written,
+  clearing it means the key is simply absent afterwards.
+- **The write is temp-then-rename, in all three languages**, and every emit on the
+  way is checked — the sh writers `&&` chain theirs (the group used to end in `:`,
+  which masked a failed `printf` and then `mv`'d the partial file over a good one)
+  and `rogue_env_preserved` distinguishes `grep` exit 1, nothing left to keep, from
+  a real error. A failed write must leave the previous file exactly as it was: it
+  is five other plugins' settings, not just this caller's credentials.
+- **On Windows the ACL goes on the TEMP file, before the rename**, so the API key
+  is never briefly readable at the real path. `Write-RogueEnvFile -RequireProtection`
+  (codex, copilot, antigravity — the three that treat protection as fatal) then
+  abandons the temp and leaves the file untouched. They used to write it and
+  `Remove-Item` it afterwards, which deleted the whole shared file — base URL,
+  log dir, comments — to get rid of one secret.
 - **All writers produce the same bytes** (BOM-less UTF-8, LF, POSIX single-quoted
   values), since one file is written by whichever agent was set up last and read
   by every dispatcher. `tests/test_setup_env.{sh,ps1}` assert that byte-identity

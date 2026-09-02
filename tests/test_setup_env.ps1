@@ -91,9 +91,60 @@ $bytes = [System.IO.File]::ReadAllBytes($libFile)
 Check 'lib: no UTF-8 BOM' $false (($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF))
 Check 'lib: no CR bytes'  $false ($bytes -contains 13)
 
+# -- -RequireProtection: no ACL, no replacement -------------------------------
+# The three plugins that treat protection as fatal used to write the file and
+# then delete it, which took the settings the other five pin in it as well. Now
+# the ACL goes on the temp file and a failure abandons the temp instead. Every
+# non-Windows run exercises the failure branch (Get-Acl is unsupported there).
+$reqFile = New-SeededFile 'require-protection.env'
+$reqBefore = [System.IO.File]::ReadAllText($reqFile)
+$reqOk = Write-RogueEnvFile -Path $reqFile -RequireProtection -Values ([ordered]@{
+    ROGUE_API_KEY     = 'guarded-key'
+    ROGUE_ACTOR_EMAIL = 'e@x.io'
+    ROGUE_ACTOR_NAME  = 'N'
+})
+if ($reqOk) {
+    Check 'require-protection: wrote once the ACL applied' 'guarded-key' (Get-EnvValue $reqFile 'ROGUE_API_KEY')
+} else {
+    Check 'require-protection: existing file left untouched' $reqBefore ([System.IO.File]::ReadAllText($reqFile))
+}
+Check 'require-protection: no temp left behind' 0 `
+    (@(Get-ChildItem -LiteralPath $sandbox -Filter '*.rogue-tmp.*' -Force).Count)
+
+# A failed write must not truncate the file either. A read-only directory is what
+# a full disk looks like from here; root ignores the mode bits, hence the probe.
+$chmod = Get-Command chmod -ErrorAction SilentlyContinue
+if ($chmod) {
+    $roDir = Join-Path $sandbox 'readonly'
+    New-Item -ItemType Directory -Path $roDir -Force | Out-Null
+    $roFile = Join-Path $roDir 'rogue.env'
+    [System.IO.File]::WriteAllText($roFile, $seed + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    $roBefore = [System.IO.File]::ReadAllText($roFile)
+    & $chmod.Source 500 $roDir
+    $probe = Join-Path $roDir '.probe'
+    $writable = $true
+    try { [System.IO.File]::WriteAllText($probe, 'x'); Remove-Item -LiteralPath $probe -Force } catch { $writable = $false }
+    if ($writable) {
+        Write-Host '  skip: directory is writable anyway (running as root?)'
+    } else {
+        $threw = $false
+        try {
+            Write-RogueEnvFile -Path $roFile -Values ([ordered]@{
+                ROGUE_API_KEY = 'should-not-land'; ROGUE_ACTOR_EMAIL = 'e@x.io'; ROGUE_ACTOR_NAME = 'N'
+            }) | Out-Null
+        } catch { $threw = $true }
+        Check 'failed write: reported, not swallowed' $true $threw
+        Check 'failed write: old file intact' $roBefore ([System.IO.File]::ReadAllText($roFile))
+    }
+    & $chmod.Source 700 $roDir
+} else {
+    Write-Host '  skip: chmod not available (failed-write case)'
+}
+
 # -- The two best-effort setup.ps1 helpers, end to end ------------------------
-# Only these two: the other three delete the file and fail when the ACL cannot be
-# applied, i.e. every non-Windows run. They are wired-checked below.
+# Only these two: the other three pass -RequireProtection and fail without
+# writing when the ACL cannot be applied, i.e. every non-Windows run. They are
+# wired-checked below.
 $saveEnvFile = $env:ROGUE_ENV_FILE
 foreach ($plugin in @('rogue', 'cursor')) {
     $path = New-SeededFile "$plugin.env"
@@ -112,10 +163,56 @@ foreach ($plugin in @('rogue', 'codex', 'cursor', 'copilot', 'antigravity')) {
     $text = Get-Content -Raw -LiteralPath (Join-Path $repo "plugins/$plugin/scripts/setup.ps1")
     Check "${plugin}: uses the shared writer" $true ($text -match 'Write-RogueEnvFile')
     Check "${plugin}: does not rewrite the file itself" $false ($text -match 'Set-Content\s+-Path\s+\$EnvFile')
+    # The file now holds five other plugins' settings: no caller may delete it.
+    Check "${plugin}: never deletes the env file" $false ($text -match 'Remove-Item -LiteralPath \$EnvFile')
 }
+foreach ($plugin in @('codex', 'copilot', 'antigravity')) {
+    $text = Get-Content -Raw -LiteralPath (Join-Path $repo "plugins/$plugin/scripts/setup.ps1")
+    Check "${plugin}: requires protection before replacing" $true ($text -match '-RequireProtection')
+}
+
+# The destination is only ever reached by renaming a fully written temp file.
+$libText = Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/env-file.ps1')
+Check 'writer: no in-place write of the destination' $false `
+    ($libText -match '\[System\.IO\.File\]::WriteAllText\(\$Path')
+Check 'writer: renames a temp into place' $true `
+    ($libText -match 'Move-Item -LiteralPath \$tmp -Destination \$Path')
 $installer = Get-Content -Raw -LiteralPath (Join-Path $repo 'install.ps1')
 Check 'install.ps1: merges existing lines' $true ($installer -match 'foreach \(\$line in \(Get-Content -LiteralPath \$EnvFile')
 Check 'install.ps1: no truncating write'   $false ($installer -match 'Set-Content\s+-Path\s+\$EnvFile')
+Check 'install.ps1: renames a temp into place' $true `
+    ($installer -match 'Move-Item -LiteralPath \$envTmp -Destination \$EnvFile')
+
+# -- install.ps1: an explicit base URL must beat the one already on disk -------
+# install.ps1 has no lib-only seam - it is a top-level script that installs on
+# sight - so lift out the one function that decides that precedence and run it.
+$loadFn = [regex]::Match($installer, '(?ms)^function Load-ExistingCreds \{.*?^\}').Value
+Check 'install.ps1: Load-ExistingCreds located' $true ($loadFn.Length -gt 0)
+. ([scriptblock]::Create($loadFn))
+
+$ROGUE_BASE_URL_DEFAULT = 'https://api.rogue.security'
+$saveProfile = $env:USERPROFILE
+$env:USERPROFILE = $sandbox
+[System.IO.File]::WriteAllText((Join-Path $sandbox '.rogue-env'), $seed + "`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+
+function Resolve-BaseUrl {
+    param([string]$Given, [bool]$Explicit)
+    $script:ApiKey = 'k'; $script:Email = 'e@x.io'; $script:Name = 'N'
+    $script:BaseUrl = $Given
+    $script:BaseUrlExplicit = $Explicit
+    Load-ExistingCreds
+    return $script:BaseUrl
+}
+Check 'install.ps1: silent run takes the on-disk url' 'http://localhost:8007' `
+    (Resolve-BaseUrl $ROGUE_BASE_URL_DEFAULT $false)
+Check 'install.ps1: explicit custom url wins' 'https://staging.example.com' `
+    (Resolve-BaseUrl 'https://staging.example.com' $true)
+# The regression: an explicit SaaS url used to read as "not given" and lose, so a
+# machine pinned to a staging host could never be moved back.
+Check 'install.ps1: explicit default clears the stale custom url' $ROGUE_BASE_URL_DEFAULT `
+    (Resolve-BaseUrl $ROGUE_BASE_URL_DEFAULT $true)
+$env:USERPROFILE = $saveProfile
 
 # -- The sh and PowerShell writers must produce the SAME file ------------------
 $bash = Get-Command bash -ErrorAction SilentlyContinue

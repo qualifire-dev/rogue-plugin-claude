@@ -72,6 +72,10 @@ $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $en
 if (-not $ApiKey)     { $ApiKey     = $env:ROGUE_API_KEY }
 if (-not $Email)      { $Email      = $env:ROGUE_ACTOR_EMAIL }
 if (-not $Name)       { $Name       = $env:ROGUE_ACTOR_NAME }
+# Whether the caller SAID a base URL, not whether the value happens to differ
+# from the default: -BaseUrl https://api.rogue.security is how a machine with a
+# stale self-hosted URL on disk gets moved back to SaaS.
+$BaseUrlExplicit = [bool]$BaseUrl -or [bool]$env:ROGUE_BASE_URL
 if (-not $BaseUrl)    { $BaseUrl    = if ($env:ROGUE_BASE_URL) { $env:ROGUE_BASE_URL } else { $ROGUE_BASE_URL_DEFAULT } }
 if (-not $PluginRepo) { $PluginRepo = if ($env:ROGUE_PLUGIN_REPO) { $env:ROGUE_PLUGIN_REPO } else { 'qualifire-dev/rogue-plugins' } }
 if ($env:ROGUE_NON_INTERACTIVE) { $NonInteractive = $true }
@@ -146,7 +150,7 @@ function Load-ExistingCreds {
                     'ROGUE_API_KEY'     { if (-not $script:ApiKey)  { $script:ApiKey  = $v } }
                     'ROGUE_ACTOR_EMAIL' { if (-not $script:Email)   { $script:Email   = $v } }
                     'ROGUE_ACTOR_NAME'  { if (-not $script:Name)    { $script:Name    = $v } }
-                    'ROGUE_BASE_URL'    { if ($script:BaseUrl -eq $ROGUE_BASE_URL_DEFAULT) { $script:BaseUrl = $v } }
+                    'ROGUE_BASE_URL'    { if (-not $script:BaseUrlExplicit) { $script:BaseUrl = $v } }
                 }
             }
         }
@@ -235,16 +239,26 @@ if ($ApiKey) {
     }
     $envDir = Split-Path $EnvFile
     if ($envDir -and -not (Test-Path $envDir)) { New-Item -ItemType Directory -Path $envDir -Force | Out-Null }
+    # Temp then rename, like install.sh: a failed or interrupted write must not
+    # truncate a file six plugins read. The ACL lands on the temp, so the key is
+    # never briefly readable at the real path.
     # BOM-less UTF-8 with LF - the same bytes install.sh writes.
-    [System.IO.File]::WriteAllText($EnvFile, (($envLines -join "`n") + "`n"),
-        (New-Object System.Text.UTF8Encoding($false)))
+    $envTmp = "$EnvFile.rogue-tmp.$PID"
     try {
-        $acl = Get-Acl $EnvFile
-        $acl.SetAccessRuleProtection($true, $false)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, 'FullControl', 'Allow')
-        $acl.SetAccessRule($rule); Set-Acl $EnvFile $acl
-    } catch { Warn2 "Could not restrict permissions on $EnvFile (non-fatal)." }
+        [System.IO.File]::WriteAllText($envTmp, (($envLines -join "`n") + "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+        try {
+            $acl = Get-Acl $envTmp
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, 'FullControl', 'Allow')
+            $acl.SetAccessRule($rule); Set-Acl $envTmp $acl
+        } catch { Warn2 "Could not restrict permissions on $EnvFile (non-fatal)." }
+        Move-Item -LiteralPath $envTmp -Destination $EnvFile -Force
+    } catch {
+        Remove-Item -LiteralPath $envTmp -Force -ErrorAction SilentlyContinue
+        Die "Could not write $EnvFile"
+    }
     Ok "Credentials written to $EnvFile"
 }
 

@@ -11,10 +11,13 @@ rogue_env_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
-# Lines we do not own; our header goes too, or it piles up per write.
+# Lines we do not own; our header goes too, or it piles up per write. grep exits
+# 1 when nothing is left to keep, which is not a failure - but a read or write
+# error (2) must propagate, or a truncated temp file replaces a good one.
 rogue_env_preserved() { # <env-file> <key1|key2|...>
-  { grep -Ev "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" "$1" \
-    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'; } || :
+  grep -Ev "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" "$1" \
+    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
+  case "$?" in 0 | 1) return 0 ;; *) return 1 ;; esac
 }
 
 # rogue_write_env_file <env-file> <key> <value> [<key> <value> ...]
@@ -34,16 +37,17 @@ rogue_write_env_file() {
     shift 2
   done
 
-  # Temp file: a full disk must not leave a truncated credential file.
+  # Temp file: a full disk must not leave a truncated credential file. Every
+  # emit is && chained, so a partial write fails the group instead of being
+  # swallowed and mv'd over the file it was meant to update.
   _env_tmp="${_env_file}.rogue-tmp.$$"
   (
     umask 077
     {
-      printf '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.\n'
-      printf '# Delete this file to revoke credentials.\n'
-      printf '%s' "$_env_managed"
-      [ -f "$_env_file" ] && rogue_env_preserved "$_env_file" "$_env_keys"
-      :
+      printf '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.\n' &&
+      printf '# Delete this file to revoke credentials.\n' &&
+      printf '%s' "$_env_managed" &&
+      { [ ! -f "$_env_file" ] || rogue_env_preserved "$_env_file" "$_env_keys"; }
     } > "$_env_tmp"
   ) || { rm -f "$_env_tmp"; return 1; }
 

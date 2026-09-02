@@ -49,6 +49,11 @@ set -u
 # ── Config ──────────────────────────────────────────────────────────────────
 ROGUE_PLUGIN_REPO="${ROGUE_PLUGIN_REPO:-qualifire-dev/rogue-plugins}"
 ROGUE_BASE_URL_DEFAULT="https://api.rogue.security"
+# Whether the caller SAID a base URL, not whether the value happens to differ
+# from the default: `--base-url https://api.rogue.security` is how a machine
+# with a stale self-hosted URL on disk gets moved back to SaaS.
+BASE_URL_EXPLICIT=0
+[ -z "${ROGUE_BASE_URL:-}" ] || BASE_URL_EXPLICIT=1
 ROGUE_BASE_URL="${ROGUE_BASE_URL:-$ROGUE_BASE_URL_DEFAULT}"
 MARKETPLACE_NAME="rogue-marketplace"
 PLUGIN_NAME="rogue"
@@ -453,15 +458,15 @@ configure_credentials() {
   local flag_key="${ROGUE_API_KEY:-}"
   local flag_email="${ROGUE_ACTOR_EMAIL:-}"
   local flag_name="${ROGUE_ACTOR_NAME:-}"
-  local flag_base_url=""
-  [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] || flag_base_url="$ROGUE_BASE_URL"
+  local flag_base_url="$ROGUE_BASE_URL"
 
   # Pull anything already on disk / in env into scope.
   [ -r /etc/rogue/env ] && . /etc/rogue/env
   [ -r "$ENV_FILE" ]    && . "$ENV_FILE"
 
-  # On-disk beats the default, an explicit --base-url beats both.
-  [ -z "$flag_base_url" ] || ROGUE_BASE_URL="$flag_base_url"
+  # On-disk beats the default; an explicit --base-url beats both, INCLUDING when
+  # it is the default value - that is the only way to clear a stale custom URL.
+  [ "$BASE_URL_EXPLICIT" = "1" ] && ROGUE_BASE_URL="$flag_base_url"
 
   local cur_key="${flag_key:-${ROGUE_API_KEY:-}}"
 
@@ -543,26 +548,31 @@ configure_credentials() {
 # installer unattended every 24h.
 env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+# Lines we do not own, minus our own header (re-emitted per write). grep exits 1
+# when nothing is left to keep - not a failure; 2 is, and must not be masked.
+env_preserved() {
+  grep -Ev "^[[:space:]]*(export[[:space:]]+)?($1)[[:space:]]*=" "$ENV_FILE" \
+    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
+  case "$?" in 0 | 1) return 0 ;; *) return 1 ;; esac
+}
+
 write_env_file() {
   local keys="ROGUE_API_KEY|ROGUE_ACTOR_EMAIL|ROGUE_ACTOR_NAME|ROGUE_BASE_URL"
   local tmp="$ENV_FILE.rogue-tmp.$$"
+  # Every emit is && chained: a partial write must fail the group rather than be
+  # swallowed and then mv'd over the credential file it was meant to update.
   (
     umask 077
     {
-      printf '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.\n'
-      printf '# Delete this file to revoke credentials.\n'
-      printf 'export ROGUE_API_KEY=%s\n' "$(env_quote "$ROGUE_API_KEY")"
-      printf 'export ROGUE_ACTOR_EMAIL=%s\n' "$(env_quote "$ROGUE_ACTOR_EMAIL")"
-      printf 'export ROGUE_ACTOR_NAME=%s\n' "$(env_quote "$ROGUE_ACTOR_NAME")"
+      printf '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.\n' &&
+      printf '# Delete this file to revoke credentials.\n' &&
+      printf 'export ROGUE_API_KEY=%s\n' "$(env_quote "$ROGUE_API_KEY")" &&
+      printf 'export ROGUE_ACTOR_EMAIL=%s\n' "$(env_quote "$ROGUE_ACTOR_EMAIL")" &&
+      printf 'export ROGUE_ACTOR_NAME=%s\n' "$(env_quote "$ROGUE_ACTOR_NAME")" &&
       # Writing the default would bake today's hostname into every install.
-      if [ "$ROGUE_BASE_URL" != "$ROGUE_BASE_URL_DEFAULT" ]; then
-        printf 'export ROGUE_BASE_URL=%s\n' "$(env_quote "$ROGUE_BASE_URL")"
-      fi
-      # What we do not own, minus our own header (re-emitted above).
-      if [ -f "$ENV_FILE" ]; then
-        { grep -Ev "^[[:space:]]*(export[[:space:]]+)?($keys)[[:space:]]*=" "$ENV_FILE" \
-          | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'; } || :
-      fi
+      { [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] ||
+        printf 'export ROGUE_BASE_URL=%s\n' "$(env_quote "$ROGUE_BASE_URL")"; } &&
+      { [ ! -f "$ENV_FILE" ] || env_preserved "$keys"; }
     } > "$tmp"
   ) || { rm -f "$tmp"; die "Could not write $ENV_FILE"; }
   mv -f "$tmp" "$ENV_FILE" || { rm -f "$tmp"; die "Could not write $ENV_FILE"; }
@@ -724,7 +734,7 @@ parse_args() {
       --actor-email)     [ -n "$val" ] || { val="$2"; shift; }; ROGUE_ACTOR_EMAIL="$val" ;;
       --actor-name)      [ -n "$val" ] || { val="$2"; shift; }; ROGUE_ACTOR_NAME="$val" ;;
       --plugin-repo)     [ -n "$val" ] || { val="$2"; shift; }; ROGUE_PLUGIN_REPO="$val" ;;
-      --base-url)        [ -n "$val" ] || { val="$2"; shift; }; ROGUE_BASE_URL="$val" ;;
+      --base-url)        [ -n "$val" ] || { val="$2"; shift; }; ROGUE_BASE_URL="$val"; BASE_URL_EXPLICIT=1 ;;
       --claude)          WANT="$WANT claude" ;;
       --codex)           WANT="$WANT codex" ;;
       --cursor)          WANT="$WANT cursor" ;;

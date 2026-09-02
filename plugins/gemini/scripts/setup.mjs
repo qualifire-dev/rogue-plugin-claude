@@ -55,12 +55,26 @@ const contents =
   [...HEADER, ...Object.entries(MANAGED).map(([k, v]) => `export ${k}=${q(v)}`), ...preserved]
     .join("\n") + "\n";
 
-// mode 0o600 on write; chmod again in case the file pre-existed with wider bits.
-fs.writeFileSync(ENV_FILE, contents, { mode: 0o600 });
+// Temp then rename, like the sh and PowerShell writers: a failed or interrupted
+// write must not truncate a file five other plugins read. mode 0o600 on create;
+// chmod again in case an old umask or a pre-existing temp left it wider.
+const TMP = `${ENV_FILE}.rogue-tmp.${process.pid}`;
 try {
-  fs.chmodSync(ENV_FILE, 0o600);
-} catch {
-  /* Windows: POSIX mode bits are best-effort; the file lands under the user profile. */
+  fs.writeFileSync(TMP, contents, { mode: 0o600 });
+  try {
+    fs.chmodSync(TMP, 0o600);
+  } catch {
+    /* Windows: POSIX mode bits are best-effort; the file lands under the user profile. */
+  }
+  fs.renameSync(TMP, ENV_FILE);
+} catch (err) {
+  try {
+    fs.unlinkSync(TMP);
+  } catch {
+    /* Nothing to clean up. */
+  }
+  process.stderr.write(`Could not write ${ENV_FILE}: ${err.message}\n`);
+  process.exit(1);
 }
 
 process.stdout.write("OK\n");

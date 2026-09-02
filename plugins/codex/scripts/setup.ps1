@@ -19,19 +19,19 @@ $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $en
 # as a scriptblock so ExecutionPolicy never applies.
 . ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'env-file.ps1'))))
 
-$restricted = Write-RogueEnvFile -Path $EnvFile -Values ([ordered]@{
+$restricted = Write-RogueEnvFile -Path $EnvFile -RequireProtection -Values ([ordered]@{
     ROGUE_API_KEY       = $ApiKey
     ROGUE_ACTOR_EMAIL   = $Email
     ROGUE_ACTOR_NAME    = $Name
     ROGUE_CODEX_SURFACE = $Surface
 })
 
-# Without the ACL the API key sits readable with inherited perms - delete it
-# rather than print OK on an exposed secret.
+# Without the ACL the API key would sit readable with inherited perms, so
+# -RequireProtection left the file on disk untouched instead of replacing it
+# with an exposed one. Deleting it here - which is what this used to do - would
+# take the settings the other five plugins pin in it down with the secret.
 if (-not $restricted) {
-    $err = $script:RogueEnvProtectError
-    Remove-Item -LiteralPath $EnvFile -Force -ErrorAction SilentlyContinue
-    Write-Error "Failed to restrict permissions on $EnvFile : $err"
+    Write-Error "Failed to restrict permissions on $EnvFile : $script:RogueEnvProtectError"
     exit 1
 }
 
