@@ -550,10 +550,13 @@ env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # Lines we do not own, minus our own header (re-emitted per write). grep exits 1
 # when nothing is left to keep - not a failure; 2 is, and must not be masked.
+# Captured off an || so `set -e` cannot abort on the harmless 1.
 env_preserved() {
+  local rc=0
   grep -Ev "^[[:space:]]*(export[[:space:]]+)?($1)[[:space:]]*=" "$ENV_FILE" \
-    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-  case "$?" in 0 | 1) return 0 ;; *) return 1 ;; esac
+    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
+    || rc=$?
+  [ "$rc" -le 1 ]
 }
 
 write_env_file() {

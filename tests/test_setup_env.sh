@@ -218,6 +218,26 @@ ROGUE_INSTALL_LIB_ONLY=1 bash -c '
 ' _ "$REPO/install.sh" "$keep_env"
 check "silent run keeps on-disk base url" "http://localhost:8007" "$(sourced "$keep_env" ROGUE_BASE_URL)"
 
+# ── Nothing left to preserve is not a failure ────────────────────────────────
+# The filter greps everything away and exits 1; under `set -e` in a sourcing
+# script that must not abort the write.
+only_env="$SANDBOX/only-managed.env"
+cat > "$only_env" <<'ONLY'
+# Managed by the Rogue plugins. Read by hook subprocesses at runtime.
+# Delete this file to revoke credentials.
+export ROGUE_API_KEY='stale-key'
+export ROGUE_ACTOR_EMAIL='stale@example.com'
+export ROGUE_ACTOR_NAME='Stale'
+ONLY
+set +e
+"$SH" -ec '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "k" ROGUE_ACTOR_EMAIL "e@x.io" ROGUE_ACTOR_NAME "N"' \
+  _ "$REPO/scripts/shared/env-file.sh" "$only_env"
+only_rc=$?
+set -e
+check "empty preserve set succeeds"  "0" "$only_rc"
+check "empty preserve set rewrites"  "k" "$(sourced "$only_env" ROGUE_API_KEY)"
+check "empty preserve set one header" "1" "$(count_lines "$only_env" 'Read by hook subprocesses')"
+
 # ── A failed write must leave the old file alone ─────────────────────────────
 # The temp file lands beside the target, so a read-only directory is what a full
 # disk looks like from here: the writer must fail rather than mv a partial file

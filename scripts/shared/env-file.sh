@@ -13,11 +13,15 @@ rogue_env_quote() {
 
 # Lines we do not own; our header goes too, or it piles up per write. grep exits
 # 1 when nothing is left to keep, which is not a failure - but a read or write
-# error (2) must propagate, or a truncated temp file replaces a good one.
+# error (2) must propagate, or a truncated temp file replaces a good one. The
+# status is captured off an || so `set -e` in a sourcing script cannot abort on
+# the harmless 1 before the check runs.
 rogue_env_preserved() { # <env-file> <key1|key2|...>
+  _rogue_env_rc=0
   grep -Ev "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" "$1" \
-    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-  case "$?" in 0 | 1) return 0 ;; *) return 1 ;; esac
+    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
+    || _rogue_env_rc=$?
+  [ "$_rogue_env_rc" -le 1 ]
 }
 
 # rogue_write_env_file <env-file> <key> <value> [<key> <value> ...]
