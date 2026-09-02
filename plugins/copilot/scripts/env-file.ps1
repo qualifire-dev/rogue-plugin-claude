@@ -56,7 +56,11 @@ function Write-RogueEnvFile {
         $owned = '^\s*(?:export\s+)?(?:' +
             (($managed | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\s*='
         $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-        foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        # -Encoding UTF8 is load-bearing: we write BOM-less UTF-8, and Windows
+        # PowerShell 5.1 decodes a BOM-less file as the ANSI code page by default,
+        # so a non-ASCII preserved line or actor name would be mangled on the next
+        # merge - and the mangled bytes are what gets written back.
+        foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match $owned)  { continue }
             if ($line -match $header) { continue }
             $lines.Add($line)

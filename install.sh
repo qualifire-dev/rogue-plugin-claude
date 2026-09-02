@@ -550,12 +550,15 @@ env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # Lines we do not own, minus our own header (re-emitted per write). grep exits 1
 # when nothing is left to keep - not a failure; 2 is, and must not be masked.
-# Captured off an || so `set -e` cannot abort on the harmless 1.
+# Captured off an || so `set -e` cannot abort on the harmless 1. ONE grep, both
+# patterns as -e: a pipeline reports only its LAST status, so a `grep | grep`
+# hides an unreadable env file behind the second grep's empty-input exit 1.
 env_preserved() {
   local rc=0
-  grep -Ev "^[[:space:]]*(export[[:space:]]+)?($1)[[:space:]]*=" "$ENV_FILE" \
-    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
-    || rc=$?
+  grep -Ev \
+    -e "^[[:space:]]*(export[[:space:]]+)?($1)[[:space:]]*=" \
+    -e '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
+    "$ENV_FILE" || rc=$?
   [ "$rc" -le 1 ]
 }
 

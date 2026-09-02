@@ -12,15 +12,20 @@ rogue_env_quote() {
 }
 
 # Lines we do not own; our header goes too, or it piles up per write. grep exits
-# 1 when nothing is left to keep, which is not a failure - but a read or write
-# error (2) must propagate, or a truncated temp file replaces a good one. The
-# status is captured off an || so `set -e` in a sourcing script cannot abort on
-# the harmless 1 before the check runs.
+# 1 when nothing is left to keep, which is not a failure - but a read error (2)
+# must propagate, or a truncated temp file replaces a good one. The status is
+# captured off an || so `set -e` in a sourcing script cannot abort on the
+# harmless 1 before the check runs.
+#
+# ONE grep, both patterns as -e: a pipeline reports only its LAST status, so a
+# `grep | grep` hides an unreadable env file behind the second grep's empty-input
+# exit 1 and the writer then drops every unmanaged key.
 rogue_env_preserved() { # <env-file> <key1|key2|...>
   _rogue_env_rc=0
-  grep -Ev "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" "$1" \
-    | grep -Ev '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
-    || _rogue_env_rc=$?
+  grep -Ev \
+    -e "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" \
+    -e '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
+    "$1" || _rogue_env_rc=$?
   [ "$_rogue_env_rc" -le 1 ]
 }
 

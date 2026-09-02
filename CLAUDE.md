@@ -343,6 +343,27 @@ write).
   and `rogue_env_preserved` distinguishes `grep` exit 1, nothing left to keep, from
   a real error. A failed write must leave the previous file exactly as it was: it
   is five other plugins' settings, not just this caller's credentials.
+- **That preserve filter is ONE `grep` with two `-e` patterns, never `grep | grep`.**
+  A pipeline reports only its LAST status, so with two greps an unreadable env
+  file died in the first one and the second saw empty input and exited 1 — which
+  the helper read as "nothing left to keep" and the writer then replaced the file
+  with the managed keys alone, silently. Exactly the truncation this whole section
+  exists to prevent, reachable through a mode/ownership change rather than a full
+  disk. `tests/test_setup_env.sh` pins it against both sh writers with a mode-000
+  file (skipped under root, which reads it anyway); the Jamf script in the MDM docs
+  carries the same helper and the same rule.
+- **Every PowerShell read of the file passes `-Encoding UTF8`.** We write it
+  BOM-less, and Windows PowerShell 5.1 decodes a BOM-less file as the ANSI code
+  page by default — so a merge read back a non-ASCII actor name or preserved line
+  mangled and then wrote the mangled bytes out again, compounding on each run.
+  pwsh 7 defaults to UTF-8, so a Linux CI run cannot catch this: the guard is the
+  structural assertion in `tests/test_setup_env.ps1`, alongside a behavioral
+  non-ASCII round trip whose literals are built from code points (this repo's
+  `.ps1` files are themselves BOM-less UTF-8, so a typed-in literal would hit the
+  same trap and the test would be measuring itself). The reader-side dispatchers
+  (`hook.ps1`, `heartbeat.ps1`, `ship-logs.ps1`) still use a bare `Get-Content` —
+  there a mangled value costs one request rather than the file, but it is the same
+  bug.
 - **On Windows the ACL goes on the TEMP file, before the rename**, so the API key
   is never briefly readable at the real path. `Write-RogueEnvFile -RequireProtection`
   (codex, copilot, antigravity — the three that treat protection as fatal) then

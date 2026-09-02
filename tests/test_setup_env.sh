@@ -265,6 +265,62 @@ check "failed write keeps the old file" "$before" "$(cat "$ro_env")"
 check "failed write leaves no temp"     "0"       "$(find "$ro_dir" -name '*.rogue-tmp.*' | wc -l | tr -d ' ')"
 fi
 
+# ── Non-ASCII survives a merge ──────────────────────────────────────────────
+# sh has no character encoding to get wrong - it moves bytes - so this is the
+# byte-level reference the PowerShell twin is checked against, where the same
+# case is a real hazard (5.1 decodes a BOM-less file as the ANSI code page).
+u8_env="$SANDBOX/nonascii.env"
+cat > "$u8_env" <<'U8'
+export ROGUE_API_KEY='stale-key'
+export ROGUE_LOG_DIR='/var/log/café'
+U8
+for pass in 1 2; do
+  "$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "new-key" ROGUE_ACTOR_EMAIL "e@x.io" ROGUE_ACTOR_NAME "José Müller"' \
+    _ "$REPO/scripts/shared/env-file.sh" "$u8_env"
+  check "non-ASCII actor name round-trips (pass $pass)" "José Müller" "$(sourced "$u8_env" ROGUE_ACTOR_NAME)"
+  check "non-ASCII preserved line intact (pass $pass)"  "/var/log/café"   "$(sourced "$u8_env" ROGUE_LOG_DIR)"
+done
+
+# ── An UNREADABLE existing file must fail the write, not silently drop it ────
+# The preserve filter used to be `grep | grep`, and a pipeline reports only its
+# LAST status: the first grep died with "Permission denied", the second saw empty
+# input and exited 1, and the writer read that as "nothing left to keep" and
+# replaced the file with the managed keys alone. Both grep patterns are one
+# invocation now, so the read error (2) is the status the writer sees.
+unread_probe="$SANDBOX/unreadable-probe"
+: > "$unread_probe"
+chmod 000 "$unread_probe"
+if cat "$unread_probe" >/dev/null 2>&1; then
+  # root reads it regardless of the mode bits, so there is no failure to observe.
+  echo "  skip: mode 000 is readable anyway (running as root?)"
+else
+  for impl in shared install; do
+    unread_env="$SANDBOX/unreadable-$impl.env"
+    seed "$unread_env"
+    before="$(cat "$unread_env")"
+    chmod 000 "$unread_env"
+    set +e
+    if [ "$impl" = shared ]; then
+      "$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "should-not-land" ROGUE_ACTOR_EMAIL "x@y.z" ROGUE_ACTOR_NAME "X"' \
+        _ "$REPO/scripts/shared/env-file.sh" "$unread_env" >/dev/null 2>&1
+    else
+      ROGUE_INSTALL_LIB_ONLY=1 bash -c '
+        . "$1"
+        ENV_FILE="$2"
+        ROGUE_API_KEY="should-not-land"; ROGUE_ACTOR_EMAIL="x@y.z"; ROGUE_ACTOR_NAME="X"
+        write_env_file
+      ' _ "$REPO/install.sh" "$unread_env" >/dev/null 2>&1
+    fi
+    unread_rc=$?
+    set -e
+    chmod 600 "$unread_env"
+    check "$impl: unreadable file fails the write"  "1"       "$([ "$unread_rc" = 0 ] && echo 0 || echo 1)"
+    check "$impl: unreadable file left intact"      "$before" "$(cat "$unread_env")"
+    check "$impl: unreadable file leaves no temp"   "0"       "$(find "$SANDBOX" -name "*unreadable-$impl*.rogue-tmp.*" | wc -l | tr -d ' ')"
+  done
+fi
+chmod 600 "$unread_probe"
+
 # Writing the default would bake today's hostname in.
 def_env="$SANDBOX/install-default.env"
 ROGUE_INSTALL_LIB_ONLY=1 bash -c '

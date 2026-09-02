@@ -142,7 +142,9 @@ if ($hasClaude -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
 function Load-ExistingCreds {
     foreach ($f in @('C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
         if (-not (Test-Path -LiteralPath $f)) { continue }
-        foreach ($line in (Get-Content -LiteralPath $f -ErrorAction SilentlyContinue)) {
+        # -Encoding UTF8: the file is written BOM-less, and 5.1 would otherwise
+        # decode it as the ANSI code page and mangle a non-ASCII actor name.
+        foreach ($line in (Get-Content -LiteralPath $f -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
                 $k = $Matches[1]
                 $v = $Matches[2].Trim() -replace "^'(.*)'$", '$1' -replace '^"(.*)"$', '$1'
@@ -232,7 +234,8 @@ if ($ApiKey) {
     if (Test-Path -LiteralPath $EnvFile) {
         $owned = '^\s*(?:export\s+)?(?:' + ($managed -join '|') + ')\s*='
         $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-        foreach ($line in (Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue)) {
+        # -Encoding UTF8: see Load-ExistingCreds - 5.1 reads BOM-less as ANSI.
+        foreach ($line in (Get-Content -LiteralPath $EnvFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match $owned -or $line -match $header) { continue }
             $envLines += $line
         }

@@ -40,9 +40,12 @@ function New-SeededFile {
     return $path
 }
 
+# -Encoding UTF8 on every read here too: on Windows PowerShell 5.1 a bare
+# Get-Content decodes our BOM-less UTF-8 as the ANSI code page, so a test that
+# read back a mangled value would agree with a writer that mangled it.
 function Get-EnvValue {
     param([string]$Path, [string]$Key)
-    foreach ($line in (Get-Content -LiteralPath $Path)) {
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
         if ($line -match ('^\s*export\s+' + [regex]::Escape($Key) + "\s*=\s*'?(.*?)'?\s*$")) {
             return $Matches[1]
         }
@@ -52,7 +55,7 @@ function Get-EnvValue {
 
 function Count-Matching {
     param([string]$Path, [string]$Pattern)
-    return @(Get-Content -LiteralPath $Path | Where-Object { $_ -match $Pattern }).Count
+    return @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_ -match $Pattern }).Count
 }
 
 # -- The shared library the five setup.ps1 helpers load -----------------------
@@ -84,7 +87,43 @@ Write-RogueEnvFile -Path $quoteFile -Values ([ordered]@{
     ROGUE_ACTOR_NAME  = "O'Brien"
 }) | Out-Null
 Check 'lib: quoted value escaped' "export ROGUE_API_KEY='key'\''with'\''quotes'" `
-    (@(Get-Content -LiteralPath $quoteFile | Where-Object { $_ -match '^export ROGUE_API_KEY=' })[0])
+    (@(Get-Content -LiteralPath $quoteFile -Encoding UTF8 | Where-Object { $_ -match '^export ROGUE_API_KEY=' })[0])
+
+# Non-ASCII must survive a merge. We write BOM-less UTF-8; Windows PowerShell 5.1
+# decodes a BOM-less file as the ANSI code page unless told otherwise, so a bare
+# Get-Content in the writer would read the preserved lines back mangled and then
+# write the mangled bytes out - corruption that compounds on every later merge.
+#
+# The literals are built from code points rather than typed in: this .ps1 is
+# itself BOM-less UTF-8, so under 5.1 a literal non-ASCII character in the source
+# would hit the same decoding trap and the test would be measuring itself.
+$eacute = [string][char]0x00E9
+$uuml   = [string][char]0x00FC
+$actorName = 'Jos' + $eacute + ' M' + $uuml + 'ller'
+$keptDir   = '/var/log/caf' + $eacute
+
+$u8File = Join-Path $sandbox 'nonascii.env'
+[System.IO.File]::WriteAllText($u8File, (@(
+    "export ROGUE_API_KEY='stale-key'",
+    "export ROGUE_LOG_DIR='$keptDir'"
+) -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+
+foreach ($pass in 1, 2) {
+    Write-RogueEnvFile -Path $u8File -Values ([ordered]@{
+        ROGUE_API_KEY     = 'new-key'
+        ROGUE_ACTOR_EMAIL = 'e@x.io'
+        ROGUE_ACTOR_NAME  = $actorName
+    }) | Out-Null
+    Check "lib: non-ASCII actor name round-trips (pass $pass)" $actorName (Get-EnvValue $u8File 'ROGUE_ACTOR_NAME')
+    Check "lib: non-ASCII preserved line intact (pass $pass)"  $keptDir   (Get-EnvValue $u8File 'ROGUE_LOG_DIR')
+}
+# The bytes on disk, independent of any Get-Content: mangling shows up as the
+# ANSI round trip of the code point, not as the code point itself.
+$u8Bytes = [System.IO.File]::ReadAllBytes($u8File)
+$u8Text  = [System.Text.Encoding]::UTF8.GetString($u8Bytes)
+Check 'lib: non-ASCII stored as UTF-8 on disk' $true ($u8Text -match ([regex]::Escape($actorName)))
+Check 'lib: non-ASCII file has no BOM' $false `
+    (($u8Bytes[0] -eq 0xEF) -and ($u8Bytes[1] -eq 0xBB) -and ($u8Bytes[2] -eq 0xBF))
 
 # `.` in sh chokes on a BOM, and a CR rides into every value it sources.
 $bytes = [System.IO.File]::ReadAllBytes($libFile)
@@ -121,22 +160,28 @@ if ($chmod) {
     [System.IO.File]::WriteAllText($roFile, $seed + "`n", (New-Object System.Text.UTF8Encoding($false)))
     $roBefore = [System.IO.File]::ReadAllText($roFile)
     & $chmod.Source 500 $roDir
-    $probe = Join-Path $roDir '.probe'
-    $writable = $true
-    try { [System.IO.File]::WriteAllText($probe, 'x'); Remove-Item -LiteralPath $probe -Force } catch { $writable = $false }
-    if ($writable) {
-        Write-Host '  skip: directory is writable anyway (running as root?)'
-    } else {
-        $threw = $false
-        try {
-            Write-RogueEnvFile -Path $roFile -Values ([ordered]@{
-                ROGUE_API_KEY = 'should-not-land'; ROGUE_ACTOR_EMAIL = 'e@x.io'; ROGUE_ACTOR_NAME = 'N'
-            }) | Out-Null
-        } catch { $threw = $true }
-        Check 'failed write: reported, not swallowed' $true $threw
-        Check 'failed write: old file intact' $roBefore ([System.IO.File]::ReadAllText($roFile))
+    # finally, not a trailing call: $ErrorActionPreference is 'Stop', so a
+    # terminating error anywhere below would skip the restore and leave the
+    # sandbox undeletable for the run's own cleanup.
+    try {
+        $probe = Join-Path $roDir '.probe'
+        $writable = $true
+        try { [System.IO.File]::WriteAllText($probe, 'x'); Remove-Item -LiteralPath $probe -Force } catch { $writable = $false }
+        if ($writable) {
+            Write-Host '  skip: directory is writable anyway (running as root?)'
+        } else {
+            $threw = $false
+            try {
+                Write-RogueEnvFile -Path $roFile -Values ([ordered]@{
+                    ROGUE_API_KEY = 'should-not-land'; ROGUE_ACTOR_EMAIL = 'e@x.io'; ROGUE_ACTOR_NAME = 'N'
+                }) | Out-Null
+            } catch { $threw = $true }
+            Check 'failed write: reported, not swallowed' $true $threw
+            Check 'failed write: old file intact' $roBefore ([System.IO.File]::ReadAllText($roFile))
+        }
+    } finally {
+        & $chmod.Source 700 $roDir
     }
-    & $chmod.Source 700 $roDir
 } else {
     Write-Host '  skip: chmod not available (failed-write case)'
 }
@@ -177,8 +222,19 @@ Check 'writer: no in-place write of the destination' $false `
     ($libText -match '\[System\.IO\.File\]::WriteAllText\(\$Path')
 Check 'writer: renames a temp into place' $true `
     ($libText -match 'Move-Item -LiteralPath \$tmp -Destination \$Path')
+
+# Structural, because behaviour cannot cover this on Linux: pwsh 7 defaults to
+# UTF-8, so the non-ASCII case above passes there with or without the switch.
+# Only Windows PowerShell 5.1 mangles, and only the wiring check fails on both.
+Check 'writer: reads the env file as UTF-8' $true `
+    ($libText -match 'Get-Content -LiteralPath \$Path -Encoding UTF8')
+
 $installer = Get-Content -Raw -LiteralPath (Join-Path $repo 'install.ps1')
 Check 'install.ps1: merges existing lines' $true ($installer -match 'foreach \(\$line in \(Get-Content -LiteralPath \$EnvFile')
+Check 'install.ps1: reads the merge source as UTF-8' $true `
+    ($installer -match 'Get-Content -LiteralPath \$EnvFile -Encoding UTF8')
+Check 'install.ps1: reads existing creds as UTF-8' $true `
+    ($installer -match 'Get-Content -LiteralPath \$f -Encoding UTF8')
 Check 'install.ps1: no truncating write'   $false ($installer -match 'Set-Content\s+-Path\s+\$EnvFile')
 Check 'install.ps1: renames a temp into place' $true `
     ($installer -match 'Move-Item -LiteralPath \$envTmp -Destination \$EnvFile')
