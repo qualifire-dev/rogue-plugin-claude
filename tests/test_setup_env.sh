@@ -281,6 +281,20 @@ for pass in 1 2; do
   check "non-ASCII preserved line intact (pass $pass)"  "/var/log/café"   "$(sourced "$u8_env" ROGUE_LOG_DIR)"
 done
 
+# ── A CRLF file must not source a carriage return into a value ──────────────
+# grep hands a CR straight through, and sh then sources it INTO the value: a
+# preserved ROGUE_BASE_URL becomes "http://host:8007\r", an unreachable host, on
+# every hook. The PowerShell twin's Get-Content drops line endings already, so a
+# CR left here also splits the two writers' output.
+crlf_env="$SANDBOX/crlf.env"
+printf 'export ROGUE_API_KEY=%s\r\nexport ROGUE_BASE_URL=%s\r\nexport ROGUE_LOG_DIR=%s\r\n' \
+  "'stale'" "'http://localhost:8007'" "'/var/log/rogue'" > "$crlf_env"
+"$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "new-key" ROGUE_ACTOR_EMAIL "e@x.io" ROGUE_ACTOR_NAME "N"' \
+  _ "$REPO/scripts/shared/env-file.sh" "$crlf_env"
+check "crlf: no CR survives the merge" "0"                       "$(tr -cd '\r' < "$crlf_env" | wc -c | tr -d ' ')"
+check "crlf: base url usable"          "http://localhost:8007"   "$(sourced "$crlf_env" ROGUE_BASE_URL)"
+check "crlf: log dir usable"           "/var/log/rogue"          "$(sourced "$crlf_env" ROGUE_LOG_DIR)"
+
 # ── An UNREADABLE existing file must fail the write, not silently drop it ────
 # The preserve filter used to be `grep | grep`, and a pipeline reports only its
 # LAST status: the first grep died with "Permission denied", the second saw empty

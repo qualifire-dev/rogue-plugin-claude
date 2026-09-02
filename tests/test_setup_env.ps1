@@ -235,6 +235,23 @@ Check 'install.ps1: reads the merge source as UTF-8' $true `
     ($installer -match 'Get-Content -LiteralPath \$EnvFile -Encoding UTF8')
 Check 'install.ps1: reads existing creds as UTF-8' $true `
     ($installer -match 'Get-Content -LiteralPath \$f -Encoding UTF8')
+
+# install.ps1 is piped to iex with no plugin tree beside it, so it inlines the
+# dispatcher's shell-word decoder rather than loading it. Stripping the outer
+# quotes is not enough - the writers emit 'O'\''Brien' - and a divergent copy
+# here means the installer and the hooks disagree about one machine's actor name.
+$dispatcher = Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/hook.ps1')
+function Get-NormalizedFunction {
+    param([string]$Text, [string]$Name)
+    $body = [regex]::Match($Text, "(?ms)^function $Name \{.*?^\}").Value
+    $body = [regex]::Replace($body, '(?m)^\s*#.*$', '')      # comments differ on purpose
+    return ([regex]::Replace($body, '\s+', ' ')).Trim()
+}
+Check 'install.ps1: decodes shell quoting, not just the outer quotes' $true `
+    ($installer -match 'ConvertFrom-ShellQuoted \$Matches')
+Check 'install.ps1: shell-word decoder matches the dispatcher' `
+    (Get-NormalizedFunction $dispatcher 'ConvertFrom-ShellQuoted') `
+    (Get-NormalizedFunction $installer  'ConvertFrom-ShellQuoted')
 Check 'install.ps1: no truncating write'   $false ($installer -match 'Set-Content\s+-Path\s+\$EnvFile')
 Check 'install.ps1: renames a temp into place' $true `
     ($installer -match 'Move-Item -LiteralPath \$envTmp -Destination \$EnvFile')
@@ -244,6 +261,10 @@ Check 'install.ps1: renames a temp into place' $true `
 # sight - so lift out the one function that decides that precedence and run it.
 $loadFn = [regex]::Match($installer, '(?ms)^function Load-ExistingCreds \{.*?^\}').Value
 Check 'install.ps1: Load-ExistingCreds located' $true ($loadFn.Length -gt 0)
+# Load-ExistingCreds calls this, so it has to come along.
+$unquoteFn = [regex]::Match($installer, '(?ms)^function ConvertFrom-ShellQuoted \{.*?^\}').Value
+Check 'install.ps1: ConvertFrom-ShellQuoted located' $true ($unquoteFn.Length -gt 0)
+. ([scriptblock]::Create($unquoteFn))
 . ([scriptblock]::Create($loadFn))
 
 $ROGUE_BASE_URL_DEFAULT = 'https://api.rogue.security'
@@ -268,6 +289,44 @@ Check 'install.ps1: explicit custom url wins' 'https://staging.example.com' `
 # machine pinned to a staging host could never be moved back.
 Check 'install.ps1: explicit default clears the stale custom url' $ROGUE_BASE_URL_DEFAULT `
     (Resolve-BaseUrl $ROGUE_BASE_URL_DEFAULT $true)
+
+# -- A value with an apostrophe must survive load -> write -> load -------------
+# The writers emit POSIX single-quoted values, so O'Brien is stored as
+# 'O'\''Brien'. Load-ExistingCreds used to strip only the outer quotes and hand
+# back the literal O'\''Brien, which the next write re-quoted - and auto-update
+# re-runs this installer unattended every 24h, so the escaping compounded with no
+# user action. An Enter-to-keep flow reaches the same place by hand.
+$apos = "O'Brien"
+$aposFile = Join-Path $sandbox '.rogue-env'
+[System.IO.File]::WriteAllText($aposFile, (@(
+    "export ROGUE_API_KEY='k'",
+    "export ROGUE_ACTOR_EMAIL='o@example.com'",
+    "export ROGUE_ACTOR_NAME='O'\''Brien'"
+) -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+
+$script:ApiKey = ''; $script:Email = ''; $script:Name = ''
+$script:BaseUrl = $ROGUE_BASE_URL_DEFAULT; $script:BaseUrlExplicit = $false
+Load-ExistingCreds
+Check 'install.ps1: apostrophe decoded on load' $apos $script:Name
+
+# Now write it back the way the installer does, and load it once more: a value
+# that survives one cycle but grows on the next is the actual failure mode.
+Write-RogueEnvFile -Path $aposFile -Values ([ordered]@{
+    ROGUE_API_KEY     = $script:ApiKey
+    ROGUE_ACTOR_EMAIL = $script:Email
+    ROGUE_ACTOR_NAME  = $script:Name
+}) | Out-Null
+$script:Name = ''
+Load-ExistingCreds
+Check 'install.ps1: apostrophe survives a rewrite' $apos $script:Name
+Check 'install.ps1: apostrophe not re-escaped on disk' "export ROGUE_ACTOR_NAME='O'\''Brien'" `
+    (@(Get-Content -LiteralPath $aposFile -Encoding UTF8 |
+       Where-Object { $_ -match '^export ROGUE_ACTOR_NAME=' })[0])
+# sh is the other half of the fleet: it must read back the same value.
+if ($bashForApos = Get-Command bash -ErrorAction SilentlyContinue) {
+    $viaSh = & $bashForApos.Source -c ". `"$aposFile`"; printf %s `"`$ROGUE_ACTOR_NAME`""
+    Check 'install.ps1: apostrophe reads the same under sh' $apos $viaSh
+}
 $env:USERPROFILE = $saveProfile
 
 # -- The sh and PowerShell writers must produce the SAME file ------------------

@@ -138,6 +138,45 @@ if ($hasClaude -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
     Die "git not found. Install Git for Windows (https://git-scm.com/download/win) first."
 }
 
+# Decode one shell "word" the way sh does when it sources the env file. Inlined
+# from the dispatchers' ConvertFrom-ShellQuoted (this script is piped to iex with
+# no plugin tree beside it) - keep the two in step.
+#
+# Stripping the outer quotes is not enough: the writers emit POSIX single-quoted
+# values, so O'Brien is stored as 'O'\''Brien' and a naive strip yields the
+# literal O'\''Brien. That value then gets re-quoted on the next write, and
+# auto-update re-runs this installer unattended every 24h, so the escaping
+# compounds on its own. install.sh has no such bug - it sources the file.
+function ConvertFrom-ShellQuoted {
+    param([string]$Val)
+    if ($null -eq $Val) { return $Val }
+    $sb = [System.Text.StringBuilder]::new()
+    $i = 0; $n = $Val.Length
+    $state = 'normal'   # normal | single | double
+    while ($i -lt $n) {
+        $c = $Val[$i]
+        switch ($state) {
+            'single' {
+                if ($c -eq "'") { $state = 'normal' } else { [void]$sb.Append($c) }
+            }
+            'double' {
+                if ($c -eq '"') { $state = 'normal' }
+                elseif ($c -eq '\' -and ($i + 1) -lt $n -and ('"\$`'.IndexOf($Val[$i+1]) -ge 0)) {
+                    [void]$sb.Append($Val[$i+1]); $i++
+                } else { [void]$sb.Append($c) }
+            }
+            default {
+                if ($c -eq "'") { $state = 'single' }
+                elseif ($c -eq '"') { $state = 'double' }
+                elseif ($c -eq '\' -and ($i + 1) -lt $n) { [void]$sb.Append($Val[$i+1]); $i++ }
+                else { [void]$sb.Append($c) }
+            }
+        }
+        $i++
+    }
+    return $sb.ToString()
+}
+
 # Load existing creds from disk (same priority as the dispatcher: later wins).
 function Load-ExistingCreds {
     foreach ($f in @('C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
@@ -147,7 +186,7 @@ function Load-ExistingCreds {
         foreach ($line in (Get-Content -LiteralPath $f -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
                 $k = $Matches[1]
-                $v = $Matches[2].Trim() -replace "^'(.*)'$", '$1' -replace '^"(.*)"$', '$1'
+                $v = ConvertFrom-ShellQuoted $Matches[2].Trim()
                 switch ($k) {
                     'ROGUE_API_KEY'     { if (-not $script:ApiKey)  { $script:ApiKey  = $v } }
                     'ROGUE_ACTOR_EMAIL' { if (-not $script:Email)   { $script:Email   = $v } }

@@ -352,6 +352,23 @@ write).
   disk. `tests/test_setup_env.sh` pins it against both sh writers with a mode-000
   file (skipped under root, which reads it anyway); the Jamf script in the MDM docs
   carries the same helper and the same rule.
+- **The preserve filter STRIPS a trailing CR, and is captured into a variable
+  rather than piped.** `grep` hands a CRLF file's CR straight through, and sh then
+  sources it *into* the value — a preserved `ROGUE_BASE_URL` becomes
+  `http://host:8007\r`, an unreachable host on every hook. The PowerShell twin's
+  `Get-Content` drops line endings already, so a CR left on the sh side also splits
+  the two writers' output, which is the byte-identity `tests/test_setup_env.ps1`
+  asserts. The capture matters as much as the strip: piping grep into `tr` would
+  put grep's status behind the pipeline again and re-open the masking bug above.
+- **`install.ps1` decodes values with the dispatchers' `ConvertFrom-ShellQuoted`,
+  not an outer-quote strip.** The writers emit POSIX single-quoted values, so
+  `O'Brien` is stored as `'O'\''Brien'`; stripping only the outer quotes yields the
+  literal `O'\''Brien`, which the next write re-quotes — and `auto-update` re-runs
+  the installer unattended every 24h, so the escaping compounds with no user
+  action (measured: one cycle turns it into `O'\''\'\'''\''Brien`). The function is
+  inlined because `install.ps1` is piped to `iex` with no plugin tree beside it, so
+  a test pins it against `plugins/rogue/scripts/hook.ps1`'s copy. `install.sh` has
+  no such bug — it `source`s the file and lets sh do the unquoting.
 - **Every PowerShell read of the file passes `-Encoding UTF8`.** We write it
   BOM-less, and Windows PowerShell 5.1 decodes a BOM-less file as the ANSI code
   page by default — so a merge read back a non-ASCII actor name or preserved line
@@ -363,7 +380,7 @@ write).
   same trap and the test would be measuring itself). The reader-side dispatchers
   (`hook.ps1`, `heartbeat.ps1`, `ship-logs.ps1`) still use a bare `Get-Content` —
   there a mangled value costs one request rather than the file, but it is the same
-  bug.
+  bug, tracked as issue #46.
 - **On Windows the ACL goes on the TEMP file, before the rename**, so the API key
   is never briefly readable at the real path. `Write-RogueEnvFile -RequireProtection`
   (codex, copilot, antigravity — the three that treat protection as fatal) then

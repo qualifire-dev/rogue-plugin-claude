@@ -553,13 +553,20 @@ env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # Captured off an || so `set -e` cannot abort on the harmless 1. ONE grep, both
 # patterns as -e: a pipeline reports only its LAST status, so a `grep | grep`
 # hides an unreadable env file behind the second grep's empty-input exit 1.
+# Captured into a variable rather than piped, so the status checked below is
+# grep's own and the CR strip cannot mask it the way the second grep used to.
 env_preserved() {
   local rc=0
-  grep -Ev \
+  local kept
+  kept="$(grep -Ev \
     -e "^[[:space:]]*(export[[:space:]]+)?($1)[[:space:]]*=" \
     -e '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
-    "$ENV_FILE" || rc=$?
-  [ "$rc" -le 1 ]
+    "$ENV_FILE")" || rc=$?
+  [ "$rc" -le 1 ] || return 1
+  # A CRLF file would otherwise keep its CR, and sh sources the CR into the value -
+  # ROGUE_BASE_URL becomes an unreachable host. The PowerShell writer already drops
+  # line endings, so leaving it also splits the two writers' output.
+  [ -z "$kept" ] || printf '%s\n' "$kept" | tr -d '\r'
 }
 
 write_env_file() {

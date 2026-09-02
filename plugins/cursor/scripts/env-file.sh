@@ -20,13 +20,21 @@ rogue_env_quote() {
 # ONE grep, both patterns as -e: a pipeline reports only its LAST status, so a
 # `grep | grep` hides an unreadable env file behind the second grep's empty-input
 # exit 1 and the writer then drops every unmanaged key.
+# Captured into a variable rather than piped, so the status checked below is
+# grep's own and the CR strip cannot mask it the way the second grep used to.
 rogue_env_preserved() { # <env-file> <key1|key2|...>
   _rogue_env_rc=0
-  grep -Ev \
+  _rogue_env_kept="$(grep -Ev \
     -e "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" \
     -e '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
-    "$1" || _rogue_env_rc=$?
-  [ "$_rogue_env_rc" -le 1 ]
+    "$1")" || _rogue_env_rc=$?
+  [ "$_rogue_env_rc" -le 1 ] || return 1
+
+  # A CRLF file - Notepad, an MDM script - hands its CR straight through grep, and
+  # sh sources it INTO the value: ROGUE_BASE_URL becomes an unreachable host with a
+  # carriage return glued to the port. The PowerShell twin's Get-Content drops line
+  # endings already, so keeping it here also splits the two writers' output.
+  [ -z "$_rogue_env_kept" ] || printf '%s\n' "$_rogue_env_kept" | tr -d '\r'
 }
 
 # rogue_write_env_file <env-file> <key> <value> [<key> <value> ...]
