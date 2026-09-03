@@ -72,9 +72,6 @@ $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $en
 if (-not $ApiKey)     { $ApiKey     = $env:ROGUE_API_KEY }
 if (-not $Email)      { $Email      = $env:ROGUE_ACTOR_EMAIL }
 if (-not $Name)       { $Name       = $env:ROGUE_ACTOR_NAME }
-# Whether the caller SAID a base URL, not whether the value happens to differ
-# from the default: -BaseUrl https://api.rogue.security is how a machine with a
-# stale self-hosted URL on disk gets moved back to SaaS.
 $BaseUrlExplicit = [bool]$BaseUrl -or [bool]$env:ROGUE_BASE_URL
 if (-not $BaseUrl)    { $BaseUrl    = if ($env:ROGUE_BASE_URL) { $env:ROGUE_BASE_URL } else { $ROGUE_BASE_URL_DEFAULT } }
 if (-not $PluginRepo) { $PluginRepo = if ($env:ROGUE_PLUGIN_REPO) { $env:ROGUE_PLUGIN_REPO } else { 'qualifire-dev/rogue-plugins' } }
@@ -138,15 +135,6 @@ if ($hasClaude -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
     Die "git not found. Install Git for Windows (https://git-scm.com/download/win) first."
 }
 
-# Decode one shell "word" the way sh does when it sources the env file. Inlined
-# from the dispatchers' ConvertFrom-ShellQuoted (this script is piped to iex with
-# no plugin tree beside it) - keep the two in step.
-#
-# Stripping the outer quotes is not enough: the writers emit POSIX single-quoted
-# values, so O'Brien is stored as 'O'\''Brien' and a naive strip yields the
-# literal O'\''Brien. That value then gets re-quoted on the next write, and
-# auto-update re-runs this installer unattended every 24h, so the escaping
-# compounds on its own. install.sh has no such bug - it sources the file.
 function ConvertFrom-ShellQuoted {
     param([string]$Val)
     if ($null -eq $Val) { return $Val }
@@ -181,8 +169,6 @@ function ConvertFrom-ShellQuoted {
 function Load-ExistingCreds {
     foreach ($f in @('C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
         if (-not (Test-Path -LiteralPath $f)) { continue }
-        # -Encoding UTF8: the file is written BOM-less, and 5.1 would otherwise
-        # decode it as the ANSI code page and mangle a non-ASCII actor name.
         foreach ($line in (Get-Content -LiteralPath $f -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
                 $k = $Matches[1]
@@ -255,10 +241,6 @@ if ($ApiKey) {
         }
     }
 
-    # Write %USERPROFILE%\.rogue-env. Same MERGE semantics as
-    # scripts/shared/env-file.ps1, inlined because this script is piped to iex on
-    # its own - keep the two in step. Merging matters most here: auto-update
-    # re-runs the installer unattended every 24h.
     function Format-EnvVal { param([string]$Val) return "'" + $Val.Replace("'", "'\''") + "'" }
     $managed = @('ROGUE_API_KEY', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME', 'ROGUE_BASE_URL')
     $envLines = @(
@@ -268,12 +250,10 @@ if ($ApiKey) {
         "export ROGUE_ACTOR_EMAIL=$(Format-EnvVal $Email)",
         "export ROGUE_ACTOR_NAME=$(Format-EnvVal $Name)"
     )
-    # Writing the default would bake today's hostname into every install.
     if ($BaseUrl -ne $ROGUE_BASE_URL_DEFAULT) { $envLines += "export ROGUE_BASE_URL=$(Format-EnvVal $BaseUrl)" }
     if (Test-Path -LiteralPath $EnvFile) {
         $owned = '^\s*(?:export\s+)?(?:' + ($managed -join '|') + ')\s*='
         $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-        # -Encoding UTF8: see Load-ExistingCreds - 5.1 reads BOM-less as ANSI.
         foreach ($line in (Get-Content -LiteralPath $EnvFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match $owned -or $line -match $header) { continue }
             $envLines += $line
@@ -281,10 +261,6 @@ if ($ApiKey) {
     }
     $envDir = Split-Path $EnvFile
     if ($envDir -and -not (Test-Path $envDir)) { New-Item -ItemType Directory -Path $envDir -Force | Out-Null }
-    # Temp then rename, like install.sh: a failed or interrupted write must not
-    # truncate a file six plugins read. The ACL lands on the temp, so the key is
-    # never briefly readable at the real path.
-    # BOM-less UTF-8 with LF - the same bytes install.sh writes.
     $envTmp = "$EnvFile.rogue-tmp.$PID"
     try {
         [System.IO.File]::WriteAllText($envTmp, (($envLines -join "`n") + "`n"),

@@ -106,7 +106,6 @@ jobs:
           TEST_SH=sh bash tests/test_auto_update_sh.sh
           TEST_SH=dash bash tests/test_auto_update_sh.sh
           bash tests/test_gitignore_bundles.sh
-          # Both shells: the library the writers source is POSIX-clean (no %q).
           TEST_SH=dash bash tests/test_setup_env.sh
           TEST_SH=bash bash tests/test_setup_env.sh
       - name: Command and skill snippets parse

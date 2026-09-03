@@ -13,8 +13,6 @@ $ErrorActionPreference = 'Stop'
 
 $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $env:USERPROFILE '.rogue-env' }
 
-# Merges: replaces these keys, keeps a pinned ROGUE_BASE_URL and friends. Loaded
-# as a scriptblock so ExecutionPolicy never applies.
 . ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'env-file.ps1'))))
 
 $restricted = Write-RogueEnvFile -Path $EnvFile -Values ([ordered]@{

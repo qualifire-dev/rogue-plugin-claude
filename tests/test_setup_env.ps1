@@ -1,10 +1,3 @@
-# The ~/.rogue-env writers must MERGE, not truncate - the PowerShell half, and
-# the twin of tests/test_setup_env.sh, which it must agree with case for case.
-#
-# Runs anywhere pwsh runs, including Linux CI. Windows PowerShell 5.1 must also
-# pass; keep the syntax 5.1-clean.
-#
-#   pwsh -File tests/test_setup_env.ps1
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
@@ -19,7 +12,6 @@ function Check {
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("rogue-envps-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
 
-# Managed keys stale, plus what a machine might have added itself.
 $seed = @(
     '# Managed by the rogue Claude plugin. Read by hook subprocesses at runtime.',
     '# Delete this file to revoke credentials.',
@@ -40,9 +32,6 @@ function New-SeededFile {
     return $path
 }
 
-# -Encoding UTF8 on every read here too: on Windows PowerShell 5.1 a bare
-# Get-Content decodes our BOM-less UTF-8 as the ANSI code page, so a test that
-# read back a mangled value would agree with a writer that mangled it.
 function Get-EnvValue {
     param([string]$Path, [string]$Key)
     foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
@@ -58,7 +47,6 @@ function Count-Matching {
     return @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_ -match $Pattern }).Count
 }
 
-# -- The shared library the five setup.ps1 helpers load -----------------------
 . ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/env-file.ps1'))))
 
 $libFile = New-SeededFile 'lib.env'
@@ -75,11 +63,8 @@ Check 'lib: log dir kept'          '/var/log/rogue'        (Get-EnvValue $libFil
 Check 'lib: beacon interval kept'  '60'                    (Get-EnvValue $libFile 'ROGUE_HEARTBEAT_MIN_INTERVAL')
 Check 'lib: user comment kept'     1  (Count-Matching $libFile '^# our self-hosted API$')
 Check 'lib: one api key line'      1  (Count-Matching $libFile '^export ROGUE_API_KEY=')
-# Re-emitted per write; the old one must not accumulate.
 Check 'lib: one header line'       1  (Count-Matching $libFile 'Read by hook subprocesses')
 
-# sh sources this file on the other half of the fleet, where an unescaped quote
-# swallows the rest of it.
 $quoteFile = New-SeededFile 'quote.env'
 Write-RogueEnvFile -Path $quoteFile -Values ([ordered]@{
     ROGUE_API_KEY     = "key'with'quotes"
@@ -89,14 +74,6 @@ Write-RogueEnvFile -Path $quoteFile -Values ([ordered]@{
 Check 'lib: quoted value escaped' "export ROGUE_API_KEY='key'\''with'\''quotes'" `
     (@(Get-Content -LiteralPath $quoteFile -Encoding UTF8 | Where-Object { $_ -match '^export ROGUE_API_KEY=' })[0])
 
-# Non-ASCII must survive a merge. We write BOM-less UTF-8; Windows PowerShell 5.1
-# decodes a BOM-less file as the ANSI code page unless told otherwise, so a bare
-# Get-Content in the writer would read the preserved lines back mangled and then
-# write the mangled bytes out - corruption that compounds on every later merge.
-#
-# The literals are built from code points rather than typed in: this .ps1 is
-# itself BOM-less UTF-8, so under 5.1 a literal non-ASCII character in the source
-# would hit the same decoding trap and the test would be measuring itself.
 $eacute = [string][char]0x00E9
 $uuml   = [string][char]0x00FC
 $actorName = 'Jos' + $eacute + ' M' + $uuml + 'ller'
@@ -117,24 +94,16 @@ foreach ($pass in 1, 2) {
     Check "lib: non-ASCII actor name round-trips (pass $pass)" $actorName (Get-EnvValue $u8File 'ROGUE_ACTOR_NAME')
     Check "lib: non-ASCII preserved line intact (pass $pass)"  $keptDir   (Get-EnvValue $u8File 'ROGUE_LOG_DIR')
 }
-# The bytes on disk, independent of any Get-Content: mangling shows up as the
-# ANSI round trip of the code point, not as the code point itself.
 $u8Bytes = [System.IO.File]::ReadAllBytes($u8File)
 $u8Text  = [System.Text.Encoding]::UTF8.GetString($u8Bytes)
 Check 'lib: non-ASCII stored as UTF-8 on disk' $true ($u8Text -match ([regex]::Escape($actorName)))
 Check 'lib: non-ASCII file has no BOM' $false `
     (($u8Bytes[0] -eq 0xEF) -and ($u8Bytes[1] -eq 0xBB) -and ($u8Bytes[2] -eq 0xBF))
 
-# `.` in sh chokes on a BOM, and a CR rides into every value it sources.
 $bytes = [System.IO.File]::ReadAllBytes($libFile)
 Check 'lib: no UTF-8 BOM' $false (($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF))
 Check 'lib: no CR bytes'  $false ($bytes -contains 13)
 
-# -- -RequireProtection: no ACL, no replacement -------------------------------
-# The three plugins that treat protection as fatal used to write the file and
-# then delete it, which took the settings the other five pin in it as well. Now
-# the ACL goes on the temp file and a failure abandons the temp instead. Every
-# non-Windows run exercises the failure branch (Get-Acl is unsupported there).
 $reqFile = New-SeededFile 'require-protection.env'
 $reqBefore = [System.IO.File]::ReadAllText($reqFile)
 $reqOk = Write-RogueEnvFile -Path $reqFile -RequireProtection -Values ([ordered]@{
@@ -150,8 +119,6 @@ if ($reqOk) {
 Check 'require-protection: no temp left behind' 0 `
     (@(Get-ChildItem -LiteralPath $sandbox -Filter '*.rogue-tmp.*' -Force).Count)
 
-# A failed write must not truncate the file either. A read-only directory is what
-# a full disk looks like from here; root ignores the mode bits, hence the probe.
 $chmod = Get-Command chmod -ErrorAction SilentlyContinue
 if ($chmod) {
     $roDir = Join-Path $sandbox 'readonly'
@@ -160,9 +127,6 @@ if ($chmod) {
     [System.IO.File]::WriteAllText($roFile, $seed + "`n", (New-Object System.Text.UTF8Encoding($false)))
     $roBefore = [System.IO.File]::ReadAllText($roFile)
     & $chmod.Source 500 $roDir
-    # finally, not a trailing call: $ErrorActionPreference is 'Stop', so a
-    # terminating error anywhere below would skip the restore and leave the
-    # sandbox undeletable for the run's own cleanup.
     try {
         $probe = Join-Path $roDir '.probe'
         $writable = $true
@@ -186,10 +150,6 @@ if ($chmod) {
     Write-Host '  skip: chmod not available (failed-write case)'
 }
 
-# -- The two best-effort setup.ps1 helpers, end to end ------------------------
-# Only these two: the other three pass -RequireProtection and fail without
-# writing when the ACL cannot be applied, i.e. every non-Windows run. They are
-# wired-checked below.
 $saveEnvFile = $env:ROGUE_ENV_FILE
 foreach ($plugin in @('rogue', 'cursor')) {
     $path = New-SeededFile "$plugin.env"
@@ -203,12 +163,10 @@ foreach ($plugin in @('rogue', 'cursor')) {
 }
 $env:ROGUE_ENV_FILE = $saveEnvFile
 
-# -- Wiring: no writer may go back to truncating -------------------------------
 foreach ($plugin in @('rogue', 'codex', 'cursor', 'copilot', 'antigravity')) {
     $text = Get-Content -Raw -LiteralPath (Join-Path $repo "plugins/$plugin/scripts/setup.ps1")
     Check "${plugin}: uses the shared writer" $true ($text -match 'Write-RogueEnvFile')
     Check "${plugin}: does not rewrite the file itself" $false ($text -match 'Set-Content\s+-Path\s+\$EnvFile')
-    # The file now holds five other plugins' settings: no caller may delete it.
     Check "${plugin}: never deletes the env file" $false ($text -match 'Remove-Item -LiteralPath \$EnvFile')
 }
 foreach ($plugin in @('codex', 'copilot', 'antigravity')) {
@@ -216,16 +174,12 @@ foreach ($plugin in @('codex', 'copilot', 'antigravity')) {
     Check "${plugin}: requires protection before replacing" $true ($text -match '-RequireProtection')
 }
 
-# The destination is only ever reached by renaming a fully written temp file.
 $libText = Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/env-file.ps1')
 Check 'writer: no in-place write of the destination' $false `
     ($libText -match '\[System\.IO\.File\]::WriteAllText\(\$Path')
 Check 'writer: renames a temp into place' $true `
     ($libText -match 'Move-Item -LiteralPath \$tmp -Destination \$Path')
 
-# Structural, because behaviour cannot cover this on Linux: pwsh 7 defaults to
-# UTF-8, so the non-ASCII case above passes there with or without the switch.
-# Only Windows PowerShell 5.1 mangles, and only the wiring check fails on both.
 Check 'writer: reads the env file as UTF-8' $true `
     ($libText -match 'Get-Content -LiteralPath \$Path -Encoding UTF8')
 
@@ -236,10 +190,6 @@ Check 'install.ps1: reads the merge source as UTF-8' $true `
 Check 'install.ps1: reads existing creds as UTF-8' $true `
     ($installer -match 'Get-Content -LiteralPath \$f -Encoding UTF8')
 
-# install.ps1 is piped to iex with no plugin tree beside it, so it inlines the
-# dispatcher's shell-word decoder rather than loading it. Stripping the outer
-# quotes is not enough - the writers emit 'O'\''Brien' - and a divergent copy
-# here means the installer and the hooks disagree about one machine's actor name.
 $dispatcher = Get-Content -Raw -LiteralPath (Join-Path $repo 'plugins/rogue/scripts/hook.ps1')
 function Get-NormalizedFunction {
     param([string]$Text, [string]$Name)
@@ -256,12 +206,8 @@ Check 'install.ps1: no truncating write'   $false ($installer -match 'Set-Conten
 Check 'install.ps1: renames a temp into place' $true `
     ($installer -match 'Move-Item -LiteralPath \$envTmp -Destination \$EnvFile')
 
-# -- install.ps1: an explicit base URL must beat the one already on disk -------
-# install.ps1 has no lib-only seam - it is a top-level script that installs on
-# sight - so lift out the one function that decides that precedence and run it.
 $loadFn = [regex]::Match($installer, '(?ms)^function Load-ExistingCreds \{.*?^\}').Value
 Check 'install.ps1: Load-ExistingCreds located' $true ($loadFn.Length -gt 0)
-# Load-ExistingCreds calls this, so it has to come along.
 $unquoteFn = [regex]::Match($installer, '(?ms)^function ConvertFrom-ShellQuoted \{.*?^\}').Value
 Check 'install.ps1: ConvertFrom-ShellQuoted located' $true ($unquoteFn.Length -gt 0)
 . ([scriptblock]::Create($unquoteFn))
@@ -285,17 +231,9 @@ Check 'install.ps1: silent run takes the on-disk url' 'http://localhost:8007' `
     (Resolve-BaseUrl $ROGUE_BASE_URL_DEFAULT $false)
 Check 'install.ps1: explicit custom url wins' 'https://staging.example.com' `
     (Resolve-BaseUrl 'https://staging.example.com' $true)
-# The regression: an explicit SaaS url used to read as "not given" and lose, so a
-# machine pinned to a staging host could never be moved back.
 Check 'install.ps1: explicit default clears the stale custom url' $ROGUE_BASE_URL_DEFAULT `
     (Resolve-BaseUrl $ROGUE_BASE_URL_DEFAULT $true)
 
-# -- A value with an apostrophe must survive load -> write -> load -------------
-# The writers emit POSIX single-quoted values, so O'Brien is stored as
-# 'O'\''Brien'. Load-ExistingCreds used to strip only the outer quotes and hand
-# back the literal O'\''Brien, which the next write re-quoted - and auto-update
-# re-runs this installer unattended every 24h, so the escaping compounded with no
-# user action. An Enter-to-keep flow reaches the same place by hand.
 $apos = "O'Brien"
 $aposFile = Join-Path $sandbox '.rogue-env'
 [System.IO.File]::WriteAllText($aposFile, (@(
@@ -309,8 +247,6 @@ $script:BaseUrl = $ROGUE_BASE_URL_DEFAULT; $script:BaseUrlExplicit = $false
 Load-ExistingCreds
 Check 'install.ps1: apostrophe decoded on load' $apos $script:Name
 
-# Now write it back the way the installer does, and load it once more: a value
-# that survives one cycle but grows on the next is the actual failure mode.
 Write-RogueEnvFile -Path $aposFile -Values ([ordered]@{
     ROGUE_API_KEY     = $script:ApiKey
     ROGUE_ACTOR_EMAIL = $script:Email
@@ -322,11 +258,6 @@ Check 'install.ps1: apostrophe survives a rewrite' $apos $script:Name
 Check 'install.ps1: apostrophe not re-escaped on disk' "export ROGUE_ACTOR_NAME='O'\''Brien'" `
     (@(Get-Content -LiteralPath $aposFile -Encoding UTF8 |
        Where-Object { $_ -match '^export ROGUE_ACTOR_NAME=' })[0])
-# sh is the other half of the fleet: it must read back the same value. POSIX
-# paths only - under Git Bash this sandbox path is C:\Users\..., whose
-# backslashes bash eats as escapes, so the source silently reads nothing. The
-# path goes through the environment rather than the -c string for the same
-# reason. tests/test_setup_env.sh covers the sh side natively on this platform.
 $bashForApos = Get-Command bash -ErrorAction SilentlyContinue
 if ($bashForApos -and -not $env:OS) {
     $env:ROGUE_APOS_FILE = $aposFile
@@ -336,7 +267,6 @@ if ($bashForApos -and -not $env:OS) {
 }
 $env:USERPROFILE = $saveProfile
 
-# -- The sh and PowerShell writers must produce the SAME file ------------------
 $bash = Get-Command bash -ErrorAction SilentlyContinue
 if ($bash) {
     $shFile = New-SeededFile 'cmp-sh.env'

@@ -138,16 +138,9 @@ function Invoke-ProductScript {
         -NoNewWindow -PassThru -Wait
 }
 
-# setup.ps1 is the one product script NOT loaded as a scriptblock: every /rogue:setup
-# doc runs it with -File or `& <path>`, and it dot-sources its sibling env-file.ps1
-# off $PSScriptRoot - which a scriptblock leaves empty ($PSCommandPath too, so the
-# script cannot self-locate its way out of it). Loading it the hooks.json way would
-# test a shape that does not exist.
 function Invoke-SetupScript {
     param([string]$RelativePath, [string[]]$Arguments)
     $path = Join-Path $repo $RelativePath
-    # Quoted per element: an actor name legitimately contains a space, and
-    # Start-Process joins -ArgumentList on spaces without quoting anything itself.
     $quoted = $Arguments | ForEach-Object { '"' + $_ + '"' }
     return Start-Process -FilePath 'powershell' `
         -ArgumentList (@('-NoProfile', '-NonInteractive', '-File', ('"' + $path + '"')) + $quoted) `

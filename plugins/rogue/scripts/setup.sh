@@ -17,7 +17,6 @@ ACTOR_NAME="${3:-}"
 
 ENV_FILE="${ROGUE_ENV_FILE:-$HOME/.rogue-env}"
 
-# Merges: replaces these keys, keeps a pinned ROGUE_BASE_URL and friends.
 . "$(dirname "$0")/env-file.sh"
 rogue_write_env_file "$ENV_FILE" \
   ROGUE_API_KEY "$API_KEY" \

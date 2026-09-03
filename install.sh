@@ -49,9 +49,6 @@ set -u
 # ── Config ──────────────────────────────────────────────────────────────────
 ROGUE_PLUGIN_REPO="${ROGUE_PLUGIN_REPO:-qualifire-dev/rogue-plugins}"
 ROGUE_BASE_URL_DEFAULT="https://api.rogue.security"
-# Whether the caller SAID a base URL, not whether the value happens to differ
-# from the default: `--base-url https://api.rogue.security` is how a machine
-# with a stale self-hosted URL on disk gets moved back to SaaS.
 BASE_URL_EXPLICIT=0
 [ -z "${ROGUE_BASE_URL:-}" ] || BASE_URL_EXPLICIT=1
 ROGUE_BASE_URL="${ROGUE_BASE_URL:-$ROGUE_BASE_URL_DEFAULT}"
@@ -464,8 +461,6 @@ configure_credentials() {
   [ -r /etc/rogue/env ] && . /etc/rogue/env
   [ -r "$ENV_FILE" ]    && . "$ENV_FILE"
 
-  # On-disk beats the default; an explicit --base-url beats both, INCLUDING when
-  # it is the default value - that is the only way to clear a stale custom URL.
   [ "$BASE_URL_EXPLICIT" = "1" ] && ROGUE_BASE_URL="$flag_base_url"
 
   local cur_key="${flag_key:-${ROGUE_API_KEY:-}}"
@@ -542,19 +537,8 @@ configure_credentials() {
   write_env_file
 }
 
-# Write ~/.rogue-env (mode 600). Same MERGE semantics as
-# scripts/shared/env-file.sh, inlined because this script is piped to bash on its
-# own - keep the two in step. Merging matters most here: auto-update re-runs the
-# installer unattended every 24h.
 env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-# Lines we do not own, minus our own header (re-emitted per write). grep exits 1
-# when nothing is left to keep - not a failure; 2 is, and must not be masked.
-# Captured off an || so `set -e` cannot abort on the harmless 1. ONE grep, both
-# patterns as -e: a pipeline reports only its LAST status, so a `grep | grep`
-# hides an unreadable env file behind the second grep's empty-input exit 1.
-# Captured into a variable rather than piped, so the status checked below is
-# grep's own and the CR strip cannot mask it the way the second grep used to.
 env_preserved() {
   local rc=0
   local kept
@@ -563,17 +547,12 @@ env_preserved() {
     -e '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
     "$ENV_FILE")" || rc=$?
   [ "$rc" -le 1 ] || return 1
-  # A CRLF file would otherwise keep its CR, and sh sources the CR into the value -
-  # ROGUE_BASE_URL becomes an unreachable host. The PowerShell writer already drops
-  # line endings, so leaving it also splits the two writers' output.
   [ -z "$kept" ] || printf '%s\n' "$kept" | tr -d '\r'
 }
 
 write_env_file() {
   local keys="ROGUE_API_KEY|ROGUE_ACTOR_EMAIL|ROGUE_ACTOR_NAME|ROGUE_BASE_URL"
   local tmp="$ENV_FILE.rogue-tmp.$$"
-  # Every emit is && chained: a partial write must fail the group rather than be
-  # swallowed and then mv'd over the credential file it was meant to update.
   (
     umask 077
     {
@@ -582,7 +561,6 @@ write_env_file() {
       printf 'export ROGUE_API_KEY=%s\n' "$(env_quote "$ROGUE_API_KEY")" &&
       printf 'export ROGUE_ACTOR_EMAIL=%s\n' "$(env_quote "$ROGUE_ACTOR_EMAIL")" &&
       printf 'export ROGUE_ACTOR_NAME=%s\n' "$(env_quote "$ROGUE_ACTOR_NAME")" &&
-      # Writing the default would bake today's hostname into every install.
       { [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] ||
         printf 'export ROGUE_BASE_URL=%s\n' "$(env_quote "$ROGUE_BASE_URL")"; } &&
       { [ ! -f "$ENV_FILE" ] || env_preserved "$keys"; }
@@ -818,5 +796,4 @@ main() {
   note "Open a new session in each agent, then run ${C_DIM}/rogue:status${C_RESET} to verify."
 }
 
-# Set only by tests/test_setup_env.sh, to source the writer without installing.
 [ -n "${ROGUE_INSTALL_LIB_ONLY:-}" ] || main "$@"

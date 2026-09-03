@@ -23,7 +23,6 @@ if (!apiKey) {
 const HOME = os.homedir() || process.env.HOME || process.env.USERPROFILE || ".";
 const ENV_FILE = process.env.ROGUE_ENV_FILE || path.join(HOME, ".rogue-env");
 
-// POSIX single-quote: the other plugins source this file with `sh`.
 const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
 const MANAGED = {
@@ -32,7 +31,6 @@ const MANAGED = {
   ROGUE_ACTOR_NAME: actorName,
 };
 
-// Merges, and must produce the same bytes as scripts/shared/env-file.sh.
 const HEADER = [
   "# Managed by the Rogue plugins. Read by hook subprocesses at runtime.",
   "# Delete this file to revoke credentials.",
@@ -47,32 +45,23 @@ try {
     .split(/\r?\n/)
     .filter((line, index, all) => !(index === all.length - 1 && line === ""))
     .filter((line) => !OWNED.test(line) && !OWN_HEADER.test(line));
-} catch {
-  /* No file yet: nothing to preserve. */
-}
+} catch {}
 
 const contents =
   [...HEADER, ...Object.entries(MANAGED).map(([k, v]) => `export ${k}=${q(v)}`), ...preserved]
     .join("\n") + "\n";
 
-// Temp then rename, like the sh and PowerShell writers: a failed or interrupted
-// write must not truncate a file five other plugins read. mode 0o600 on create;
-// chmod again in case an old umask or a pre-existing temp left it wider.
 const TMP = `${ENV_FILE}.rogue-tmp.${process.pid}`;
 try {
   fs.writeFileSync(TMP, contents, { mode: 0o600 });
   try {
     fs.chmodSync(TMP, 0o600);
-  } catch {
-    /* Windows: POSIX mode bits are best-effort; the file lands under the user profile. */
-  }
+  } catch {}
   fs.renameSync(TMP, ENV_FILE);
 } catch (err) {
   try {
     fs.unlinkSync(TMP);
-  } catch {
-    /* Nothing to clean up. */
-  }
+  } catch {}
   process.stderr.write(`Could not write ${ENV_FILE}: ${err.message}\n`);
   process.exit(1);
 }

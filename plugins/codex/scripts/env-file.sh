@@ -1,28 +1,10 @@
 #!/usr/bin/env sh
-# Rogue Security - shared credential-file writer. SOURCED, never executed.
-#
-# SOURCE OF TRUTH: run scripts/sync-shared-scripts.sh after editing.
-#
-# The write MERGES: ~/.rogue-env is shared by six plugins and holds settings no
-# setup flow asks about (ROGUE_BASE_URL, ROGUE_LOG_DIR). POSIX clean - dash has
-# no printf %q.
 
 rogue_env_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
-# Lines we do not own; our header goes too, or it piles up per write. grep exits
-# 1 when nothing is left to keep, which is not a failure - but a read error (2)
-# must propagate, or a truncated temp file replaces a good one. The status is
-# captured off an || so `set -e` in a sourcing script cannot abort on the
-# harmless 1 before the check runs.
-#
-# ONE grep, both patterns as -e: a pipeline reports only its LAST status, so a
-# `grep | grep` hides an unreadable env file behind the second grep's empty-input
-# exit 1 and the writer then drops every unmanaged key.
-# Captured into a variable rather than piped, so the status checked below is
-# grep's own and the CR strip cannot mask it the way the second grep used to.
-rogue_env_preserved() { # <env-file> <key1|key2|...>
+rogue_env_preserved() {
   _rogue_env_rc=0
   _rogue_env_kept="$(grep -Ev \
     -e "^[[:space:]]*(export[[:space:]]+)?(${2})[[:space:]]*=" \
@@ -30,14 +12,9 @@ rogue_env_preserved() { # <env-file> <key1|key2|...>
     "$1")" || _rogue_env_rc=$?
   [ "$_rogue_env_rc" -le 1 ] || return 1
 
-  # A CRLF file - Notepad, an MDM script - hands its CR straight through grep, and
-  # sh sources it INTO the value: ROGUE_BASE_URL becomes an unreachable host with a
-  # carriage return glued to the port. The PowerShell twin's Get-Content drops line
-  # endings already, so keeping it here also splits the two writers' output.
   [ -z "$_rogue_env_kept" ] || printf '%s\n' "$_rogue_env_kept" | tr -d '\r'
 }
 
-# rogue_write_env_file <env-file> <key> <value> [<key> <value> ...]
 rogue_write_env_file() {
   _env_file="$1"; shift
   [ "$#" -ge 2 ] || return 2
@@ -54,9 +31,6 @@ rogue_write_env_file() {
     shift 2
   done
 
-  # Temp file: a full disk must not leave a truncated credential file. Every
-  # emit is && chained, so a partial write fails the group instead of being
-  # swallowed and mv'd over the file it was meant to update.
   _env_tmp="${_env_file}.rogue-tmp.$$"
   (
     umask 077
