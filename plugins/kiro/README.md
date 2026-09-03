@@ -122,6 +122,16 @@ receives the IDE's prompt-block JSON, which the 3.0 CLI ignores) until the
 hardware matrix (FIRE-2038) finds a run-time signal that tells the two hosts
 apart. This is the one known mislabel.
 
+## Versioning and release
+
+`plugin.json` carries the version of record (`install-id.sh`, `hook.ps1` and
+`heartbeat.ps1` read it there); `VERSION` beside it mirrors the value for
+operators and the release page, and `scripts/plugin-versions.sh` refuses to
+build a release while the two disagree. `release.yml` publishes the plugin as
+`rogue-plugin-kiro.tar.gz` (the archive's top dir is this directory) and lists
+the version in `versions.json` under slug `kiro`, which the backend maps
+family `kiro` to when it decides whether a roster row is outdated.
+
 ## Credentials
 
 Later file wins:
