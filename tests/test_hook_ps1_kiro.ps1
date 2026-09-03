@@ -162,6 +162,20 @@ $count++
 if ($src -match '\[int\]\$t -gt 0\) \{ \$timeoutSec = \[int\]\$t \}') { Write-Host '  ok: a zero ROGUE_HOOK_TIMEOUT keeps the default budget' }
 else { Write-Host 'FAIL [a zero ROGUE_HOOK_TIMEOUT keeps the default budget]'; $fails++ }
 
+# -- no file-scope assignment shadows a parameter ----------------------------
+# PowerShell variable names are case-insensitive: a file-scope
+# `$script:surface = ''` overwrote the `$Surface` parameter before the main body
+# validated it, so every Windows event went out as kiro_cli and no log line
+# carried a surface token. Static, because the main body stands down
+# off-Windows. A reassignment that reads the parameter (`$EventName =
+# ConvertTo-KiroEvent $EventName`) is not a shadow and is allowed.
+$count++
+$paramNames = [regex]::Matches([regex]::Match($src, 'param\(([^)]*)\)').Groups[1].Value, '\$(\w+)') |
+    ForEach-Object { $_.Groups[1].Value }
+$shadowed = @($paramNames | Where-Object { $src -match "(?im)^\s*\`$(script:)?$_\s*=(?!.*\`$$_\b)" })
+if ($shadowed.Count -eq 0) { Write-Host '  ok: no file-scope assignment shadows a parameter' }
+else { Write-Host "FAIL [no file-scope assignment shadows a parameter]: $($shadowed -join ', ')"; $fails++ }
+
 Write-Host ""
 if ($fails -eq 0) { Write-Host "All $count Kiro PowerShell bridge tests passed."; exit 0 }
 Write-Host "$fails of $count failed."

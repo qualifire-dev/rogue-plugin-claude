@@ -24,7 +24,11 @@
 #   2. C:\ProgramData\rogue\env  (MDM-provisioned; mirrors /etc/rogue/env)
 #   3. %USERPROFILE%\.rogue-env  (user / installer-written)
 
-param([string]$EventName = '', [string]$Surface = '', [string]$PluginRoot = '')
+# $SurfaceArg, not $Surface: PowerShell variable names are case-insensitive, so
+# the file-scope `$script:surface = ''` below would overwrite a parameter of that
+# name before the main body validated it, and every event would go out as
+# kiro_cli. Positional, so the hook file's `hook.ps1 <event> <surface>` is unchanged.
+param([string]$EventName = '', [string]$SurfaceArg = '', [string]$PluginRoot = '')
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
@@ -254,7 +258,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
 
 $triggerArg = $EventName
 $EventName = ConvertTo-KiroEvent $EventName
-$script:surface = Get-KiroSurface $Surface
+$script:surface = Get-KiroSurface $SurfaceArg
 $agent = if ($script:surface) { $script:surface } else { 'kiro_cli' }
 Dbg "event=$EventName surface=$agent"
 

@@ -341,6 +341,7 @@ jobs:
           pwsh -NoProfile -File tests/test_auto_update_ps1.ps1
           pwsh -NoProfile -File tests/test_setup_env.ps1
           pwsh -NoProfile -File tests/test_install_kiro_ps1.ps1
+          pwsh -NoProfile -File tests/test_status_kiro_ps1.ps1
 
   windows:
     # The job the seam CANNOT stand in for. Every PowerShell test in the job above
@@ -396,4 +397,6 @@ jobs:
           powershell -NoProfile -File tests/test_setup_env.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_install_kiro_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_status_kiro_ps1.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }

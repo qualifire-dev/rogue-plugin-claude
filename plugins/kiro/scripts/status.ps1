@@ -14,6 +14,10 @@
 # register a second row for the install being checked.
 #
 # Exit 0 when configured and the API answered 200; 1 otherwise.
+#
+# Test seam, as in heartbeat.ps1: with ROGUE_PS_LIB_ONLY set the file only
+# defines its functions, and a suite calls Invoke-Status itself with
+# Invoke-WebRequest stubbed and USERPROFILE pointed at a temp dir.
 param()
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -24,11 +28,18 @@ $saveLibOnly = $env:ROGUE_PS_LIB_ONLY
 $env:ROGUE_PS_LIB_ONLY = '1'
 . ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $scriptsDir 'heartbeat.ps1'))))
 $env:ROGUE_PS_LIB_ONLY = $saveLibOnly
+# Resolved HERE, from this file's own path, and never through the heartbeat's
+# Resolve-PluginRoot: that reads $PSCommandPath, which is empty inside functions
+# defined by a scriptblock built from text, so it would fall through to the
+# current directory and read plugin.json and the bundled env from wherever the
+# user happened to run the command.
+$script:pluginRoot = Split-Path $scriptsDir -Parent
 
 $hooksDir = Join-Path (Join-Path $env:USERPROFILE '.kiro') 'hooks'
 $configured = $false
 $haveCli = $false
 $httpCode = '000'
+$statusExit = 1
 
 function Write-Row { param([string]$Label, [string]$Value) Write-Output ('  {0,-38} {1}' -f $Label, $Value) }
 function Write-SurfaceRow { param([string]$Label, [string]$Value) Write-Output ('  {0,-12}{1}' -f $Label, $Value) }
@@ -121,25 +132,13 @@ function Write-Wiring {
     Write-Row 'default agent (2.x engine)' (Get-DefaultAgentStatus)
 }
 
-# -- connection: the heartbeat's body, so it lands on the heartbeat's row --------
-function Get-StatusBody {
+# -- connection: the heartbeat's body (its Get-StatusBody), on the heartbeat's row --
+function Get-ConnectionBody {
     # The CLI's row when kiro-cli is present, the IDE's otherwise: the surface the
     # SessionStart heartbeat on this machine would report first.
-    $script:agent = 'kiro_ide'; if ($script:haveCli) { $script:agent = 'kiro_cli' }
+    $script:surface = 'kiro_ide'; if ($script:haveCli) { $script:surface = 'kiro_cli' }
     Resolve-KiroHost
-    $host_ = $env:COMPUTERNAME
-    if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
-    $fields = @{
-        agent_family  = 'kiro'
-        agent         = $script:agent
-        version       = $script:ver
-        agent_version = $script:kiroVer
-        host          = $host_
-        actor_email   = [string]$script:actorEmail
-        actor_name    = [string]$script:actorName
-    }
-    if ($script:kiroDefault) { $fields['default_agent'] = $script:kiroDefault }
-    return ($fields | ConvertTo-Json -Compress)
+    return (Get-StatusBody)
 }
 
 function Write-HttpExplanation {
@@ -167,7 +166,7 @@ function Write-Connection {
     if (-not $script:configured) { Write-Output '  skipped - no API key'; return }
     $body = ''
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-StatusBody))
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ConnectionBody))
         $resp = Invoke-WebRequest -Uri "$($script:baseUrl)/api/v1/hooks/status" -Method Post `
             -Headers @{ 'x-rogue-api-key' = $script:apiKey } -ContentType 'application/json' `
             -Body $bytes -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
@@ -205,7 +204,6 @@ function Write-Log {
 function Invoke-Status {
     Write-Output 'Rogue Security status (Kiro)'
     Initialize-Tls
-    Resolve-PluginRoot
     Import-Credentials
     Resolve-BaseUrl
     Resolve-Actor
@@ -215,8 +213,8 @@ function Invoke-Status {
     Write-Wiring
     Write-Connection
     Write-Log
-    if ($script:configured -and $script:httpCode -eq '200') { exit 0 }
-    exit 1
+    $script:statusExit = 1
+    if ($script:configured -and $script:httpCode -eq '200') { $script:statusExit = 0 }
 }
 
-Invoke-Status
+if (-not $env:ROGUE_PS_LIB_ONLY) { Invoke-Status; exit $script:statusExit }
