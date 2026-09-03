@@ -11,9 +11,10 @@
 # agents carrying the Rogue hooks are covered there, ADR 0001).
 #
 # The connection check POSTs /hooks/status, which upserts a roster row
-# fingerprinted on host|actor|family|agent - so the body is the heartbeat's,
-# resolved through the same actor.sh / install-id.sh / kiro-host.sh, or this
-# run would register a second row for the install it is checking.
+# fingerprinted on host|actor|family|agent - so the body is the heartbeat's:
+# built by the one rogue_kiro_status_body in kiro-host.sh from the same
+# actor.sh / install-id.sh / kiro-host.sh resolution, or this run would
+# register a second row for the install it is checking.
 #
 # Exit 0 when configured and the API answered 200; 1 otherwise, so a managed
 # rollout can verify a machine from a script.
@@ -31,7 +32,6 @@ HTTP_CODE=""
 
 row() { printf '  %-38s %s\n' "$1" "$2"; }
 surface_row() { printf '  %-12s%s\n' "$1" "$2"; }
-esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # The first "<key>": "<string>" value in a JSON body, without jq.
 json_str() { printf '%s' "$2" | sed -nE 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n1; }
 
@@ -132,11 +132,7 @@ status_body() {
   SURFACE=kiro_ide; [ "$HAVE_CLI" = 1 ] && SURFACE=kiro_cli
   . "${PLUGIN_ROOT}/scripts/install-id.sh"
   . "${PLUGIN_ROOT}/scripts/kiro-host.sh"
-  extra=""
-  [ -n "$ROGUE_KIRO_DEFAULT_AGENT" ] && extra=$(printf ',"default_agent":"%s"' "$(esc "$ROGUE_KIRO_DEFAULT_AGENT")")
-  printf '{"agent_family":"kiro","agent":"%s","version":"%s","agent_version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"%s}' \
-    "$SURFACE" "$(esc "$ROGUE_INSTALL_VERSION")" "$(esc "$ROGUE_KIRO_VERSION")" "$(esc "$ROGUE_INSTALL_HOST")" \
-    "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")" "$extra"
+  rogue_kiro_status_body
 }
 
 explain_http() {

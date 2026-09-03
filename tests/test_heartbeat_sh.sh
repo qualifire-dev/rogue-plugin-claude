@@ -232,8 +232,10 @@ chmod +x "$TMPROOT/kiro-bin/curl"
 # or errors out when none is set. The IDE has no CLI: its version is the app
 # bundle's Info.plist, pointed at through ROGUE_KIRO_APP so the suite never
 # reads /Applications.
+# Every call is recorded, so a throttled beacon can be shown to spawn none.
 cat > "$TMPROOT/kiro-bin/kiro-cli" <<'STUB'
 #!/bin/sh
+printf '%s\n' "$*" >> "${KIRO_CLI_LOG:-/dev/null}"
 case "$1 $2" in
   "--version ")                echo "kiro-cli 2.21.0" ;;
   "settings chat.defaultAgent") [ -n "${KIRO_FAKE_DEFAULT:-}" ] && { echo "\"$KIRO_FAKE_DEFAULT\""; exit 0; }
@@ -258,9 +260,10 @@ KIRO_STAMP="$KIRO_HOME/.rogue/beacon/.last-kiro"
 # `env -u` scrubs the developer's own ROGUE_* (this suite is very likely run from a
 # shell that exports a real key): only the temp HOME's env file may configure it.
 kiro_beacon() {
-  : > "$TMPROOT/kiro-calls"
+  : > "$TMPROOT/kiro-calls"; : > "$TMPROOT/kiro-cli-calls"
   env -u ROGUE_API_KEY -u ROGUE_BASE_URL -u ROGUE_ACTOR_EMAIL -u ROGUE_ACTOR_NAME \
-      SB_CALLS="$TMPROOT/kiro-calls" PATH="$TMPROOT/kiro-bin:$PATH" HOME="$KIRO_HOME" \
+      SB_CALLS="$TMPROOT/kiro-calls" KIRO_CLI_LOG="$TMPROOT/kiro-cli-calls" \
+      PATH="$TMPROOT/kiro-bin:$PATH" HOME="$KIRO_HOME" \
       ROGUE_KIRO_APP="${ROGUE_KIRO_APP:-$TMPROOT/no-app}" KIRO_FAKE_DEFAULT="${KIRO_FAKE_DEFAULT:-}" \
       "$SH" "$KIRO_ROOT/scripts/heartbeat.sh" "$1" "$2" >/dev/null 2>&1
   cat "$TMPROOT/kiro-calls"
@@ -287,6 +290,11 @@ echo "── the kiro heartbeat reports the host's own version and the CLI defau
 out="$(KIRO_FAKE_DEFAULT=rogue kiro_beacon kiro_cli SessionStart)"
 check "kiro_cli reports agent_version from kiro-cli --version" "yes" "$(has "$out" '"agent_version":"2.21.0"')"
 check "kiro_cli reports the default agent, unquoted" "yes" "$(has "$out" '"default_agent":"rogue"')"
+check "SessionStart asks kiro-cli for its version" "yes" "$(has "$(cat "$TMPROOT/kiro-cli-calls")" '--version')"
+# Throttled means throttled: the probes are kiro-cli processes, and a per-turn
+# Stop inside the window must spawn none of them - the claim comes first.
+check "a Stop inside the window makes no request" "" "$(KIRO_FAKE_DEFAULT=rogue kiro_beacon kiro_cli Stop)"
+check "and asks Kiro nothing (no kiro-cli process)" "" "$(cat "$TMPROOT/kiro-cli-calls")"
 rm -rf "${KIRO_STAMP%/*}"
 out="$(kiro_beacon kiro_cli SessionStart)"
 check "no default set → no default_agent field" "no" "$(has "$out" 'default_agent')"

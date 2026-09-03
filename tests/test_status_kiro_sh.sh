@@ -141,6 +141,20 @@ assert_has '"agent_version":"2.21.0"'          "$CURLS" "body carries the Kiro b
 assert_has '"default_agent":"rogue"'           "$CURLS" "body carries the default agent"
 assert_has '"host":"'                          "$CURLS" "body carries the host"
 
+echo "── the body is the heartbeat's, byte for byte ───────────────────────────"
+# heartbeat.sh run against the same home and fakes, with the surface the status
+# run chose. Any field the two disagree on is a second roster row for this
+# install - which is why kiro-host.sh holds the one builder both call.
+status_json=$(grep -o '{"agent_family.*}' "$H/curl.log" | head -n1)
+: > "$H/curl.log"
+( cd "$H/ws" && env -i HOME="$H" PATH="$BIN:$FARM" CURL_LOG="$H/curl.log" \
+    ROGUE_KIRO_APP="$APP" KIRO_FAKE_DEFAULT=rogue \
+    "$SH" "$PLUGIN/scripts/heartbeat.sh" kiro_cli SessionStart ) >/dev/null 2>&1
+heartbeat_json=$(grep -o '{"agent_family.*}' "$H/curl.log" | head -n1)
+[ -n "$heartbeat_json" ] && ok "heartbeat.sh posted a body" || bad "heartbeat.sh posted a body" "no body in $(cat "$H/curl.log")"
+[ "$status_json" = "$heartbeat_json" ] && ok "status.sh posts exactly the body heartbeat.sh posts" \
+  || bad "status.sh posts exactly the body heartbeat.sh posts" "status=$status_json heartbeat=$heartbeat_json"
+
 echo "── the default agent moved away from the hooked one ─────────────────────"
 new_home moved; wire_kiro
 FAKE_BODY="$FAKE_BODY" KIRO_FAKE_DEFAULT=custom run_status

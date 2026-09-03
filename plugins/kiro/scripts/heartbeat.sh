@@ -29,9 +29,6 @@ set -u
 PLUGIN_ROOT=""
 AGENT=""               # which of the three surfaces this install is reporting for
 VER="unknown"          # plugin version, from plugin.json via install-id.sh
-HOST="unknown"         # hostname; both set by resolve_version via install-id.sh
-KIRO_VER="unknown"     # the Kiro build itself, via kiro-host.sh
-KIRO_DEFAULT=""        # the CLI's default agent, empty off the CLI or when unset
 TRIGGER="SessionStart" # which hook fired us; anything else is rate-limited
 
 # Self-locate the plugin root from $0 (<root>/scripts/heartbeat.sh).
@@ -79,28 +76,20 @@ resolve_version() {
   SURFACE="$AGENT"
   [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
   VER="${ROGUE_INSTALL_VERSION:-unknown}"
-  HOST="${ROGUE_INSTALL_HOST:-unknown}"
   return 0
 }
 
 # What Kiro itself reports: its build (CLI from `kiro-cli --version`, IDE from
 # the app bundle) and, on the CLI, the default agent. Two versions ride one
-# roster row - `version` is the plugin's, `agent_version` is Kiro's - so support
-# can tell a current plugin from a stale Kiro. kiro-host.sh reads SURFACE too.
+# body - `version` is the plugin's, `agent_version` is Kiro's - so support can
+# tell a current plugin from a stale Kiro once the backend stores the second
+# (it does not yet; see README "Roster heartbeat"). kiro-host.sh reads SURFACE too,
+# and also defines rogue_kiro_status_body, the body builder shared with
+# status.sh. Called from post_heartbeat AFTER the beacon claim: each probe is a
+# kiro-cli process, and a throttled Stop must not pay for two of them.
 resolve_kiro_host() {
   SURFACE="$AGENT"
   [ -r "${PLUGIN_ROOT}/scripts/kiro-host.sh" ] && . "${PLUGIN_ROOT}/scripts/kiro-host.sh"
-  KIRO_VER="${ROGUE_KIRO_VERSION:-unknown}"
-  KIRO_DEFAULT="${ROGUE_KIRO_DEFAULT_AGENT:-}"
-  return 0
-}
-
-esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-
-# `,"default_agent":"…"` when the CLI reported one, nothing otherwise: an absent
-# field is "not a CLI, or none set", which an empty string would blur.
-default_agent_field() {
-  [ -n "$KIRO_DEFAULT" ] && printf ',"default_agent":"%s"' "$(esc "$KIRO_DEFAULT")"
   return 0
 }
 
@@ -136,9 +125,11 @@ post_heartbeat() {
   _unthrottled=0
   [ "$TRIGGER" = "SessionStart" ] && _unthrottled=1
   rogue_beacon_claim kiro "$_unthrottled" || return 0
-  _body=$(printf '{"agent_family":"kiro","agent":"%s","version":"%s","agent_version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"%s}' \
-    "$(esc "$AGENT")" "$(esc "$VER")" "$(esc "$KIRO_VER")" "$(esc "$HOST")" \
-    "$(esc "${ROGUE_ACTOR_EMAIL:-}")" "$(esc "${ROGUE_ACTOR_NAME:-}")" "$(default_agent_field)")
+  resolve_kiro_host
+  # No builder means no kiro-host.sh: a partial install has nothing to report
+  # this turn, and the stamp already written keeps it from retrying every turn.
+  command -v rogue_kiro_status_body >/dev/null 2>&1 || return 0
+  _body=$(rogue_kiro_status_body)
 
   curl -sS --max-time 10 -X POST \
     "${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/status" \
@@ -177,9 +168,8 @@ main() {
   load_actor
   resolve_surface "${1:-}"
   resolve_version   # after the surface: install-id.sh keys the agent on it
-  resolve_kiro_host # same reason: the surface picks which Kiro binary to ask
   load_beacon       # after load_env, so the library sees the interval knob
-  post_heartbeat
+  post_heartbeat    # claims the beacon slot, THEN asks Kiro for its version
   ship_logs
   exit 0
 }

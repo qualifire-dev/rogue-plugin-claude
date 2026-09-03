@@ -10,12 +10,19 @@
 #                             set or the surface is not the CLI. On the 2.x
 #                             engine only agents carrying the Rogue hooks are
 #                             covered (ADR 0001), so a default that moved away
-#                             from `rogue` is a machine the roster should show
-#                             as uncovered.
+#                             from `rogue` is an uncovered machine - status.sh
+#                             says so; the roster will once the backend stores
+#                             the field (README "Roster heartbeat").
 #
 # The caller sets SURFACE before sourcing, as for install-id.sh. heartbeat.sh
 # sends both values in its /hooks/status body and status.sh prints them.
 # Resolution never fails the caller: every probe is best-effort and quiet.
+#
+# rogue_kiro_status_body, defined below, is the ONE builder of that body: the
+# heartbeat and the status script both POST it, and the backend fingerprints a
+# roster row on host|actor|family|agent, so a second copy of the format string
+# is a second chance to disagree on a segment and open a second row for one
+# install.
 #
 # ROGUE_KIRO_APP overrides the IDE bundle path (default /Applications/Kiro.app)
 # so a test never reads the developer's real install.
@@ -53,3 +60,23 @@ esac
 [ -n "$ROGUE_KIRO_VERSION" ] || ROGUE_KIRO_VERSION="unknown"
 
 export ROGUE_KIRO_VERSION ROGUE_KIRO_DEFAULT_AGENT
+
+_rogue_json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# The /hooks/status body, from what actor.sh, install-id.sh and this file
+# resolved into the environment. `default_agent` is ABSENT, not empty, when the
+# CLI has none set or the surface is not the CLI: an absent field reads as
+# "not a CLI, or none set", which an empty string would blur.
+rogue_kiro_status_body() {
+  _extra=""
+  [ -n "${ROGUE_KIRO_DEFAULT_AGENT:-}" ] \
+    && _extra=$(printf ',"default_agent":"%s"' "$(_rogue_json_esc "$ROGUE_KIRO_DEFAULT_AGENT")")
+  printf '{"agent_family":"kiro","agent":"%s","version":"%s","agent_version":"%s","host":"%s","actor_email":"%s","actor_name":"%s"%s}' \
+    "$(_rogue_json_esc "${ROGUE_INSTALL_AGENT:-kiro_cli}")" \
+    "$(_rogue_json_esc "${ROGUE_INSTALL_VERSION:-unknown}")" \
+    "$(_rogue_json_esc "${ROGUE_KIRO_VERSION:-unknown}")" \
+    "$(_rogue_json_esc "${ROGUE_INSTALL_HOST:-unknown}")" \
+    "$(_rogue_json_esc "${ROGUE_ACTOR_EMAIL:-}")" \
+    "$(_rogue_json_esc "${ROGUE_ACTOR_NAME:-}")" \
+    "$_extra"
+}
