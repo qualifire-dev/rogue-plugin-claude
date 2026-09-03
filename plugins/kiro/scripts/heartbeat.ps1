@@ -236,13 +236,13 @@ function Send-Heartbeat {
     if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
 
     $fields = @{
-        agent_family  = 'kiro'
-        agent         = $agent
-        version       = $ver
+        agent_family = 'kiro'
+        agent = $agent
+        version = $ver
         agent_version = $kiroVer
-        host          = $host_
-        actor_email   = [string]$actorEmail
-        actor_name    = [string]$actorName
+        host = $host_
+        actor_email = [string]$actorEmail
+        actor_name = [string]$actorName
     }
     # Absent, not empty: "no field" reads as "not a CLI, or none set", which an
     # empty string would blur.
