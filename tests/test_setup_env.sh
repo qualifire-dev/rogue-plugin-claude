@@ -366,14 +366,24 @@ mdm_etc="$SANDBOX/mdm-etc-env"
 printf "export ROGUE_BASE_URL='https://mdm.example'\n" > "$mdm_etc"
 mdm_install="$SANDBOX/install-mdm.sh"
 sed "s#/etc/rogue/env#$mdm_etc#g" "$REPO/install.sh" > "$mdm_install"
-ROGUE_INSTALL_LIB_ONLY=1 bash -c '
+mdm_home="$SANDBOX/mdm-home"
+mkdir -p "$mdm_home"
+set +e
+env -u CLAUDE_CODE_USER_EMAIL -u ROGUE_API_KEY -u ROGUE_BASE_URL \
+    -u ROGUE_ACTOR_EMAIL -u ROGUE_ACTOR_NAME \
+    HOME="$mdm_home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    ROGUE_INSTALL_LIB_ONLY=1 bash -c '
   . "$1"
   ENV_FILE="$2"
   NON_INTERACTIVE=1
   configure_credentials >/dev/null 2>&1
 ' _ "$mdm_install" "$mdm_env"
+mdm_rc=$?
+set -e
+check "no actor identity anywhere still completes"     "0"                "$mdm_rc"
 check "mdm base url not copied into the per-user file" "0"                "$(count_lines "$mdm_env" '^export ROGUE_BASE_URL=')"
 check "mdm run still keeps other settings"             "/var/log/rogue"   "$(sourced "$mdm_env" ROGUE_LOG_DIR)"
+check "mdm run still rotated the key"                  "onbox"            "$(sourced "$mdm_env" ROGUE_API_KEY)"
 
 [ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }
 echo "all env-file writer checks passed"

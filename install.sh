@@ -472,7 +472,7 @@ configure_credentials() {
   def_email="${flag_email:-${ROGUE_ACTOR_EMAIL:-$(git config --global user.email 2>/dev/null)}}"
   def_name="${flag_name:-${ROGUE_ACTOR_NAME:-$(git config --global user.name 2>/dev/null)}}"
   [ -n "$def_email" ] || def_email="${CLAUDE_CODE_USER_EMAIL:-}"
-  [ -n "$def_name" ]  || def_name="${CLAUDE_CODE_USER_EMAIL%@*}"
+  [ -n "$def_name" ]  || { def_name="${CLAUDE_CODE_USER_EMAIL:-}"; def_name="${def_name%@*}"; }
   [ -n "$def_email" ] || def_email="$(hostname 2>/dev/null)"
   [ -n "$def_name" ]  || def_name="$(whoami 2>/dev/null)"
 
