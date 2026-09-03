@@ -969,6 +969,7 @@ install_kiro() {
   fi
   note "Kiro loads hooks at start: restart the IDE / Crew, and open a new ${C_DIM}kiro-cli chat${C_RESET}."
   note "IDE: hooks never run in an untrusted workspace — trust the workspace first."
+  note "Verify with ${C_DIM}sh $KIRO_PLUGIN_DIR/scripts/status.sh${C_RESET} (surfaces, hook wiring, default agent, API key)."
 }
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────

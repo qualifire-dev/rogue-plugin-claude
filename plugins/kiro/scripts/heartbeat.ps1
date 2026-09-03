@@ -15,6 +15,11 @@
 # `Invoke-Main` runs. Shared state lives in the script-scoped variables declared
 # under it, and every write to one is `$script:`-qualified — an unqualified
 # assignment inside a function writes to a local copy that vanishes on return.
+#
+# The validated surface is `$surface`, NOT `$agent`: PowerShell variable names
+# are case-insensitive, so a file-scope `$agent = ''` would overwrite the
+# `$Agent` parameter before Resolve-Surface ever read it, and every install
+# would report kiro_cli. (It did, until the heartbeat was run under test.)
 param([string]$Agent = '', [string]$Trigger = 'SessionStart')
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -27,7 +32,9 @@ $baseUrl    = ''
 $actorName  = ''
 $actorEmail = ''
 $ver        = 'unknown'   # plugin version, from plugin.json
-$agent      = ''          # which of the three surfaces this install reports for
+$surface    = ''          # which of the three surfaces this install reports for
+$kiroVer    = 'unknown'   # the Kiro build itself (kiro-cli --version / the IDE install)
+$kiroDefault = ''         # the CLI's default agent, empty off the CLI or when unset
 
 function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.WriteLine("[rogue-heartbeat] $Msg") } }
 
@@ -168,11 +175,81 @@ function Resolve-Version {
 #    because the value ends up in a roster row. Default kiro_cli, which is what
 #    the route defaults an unknown x-rogue-agent to as well. ──
 function Resolve-Surface {
-    if (@('kiro_ide', 'kiro_cli', 'kiro_crew') -ccontains $Agent) { $script:agent = $Agent; return }
-    $script:agent = 'kiro_cli'
+    if (@('kiro_ide', 'kiro_cli', 'kiro_crew') -ccontains $Agent) { $script:surface = $Agent; return }
+    $script:surface = 'kiro_cli'
 }
 
-# The stamp slug is `kiro`, the log file's name, and NOT $agent: the three
+# -- what Kiro itself reports (mirrors scripts/kiro-host.sh) -------------------
+# Two versions ride one body: `version` is the plugin's, `agent_version` is the
+# Kiro build it runs under, so support can tell a current plugin from a stale
+# Kiro once the backend stores the second (it does not yet; see README "Roster
+# heartbeat"). The CLI (and Crew, which drives kiro-cli) answers `kiro-cli --version`;
+# the IDE has no CLI, so its version is read from the install under
+# %LOCALAPPDATA%\Programs\Kiro (ROGUE_KIRO_APP overrides the path for tests).
+function Get-KiroCliVersion {
+    if (-not (Get-Command kiro-cli -ErrorAction SilentlyContinue)) { return '' }
+    try { $out = (& kiro-cli --version 2>$null | Out-String) } catch { return '' }
+    $m = [regex]::Match([string]$out, '[0-9]+\.[0-9]+\.[0-9]+')
+    if ($m.Success) { return $m.Value }
+    return ''
+}
+
+function Get-KiroIdeVersion {
+    $root = $env:ROGUE_KIRO_APP
+    if (-not $root -and $env:LOCALAPPDATA) { $root = Join-Path $env:LOCALAPPDATA 'Programs\Kiro' }
+    if (-not $root) { return '' }
+    $pkg = Join-Path $root 'resources\app\package.json'
+    if (-not (Test-Path -LiteralPath $pkg)) { return '' }
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $pkg), '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+}
+
+# The real CLI prints the value quoted ("rogue") and errors out when none is set.
+function Get-KiroDefaultAgent {
+    if (-not (Get-Command kiro-cli -ErrorAction SilentlyContinue)) { return '' }
+    try { $out = (& kiro-cli settings chat.defaultAgent 2>$null | Out-String) } catch { return '' }
+    return ([string]$out).Trim().Trim('"')
+}
+
+# After Resolve-Surface: the surface picks which Kiro binary to ask, and only the
+# CLI has a default agent (on the 2.x engine only agents carrying the Rogue hooks
+# are covered, so a default that moved away from `rogue` is worth showing).
+# Called from Send-Heartbeat AFTER the beacon claim: each probe is a kiro-cli
+# process, and a throttled Stop must not pay for two of them.
+function Resolve-KiroHost {
+    switch ($surface) {
+        'kiro_ide' { $script:kiroVer = Get-KiroIdeVersion; $script:kiroDefault = '' }
+        'kiro_cli' { $script:kiroVer = Get-KiroCliVersion; $script:kiroDefault = Get-KiroDefaultAgent }
+        default    { $script:kiroVer = Get-KiroCliVersion; $script:kiroDefault = '' }
+    }
+    if (-not $script:kiroVer) { $script:kiroVer = 'unknown' }
+}
+
+# The /hooks/status body, from the resolved script state. The ONE builder for
+# this heartbeat and for status.ps1 (which loads this file through the seam):
+# the backend fingerprints a roster row on host|actor|family|agent, so a second
+# copy of these fields is a second chance to disagree on a segment and open a
+# second row for one install. `default_agent` is absent, not empty, when the
+# CLI has none set or the surface is not the CLI: "no field" reads as "not a
+# CLI, or none set", which an empty string would blur.
+function Get-StatusBody {
+    $host_ = $env:COMPUTERNAME
+    if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
+    $fields = @{
+        agent_family = 'kiro'
+        agent = $surface
+        version = $ver
+        agent_version = $kiroVer
+        host = $host_
+        actor_email = [string]$actorEmail
+        actor_name = [string]$actorName
+    }
+    if ($kiroDefault) { $fields['default_agent'] = $kiroDefault }
+    return ($fields | ConvertTo-Json -Compress)
+}
+
+# The stamp slug is `kiro`, the log file's name, and NOT $surface: the three
 # surfaces share one install and one log, so they must share one throttle window
 # too - a per-surface stamp would let a machine with the IDE and the CLI both
 # installed beacon twice as often as configured.
@@ -185,18 +262,8 @@ function Send-Heartbeat {
         Dbg 'beacon throttled'
         return
     }
-
-    $host_ = $env:COMPUTERNAME
-    if (-not $host_) { try { $host_ = [System.Net.Dns]::GetHostName() } catch { $host_ = 'unknown' } }
-
-    $body = @{
-        agent_family = 'kiro'
-        agent        = $agent
-        version      = $ver
-        host         = $host_
-        actor_email  = [string]$actorEmail
-        actor_name   = [string]$actorName
-    } | ConvertTo-Json -Compress
+    Resolve-KiroHost
+    $body = Get-StatusBody
 
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
@@ -270,7 +337,7 @@ function Invoke-Main {
     Resolve-Actor
     Resolve-Version
     Resolve-Surface
-    Send-Heartbeat
+    Send-Heartbeat     # claims the beacon slot, THEN asks Kiro for its version
     Start-LogShipper
     exit 0
 }

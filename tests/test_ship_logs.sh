@@ -39,9 +39,9 @@ pass() { echo "  ok: $1"; }
 fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected [$2], got [$3])"; fi; }
 
-SLUGS='claude codex cursor gemini copilot antigravity'
-# The five plugins that ship the POSIX-sh copy (gemini ships ship-logs.mjs).
-SH_PLUGINS='rogue codex cursor copilot antigravity'
+SLUGS='claude codex cursor gemini copilot antigravity kiro'
+# The six plugins that ship the POSIX-sh copy (gemini ships ship-logs.mjs).
+SH_PLUGINS='rogue codex cursor copilot antigravity kiro'
 
 # ── the fake curl ──────────────────────────────────────────────────────────
 # The shipper invokes: curl … --data-binary @<body> -o /dev/null -w '%{http_code}'
@@ -159,7 +159,7 @@ seed()     { _i="$1"; while [ "$_i" -le "$2" ]; do
 # magic number.
 LINEB=$(printf '2026-08-12T00:00:01Z provider=claude event=PreToolUse outcome=allow n=1\n' | wc -c | tr -d ' ')
 
-echo "== the five sh copies match scripts/shared/ship-logs.sh"
+echo "== the six sh copies match scripts/shared/ship-logs.sh"
 # Every per-plugin difference is an ARGUMENT, which is what lets `cmp` enforce
 # lockstep instead of review. scripts/shared/ is the ONLY editable copy; the plugin
 # copies are committed (three plugins install straight from a git clone with no build
@@ -453,12 +453,12 @@ echo "== ROGUE_SHIP_ALL=1 collects every agent's log"
 new_case shipall
 for s in $SLUGS; do seed 1 2 "$s" "$CASE/home/.rogue/logs/$s.log"; done
 ship "ROGUE_SHIP_ALL=1"
-check "six requests" "6" "$(bodies)"
+check "seven requests" "7" "$(bodies)"
 # agent_family is a FALLBACK HINT for a line with no provider= token, so it is sent
 # only for the caller's OWN log: on a foreign log the shipping plugin's family
 # would mislabel every line (a codex line filed under `claude`).
 own_fam=""; foreign_fam="none"
-i=0; while [ "$i" -lt 6 ]; do
+i=0; while [ "$i" -lt 7 ]; do
   lf=$(strf "$i" log_file); fam=$(strf "$i" agent_family)
   if [ "$lf" = "claude.log" ]; then own_fam="$fam"
   elif [ -n "$fam" ]; then foreign_fam="$fam"; fi
@@ -497,10 +497,10 @@ echo "== a no-argument run collects everything and reports shipper=unknown"
 new_case noargs
 for s in $SLUGS; do seed 1 2 "$s" "$CASE/home/.rogue/logs/$s.log"; done
 ship_as rogue - x x
-check "six requests" "6" "$(bodies)"
+check "seven requests" "7" "$(bodies)"
 check "shipper is unknown" "unknown" "$(strf 0 shipper)"
 allblank=yes; i=0
-while [ "$i" -lt 6 ]; do [ -z "$(strf "$i" agent_family)" ] || allblank=no; i=$((i + 1)); done
+while [ "$i" -lt 7 ]; do [ -z "$(strf "$i" agent_family)" ] || allblank=no; i=$((i + 1)); done
 check "no agent_family anywhere (no slug means no family)" "yes" "$allblank"
 
 echo

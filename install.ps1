@@ -755,6 +755,7 @@ if ($hasKiro) {
         Ok "Plugin installed -> $pluginDir"
         Install-KiroHooks -PluginDir $pluginDir -WorkspaceDir (Get-Location).Path
         Warn2 'Kiro loads hooks at start: restart the IDE and open a new kiro-cli chat. IDE hooks never run in an untrusted workspace.'
+        Log "Verify with: powershell -NoProfile -ExecutionPolicy Bypass -File `"$pluginDir\scripts\status.ps1`""
     } catch {
         Warn2 "Kiro plugin not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
     } finally {

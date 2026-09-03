@@ -222,19 +222,49 @@ KIRO_ROOT="$TMPROOT/kiro"
 KIRO_HOME="$TMPROOT/kiro-home"
 mkdir -p "$KIRO_ROOT/scripts" "$KIRO_HOME" "$TMPROOT/kiro-bin"
 cp "$REPO/plugins/kiro/scripts/heartbeat.sh" "$REPO/plugins/kiro/scripts/beacon.sh" \
-   "$REPO/plugins/kiro/scripts/actor.sh" "$REPO/plugins/kiro/scripts/install-id.sh" "$KIRO_ROOT/scripts/"
+   "$REPO/plugins/kiro/scripts/actor.sh" "$REPO/plugins/kiro/scripts/install-id.sh" \
+   "$REPO/plugins/kiro/scripts/kiro-host.sh" "$KIRO_ROOT/scripts/"
 echo '{"name":"rogue","version":"9.9.9"}' > "$KIRO_ROOT/plugin.json"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$SB_CALLS"\nexit 0\n' > "$TMPROOT/kiro-bin/curl"
 chmod +x "$TMPROOT/kiro-bin/curl"
+# kiro-cli 2.21.0's shape: `--version` prints "kiro-cli <X.Y.Z>", and
+# `settings chat.defaultAgent` prints the value (quoted, as the real CLI does)
+# or errors out when none is set. The IDE has no CLI: its version is the app
+# bundle's Info.plist, pointed at through ROGUE_KIRO_APP so the suite never
+# reads /Applications.
+# Every call is recorded, so a throttled beacon can be shown to spawn none.
+cat > "$TMPROOT/kiro-bin/kiro-cli" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "${KIRO_CLI_LOG:-/dev/null}"
+case "$1 $2" in
+  "--version ")                echo "kiro-cli 2.21.0" ;;
+  "settings chat.defaultAgent") [ -n "${KIRO_FAKE_DEFAULT:-}" ] && { echo "\"$KIRO_FAKE_DEFAULT\""; exit 0; }
+                               echo "error: No value associated with chat.defaultAgent" >&2; exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$TMPROOT/kiro-bin/kiro-cli"
+KIRO_APP="$TMPROOT/Kiro.app"
+mkdir -p "$KIRO_APP/Contents"
+cat > "$KIRO_APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>CFBundleVersion</key><string>26030401</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.437</string>
+</dict></plist>
+PLIST
 echo 'export ROGUE_API_KEY=k' > "$KIRO_HOME/.rogue-env"
 KIRO_STAMP="$KIRO_HOME/.rogue/beacon/.last-kiro"
 # kiro_beacon <surface> <trigger> → the recorded curl arguments (one line per call)
 # `env -u` scrubs the developer's own ROGUE_* (this suite is very likely run from a
 # shell that exports a real key): only the temp HOME's env file may configure it.
 kiro_beacon() {
-  : > "$TMPROOT/kiro-calls"
+  : > "$TMPROOT/kiro-calls"; : > "$TMPROOT/kiro-cli-calls"
   env -u ROGUE_API_KEY -u ROGUE_BASE_URL -u ROGUE_ACTOR_EMAIL -u ROGUE_ACTOR_NAME \
-      SB_CALLS="$TMPROOT/kiro-calls" PATH="$TMPROOT/kiro-bin:$PATH" HOME="$KIRO_HOME" \
+      SB_CALLS="$TMPROOT/kiro-calls" KIRO_CLI_LOG="$TMPROOT/kiro-cli-calls" \
+      PATH="$TMPROOT/kiro-bin:$PATH" HOME="$KIRO_HOME" \
+      ROGUE_KIRO_APP="${ROGUE_KIRO_APP:-$TMPROOT/no-app}" KIRO_FAKE_DEFAULT="${KIRO_FAKE_DEFAULT:-}" \
       "$SH" "$KIRO_ROOT/scripts/heartbeat.sh" "$1" "$2" >/dev/null 2>&1
   cat "$TMPROOT/kiro-calls"
 }
@@ -244,10 +274,38 @@ check "SessionStart posts /hooks/status" "yes" "$(has "$out" "/api/v1/hooks/stat
 check "the body names family kiro" "yes" "$(has "$out" '"agent_family":"kiro"')"
 check "the body carries the surface argument" "yes" "$(has "$out" '"agent":"kiro_ide"')"
 check "the version comes from plugin.json" "yes" "$(has "$out" '"version":"9.9.9"')"
+check "no app bundle → agent_version unknown, never blank" "yes" "$(has "$out" '"agent_version":"unknown"')"
 check "the stamp slug is kiro (the log file's name)" "yes" "$([ -s "$KIRO_STAMP" ] && echo yes || echo no)"
 check "Stop inside the window is throttled" "" "$(kiro_beacon kiro_ide Stop)"
 rm -rf "${KIRO_STAMP%/*}"
 check "an unrecognised surface falls back to kiro_cli" "yes" "$(has "$(kiro_beacon bogus Stop)" '"agent":"kiro_cli"')"
+rm -rf "${KIRO_STAMP%/*}"
+echo "── the kiro heartbeat reports the host's own version and the CLI default ──"
+# Two versions ride one row: `version` is the plugin's, `agent_version` is the
+# Kiro build it runs under - the CLI from `kiro-cli --version`, the IDE from
+# the app bundle - so support can tell a plugin that is current from a Kiro that
+# is not. The CLI also reports which agent is the default: on the 2.x engine
+# only agents carrying the Rogue hooks are covered, so a machine whose default
+# moved away from `rogue` is a machine the roster should show as uncovered.
+out="$(KIRO_FAKE_DEFAULT=rogue kiro_beacon kiro_cli SessionStart)"
+check "kiro_cli reports agent_version from kiro-cli --version" "yes" "$(has "$out" '"agent_version":"2.21.0"')"
+check "kiro_cli reports the default agent, unquoted" "yes" "$(has "$out" '"default_agent":"rogue"')"
+check "SessionStart asks kiro-cli for its version" "yes" "$(has "$(cat "$TMPROOT/kiro-cli-calls")" '--version')"
+# Throttled means throttled: the probes are kiro-cli processes, and a per-turn
+# Stop inside the window must spawn none of them - the claim comes first.
+check "a Stop inside the window makes no request" "" "$(KIRO_FAKE_DEFAULT=rogue kiro_beacon kiro_cli Stop)"
+check "and asks Kiro nothing (no kiro-cli process)" "" "$(cat "$TMPROOT/kiro-cli-calls")"
+rm -rf "${KIRO_STAMP%/*}"
+out="$(kiro_beacon kiro_cli SessionStart)"
+check "no default set → no default_agent field" "no" "$(has "$out" 'default_agent')"
+rm -rf "${KIRO_STAMP%/*}"
+out="$(ROGUE_KIRO_APP="$KIRO_APP" kiro_beacon kiro_ide SessionStart)"
+check "kiro_ide reports agent_version from the app bundle's Info.plist" "yes" "$(has "$out" '"agent_version":"1.0.437"')"
+check "the IDE reports no default agent (that is a CLI setting)" "no" "$(has "$out" 'default_agent')"
+rm -rf "${KIRO_STAMP%/*}"
+out="$(KIRO_FAKE_DEFAULT=rogue kiro_beacon kiro_crew SessionStart)"
+check "kiro_crew reports the CLI version (Crew drives kiro-cli)" "yes" "$(has "$out" '"agent_version":"2.21.0"')"
+check "kiro_crew reports no default agent" "no" "$(has "$out" 'default_agent')"
 rm -f "$KIRO_HOME/.rogue-env"
 check "unconfigured is a no-op" "" "$(kiro_beacon kiro_cli SessionStart)"
 

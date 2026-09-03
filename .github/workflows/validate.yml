@@ -98,6 +98,11 @@ jobs:
           TEST_SH=dash bash tests/test_actor_sh.sh
           TEST_SH=dash bash tests/test_install_id_sh.sh
           TEST_SH=dash bash tests/test_status_skill_sh.sh
+          # Kiro has no slash-command surface, so its status command is a script
+          # rather than a skill document; both shells, since a developer runs it
+          # by hand under bash and a managed rollout verifies under /bin/sh.
+          TEST_SH=dash bash tests/test_status_kiro_sh.sh
+          TEST_SH=bash bash tests/test_status_kiro_sh.sh
           bash tests/test_plugin_versions_sh.sh
           # Twice, because hooks.json fires auto-update.sh as `sh <script>` - an
           # explicit interpreter overrides its bash shebang, so production really
@@ -336,6 +341,7 @@ jobs:
           pwsh -NoProfile -File tests/test_auto_update_ps1.ps1
           pwsh -NoProfile -File tests/test_setup_env.ps1
           pwsh -NoProfile -File tests/test_install_kiro_ps1.ps1
+          pwsh -NoProfile -File tests/test_status_kiro_ps1.ps1
 
   windows:
     # The job the seam CANNOT stand in for. Every PowerShell test in the job above
@@ -391,4 +397,6 @@ jobs:
           powershell -NoProfile -File tests/test_setup_env.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_install_kiro_ps1.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_status_kiro_ps1.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }

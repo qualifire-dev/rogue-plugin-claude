@@ -37,7 +37,63 @@ event, and when a 2.x body carries no `session_id` the bridge copies
 
 One line per event lands in `~/.rogue/logs/kiro.log`
 (`provider=kiro surface=<surface> event=<Event> outcome=… http=… rc=… raw=…`),
-see `docs/hook-log-format.md`.
+see `docs/hook-log-format.md`. The shared shipper (`scripts/ship-logs.sh` /
+`.ps1`, a byte-identical copy of `scripts/shared/`) uploads it in the
+background, and knows `kiro` as one of the per-agent logs its support form
+collects.
+
+## Roster heartbeat
+
+`scripts/heartbeat.sh <surface> <trigger>` (`heartbeat.ps1` on Windows) is
+spawned detached by the bridge on `SessionStart` (unthrottled) and on every
+`Stop` (throttled by the shared `scripts/beacon.sh`). It POSTs
+`/api/v1/hooks/status` so this install shows up in the Coding Agents roster,
+then runs the log shipper. The body is built by one function that the status
+script reuses - `rogue_kiro_status_body` in `scripts/kiro-host.sh`,
+`Get-StatusBody` in `heartbeat.ps1` - because the backend fingerprints the row
+on host, actor, family and agent, and a second copy of the fields is a second
+chance to open a second row for one install:
+
+| field | value | from | stored by the roster today |
+| --- | --- | --- | --- |
+| `agent_family` | `kiro` | fixed | yes |
+| `agent` | the surface argument (`kiro_ide` / `kiro_cli` / `kiro_crew`) | the hook file the event came through | yes, part of the row's fingerprint |
+| `version` | this plugin's version | `plugin.json`, via `scripts/install-id.sh` | yes, drives the "outdated" badge |
+| `host`, `actor_email`, `actor_name` | the install identity | `install-id.sh`, `actor.sh` | yes, the rest of the fingerprint |
+| `agent_version` | the Kiro build the surface runs under | `scripts/kiro-host.sh`: `kiro-cli --version` for the CLI and Crew, the app bundle (`Info.plist`, or the install's `package.json` on Windows) for the IDE | **no** |
+| `default_agent` | the CLI's `chat.defaultAgent`; **omitted** when none is set or off the CLI | `kiro-host.sh`: `kiro-cli settings chat.defaultAgent` | **no** |
+
+`agent_version` and `default_agent` are sent ahead of the backend. The
+`/hooks/status` schema in rogue-aidr-api (`StatusBodySchema`) lists neither,
+and unknown body fields are stripped rather than rejected, so the POST lands
+and the two values are dropped on arrival: the roster does not show the Kiro
+build or the CLI default agent yet. Until the backend half (schema, a column
+on `coding_agent`, the roster UI) ships in the monorepo, `status.sh` /
+`status.ps1` on the machine is where both are visible. They are sent now
+rather than later because the contract is the interesting part: `agent_version`
+is what support needs when a Kiro release changes hook behaviour, and on the
+2.x engine only agents that carry the Rogue hooks are covered (ADR 0001), so a
+`default_agent` that moved away from `rogue` is an uncovered machine.
+
+## Status
+
+Kiro has no slash-command surface for a `/rogue:status` skill, so the status
+command is a script:
+
+```
+sh ~/.rogue/plugins/kiro/scripts/status.sh
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.rogue\plugins\kiro\scripts\status.ps1"
+```
+
+It reports the credential sources and the resolved key (last four characters),
+the installed surfaces with their Kiro builds, the hook wiring the installer
+wrote (hook file, Crew wrappers, agent configs carrying the hooks, the 2.x
+default agent and whether it is covered), the `/hooks/status` check (HTTP code,
+organisation, running vs latest plugin version) and the last 20 lines of
+`kiro.log`. It posts the heartbeat's own body, resolved through the same
+helpers, so it refreshes the install's roster row rather than opening a second
+one. Exit 0 when configured and the API answered 200, 1 otherwise, so a managed
+rollout can verify a machine from a script.
 
 ## What the installer writes
 
@@ -75,6 +131,16 @@ receives the IDE's prompt-block JSON, which the 3.0 CLI ignores) until the
 hardware matrix (FIRE-2038) finds a run-time signal that tells the two hosts
 apart. This is the one known mislabel.
 
+## Versioning and release
+
+`plugin.json` carries the version of record (`install-id.sh`, `hook.ps1` and
+`heartbeat.ps1` read it there); `VERSION` beside it mirrors the value for
+operators and the release page, and `scripts/plugin-versions.sh` refuses to
+build a release while the two disagree. `release.yml` publishes the plugin as
+`rogue-plugin-kiro.tar.gz` (the archive's top dir is this directory) and lists
+the version in `versions.json` under slug `kiro`, which the backend maps
+family `kiro` to when it decides whether a roster row is outdated.
+
 ## Credentials
 
 Later file wins:
@@ -93,6 +159,8 @@ be sure it applies on both.
 
 ```
 bash tests/test_hook_sh_kiro.sh            # bridge end to end against tests/mock_server.py
+bash tests/test_status_kiro_sh.sh          # status.sh under a temp HOME with a fake kiro-cli and curl
+sh tests/test_heartbeat_sh.sh              # beacon throttle + the kiro heartbeat body
 bash tests/test_install_kiro_sh.sh         # install.sh --kiro under a temp HOME with a fake kiro-cli
 pwsh tests/test_install_kiro_ps1.ps1       # the same wiring in install.ps1
 TEST_SH=dash bash tests/test_hook_sh_kiro.sh

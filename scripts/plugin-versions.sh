@@ -75,7 +75,16 @@ CURSOR_V=$(read_json_version "plugins/cursor/.cursor-plugin/plugin.json")
 COPILOT_V=$(read_json_version "plugins/copilot/plugin.json")
 GEMINI_V=$(read_json_version "plugins/gemini/gemini-extension.json")
 ANTIGRAVITY_V=$(read_plain_version "plugins/antigravity/VERSION")
+# Kiro carries both: plugin.json is the version of record (install-id.sh,
+# hook.ps1 and heartbeat.ps1 all read it there) and a bare VERSION file beside
+# it for operators and the release page. Two files is one drift waiting to
+# happen, so this refuses to publish while they disagree rather than pick one.
 KIRO_V=$(read_json_version "plugins/kiro/plugin.json")
+KIRO_FILE_V=$(read_plain_version "plugins/kiro/VERSION")
+if [ "$KIRO_V" != "$KIRO_FILE_V" ]; then
+  echo "✗ plugins/kiro: plugin.json says $KIRO_V but VERSION says $KIRO_FILE_V" >&2
+  exit 1
+fi
 
 cat <<JSON
 {

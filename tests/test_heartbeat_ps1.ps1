@@ -335,7 +335,142 @@ try {
     $kiroHb = Get-Content -Raw (Join-Path $repo 'plugins/kiro/scripts/heartbeat.ps1')
     Check "kiro heartbeat.ps1 takes the surface positionally" $true `
         ($kiroHb -match "param\(\[string\]\`$Agent = '', \[string\]\`$Trigger = 'SessionStart'\)")
-    Check "kiro heartbeat.ps1 reports family kiro" $true ($kiroHb -match "agent_family = 'kiro'")
+
+    Write-Host "-- the kiro heartbeat, RUN: surface, Kiro build, default agent, throttle --"
+    # Executed through the seam, not grepped. The source-regex checks this block
+    # replaces passed against a heartbeat that reported kiro_cli for EVERY install:
+    # a file-scope `$agent = ''` overwrote the `$Agent` parameter before
+    # Resolve-Surface read it (PowerShell variable names are case-insensitive).
+    # The sh twin (tests/test_heartbeat_sh.sh) runs the same cases against
+    # heartbeat.sh; both halves must agree case for case.
+    #
+    # heartbeat.ps1 is dot-sourced at SCRIPT scope, never inside a function: its
+    # helpers read the file-scope state (`$pluginRoot`, `$ver`, `$surface`...)
+    # unqualified, and a dot-source inside a function would leave that state in
+    # the function's scope while the `$script:` writes land here.
+    $kiroRoot = Join-Path (Join-Path $repo 'plugins') 'kiro'
+    $kiroBin = Join-Path $sandbox 'kiro-bin'
+    New-Item -ItemType Directory -Path $kiroBin -Force | Out-Null
+    $kiroCliLog = Join-Path $sandbox 'kiro-cli.log'
+    # kiro-cli 2.21.0's shape: `--version` prints "kiro-cli <X.Y.Z>", `settings
+    # chat.defaultAgent` prints the value quoted or errors out when none is set.
+    # Every call is recorded, so a throttled beacon can be shown to spawn none.
+    $fakeCli = Join-Path $kiroBin 'kiro-cli.ps1'
+    @'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Argv)
+if ($env:KIRO_CLI_LOG) { Add-Content -LiteralPath $env:KIRO_CLI_LOG -Value ($Argv -join ' ') }
+if ($Argv[0] -eq '--version') { Write-Output 'kiro-cli 2.21.0'; exit 0 }
+if ("$($Argv[0]) $($Argv[1])" -eq 'settings chat.defaultAgent') {
+    if ($env:KIRO_FAKE_DEFAULT) { Write-Output ('"' + $env:KIRO_FAKE_DEFAULT + '"'); exit 0 }
+    [Console]::Error.WriteLine('error: No value associated with chat.defaultAgent')
+    exit 1
+}
+exit 0
+'@ | Set-Content -LiteralPath $fakeCli -Encoding UTF8
+    if ($env:OS -ne 'Windows_NT') {
+        $shim = Join-Path $kiroBin 'kiro-cli'
+        [System.IO.File]::WriteAllText($shim, "#!/bin/sh`nexec pwsh -NoProfile -File `"$fakeCli`" `"`$@`"`n")
+        & chmod +x $shim
+    }
+    # The IDE install as the heartbeat reads it on Windows: <root>\resources\app\package.json.
+    $kiroIde = Join-Path $sandbox 'Kiro'
+    New-Item -ItemType Directory -Path (Join-Path (Join-Path $kiroIde 'resources') 'app') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path (Join-Path $kiroIde 'resources') 'app') 'package.json'),
+        "{`n  `"version`": `"1.0.437`"`n}`n")
+    [System.IO.File]::WriteAllText((Join-Path $sandbox '.rogue-env'), "export ROGUE_API_KEY=k`n")
+    $kiroStamp = Join-Path (Join-Path (Join-Path $sandbox '.rogue') 'beacon') '.last-kiro'
+    $kiroPluginVer = [regex]::Match((Get-Content -Raw (Join-Path $kiroRoot 'plugin.json')), '"version"\s*:\s*"([^"]+)"').Groups[1].Value
+
+    # Invoke-WebRequest shadowed: functions win over cmdlets. Records the body.
+    $script:kiroSent = $null
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param($Uri, $Method, $Headers, $ContentType, $Body, [switch]$UseBasicParsing, $TimeoutSec)
+        $script:kiroSent = [System.Text.Encoding]::UTF8.GetString($Body)
+        return [pscustomobject]@{ StatusCode = 200; Content = '{}' }
+    }
+    # The developer's shell very likely exports a real key and the interval knob;
+    # the trap above (interval 0) would also disable the throttle this block tests.
+    $kiroSavedEnv = @{}
+    foreach ($k in 'PATH','ROGUE_API_KEY','ROGUE_BASE_URL','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME',
+                   'ROGUE_HEARTBEAT_MIN_INTERVAL','ROGUE_KIRO_APP','KIRO_FAKE_DEFAULT','KIRO_CLI_LOG') {
+        $kiroSavedEnv[$k] = [Environment]::GetEnvironmentVariable($k)
+        if ($k -ne 'PATH') { [Environment]::SetEnvironmentVariable($k, $null) }
+    }
+    $env:PATH = $kiroBin + [System.IO.Path]::PathSeparator + $env:PATH
+    $env:KIRO_CLI_LOG = $kiroCliLog
+    $env:ROGUE_KIRO_APP = Join-Path $sandbox 'no-app'
+
+    $kiroHbPath = Join-Path (Join-Path $kiroRoot 'scripts') 'heartbeat.ps1'
+    # Replays one run (Invoke-Main minus TLS and the exit) for a surface and a
+    # trigger and returns the body it posted, or $null when it posted nothing.
+    # A SCRIPTBLOCK that is dot-invoked, not a function: the file is dot-sourced
+    # WITH its arguments each time so the param block and every file-scope
+    # statement run in the shipped order - which is exactly where the `$Agent`
+    # clobber lived - and all of it lands in this script's scope.
+    $invokeKiroHeartbeat = {
+        param([string]$Which, [string]$When)
+        $script:kiroSent = $null
+        [System.IO.File]::WriteAllText($kiroCliLog, '')
+        . $kiroHbPath $Which $When
+        $script:pluginRoot = $kiroRoot
+        $lib = Get-BeaconLibrary
+        if ($lib) { . $lib }
+        Import-Credentials; Initialize-Beacon; Resolve-BaseUrl; Resolve-Actor; Resolve-Version; Resolve-Surface
+        Send-Heartbeat
+        $script:kiroSent
+    }
+    function Get-KiroCliCalls { return ([System.IO.File]::ReadAllText($kiroCliLog)).Trim() }
+    function Clear-KiroStamp { Remove-Item -LiteralPath $kiroStamp -Force -ErrorAction SilentlyContinue }
+
+    Clear-KiroStamp
+    $env:ROGUE_KIRO_APP = $kiroIde
+    $b = . $invokeKiroHeartbeat 'kiro_ide' 'SessionStart'
+    Check "SessionStart posts a body" $true ($null -ne $b)
+    Check "the body names family kiro" $true ($b -like '*"agent_family":"kiro"*')
+    Check "the body carries the surface argument (kiro_ide, not the kiro_cli default)" $true ($b -like '*"agent":"kiro_ide"*')
+    Check "the version comes from plugin.json" $true ($b -like "*`"version`":`"$kiroPluginVer`"*")
+    Check "kiro_ide reports agent_version from the install's package.json" $true ($b -like '*"agent_version":"1.0.437"*')
+    Check "the IDE reports no default agent (that is a CLI setting)" $false ($b -like '*default_agent*')
+    Check "the IDE never runs kiro-cli" '' (Get-KiroCliCalls)
+    Check "the stamp slug is kiro (the log file's name)" $true (Test-Path -LiteralPath $kiroStamp)
+    $env:ROGUE_KIRO_APP = Join-Path $sandbox 'no-app'
+    Clear-KiroStamp
+    $b = . $invokeKiroHeartbeat 'kiro_ide' 'SessionStart'
+    Check "no install -> agent_version unknown, never blank" $true ($b -like '*"agent_version":"unknown"*')
+
+    Clear-KiroStamp
+    $env:KIRO_FAKE_DEFAULT = 'rogue'
+    $b = . $invokeKiroHeartbeat 'kiro_cli' 'SessionStart'
+    Check "kiro_cli reports agent_version from kiro-cli --version" $true ($b -like '*"agent_version":"2.21.0"*')
+    Check "kiro_cli reports the default agent, unquoted" $true ($b -like '*"default_agent":"rogue"*')
+    Check "SessionStart asks kiro-cli for its version and the default" $true `
+        ((Get-KiroCliCalls) -like '*--version*' -and (Get-KiroCliCalls) -like '*settings chat.defaultAgent*')
+    # Throttled means throttled: the probes are kiro-cli processes, and a per-turn
+    # Stop inside the window must spawn none of them - the claim comes first.
+    $b = . $invokeKiroHeartbeat 'kiro_cli' 'Stop'
+    Check "a Stop inside the window makes no request" $true ($null -eq $b)
+    Check "and asks Kiro nothing (no kiro-cli process)" '' (Get-KiroCliCalls)
+    [System.IO.File]::WriteAllText($kiroStamp, "0`n")
+    $b = . $invokeKiroHeartbeat 'kiro_cli' 'Stop'
+    Check "a Stop past the window posts again" $true ($null -ne $b)
+
+    Clear-KiroStamp
+    $env:KIRO_FAKE_DEFAULT = $null
+    $b = . $invokeKiroHeartbeat 'kiro_cli' 'SessionStart'
+    Check "no default set -> no default_agent field" $false ($b -like '*default_agent*')
+
+    Clear-KiroStamp
+    $env:KIRO_FAKE_DEFAULT = 'rogue'
+    $b = . $invokeKiroHeartbeat 'kiro_crew' 'SessionStart'
+    Check "kiro_crew reports the CLI version (Crew drives kiro-cli)" $true ($b -like '*"agent_version":"2.21.0"*')
+    Check "kiro_crew reports no default agent" $false ($b -like '*default_agent*')
+
+    Clear-KiroStamp
+    $b = . $invokeKiroHeartbeat 'bogus' 'SessionStart'
+    Check "an unrecognised surface falls back to kiro_cli" $true ($b -like '*"agent":"kiro_cli"*')
+
+    foreach ($k in $kiroSavedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $kiroSavedEnv[$k]) }
 }
 finally {
     $env:USERPROFILE = $saveProfile
