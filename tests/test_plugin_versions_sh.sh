@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit tests for scripts/plugin-versions.sh — the ONLY reader of the six plugin
+# Unit tests for scripts/plugin-versions.sh — the ONLY reader of the seven plugin
 # version files.
 #
 # This script's output is the contract the backend resolves "outdated" from, so a
@@ -19,7 +19,7 @@ out=$(bash "$SCRIPT" "$REPO" 2>/dev/null) || { bad "real tree" "exited non-zero"
 
 flat=$(printf '%s' "$out" | tr -d ' \t\n\r')
 
-for slug in claude codex cursor copilot gemini antigravity; do
+for slug in claude codex cursor copilot gemini antigravity kiro; do
   case "$flat" in
     *"\"$slug\":\""*) ok "emits $slug" ;;
     *) bad "emits $slug" "key missing from: $out" ;;
@@ -31,11 +31,11 @@ case "$flat" in
   *) bad "carries schema 1" "not found in: $out" ;;
 esac
 
-# Exactly six plugin keys — an extra key means a plugin was added without a
+# Exactly seven plugin keys — an extra key means a plugin was added without a
 # matching backend mapping, which resolves to null (never outdated).
 keys=$(printf '%s' "$flat" | grep -oE '"[a-z]+":"[0-9]+\.[0-9]+\.[0-9]+"' | wc -l | tr -d ' ')
-if [ "$keys" = "6" ]; then ok "exactly six plugin versions"; else
-  bad "exactly six plugin versions" "found $keys"; fi
+if [ "$keys" = "7" ]; then ok "exactly seven plugin versions"; else
+  bad "exactly seven plugin versions" "found $keys"; fi
 
 # Every value must be a bare X.Y.Z. "unknown", "v1.2.3" and "1.2" all coerce
 # wrong on the consumer side.
@@ -44,7 +44,7 @@ bogus=$(printf '%s' "$flat" | grep -oE '"[a-z]+":"[^"]*"' | grep -vE '"schema"' 
 if [ -z "$bogus" ]; then ok "all values are bare X.Y.Z"; else
   bad "all values are bare X.Y.Z" "$bogus"; fi
 
-# Every value must equal what that plugin's OWN version file says — all six, not
+# Every value must equal what that plugin's OWN version file says — all seven, not
 # a sample. The slug-to-file mapping is hand-written per plugin, so a slug reading
 # from the wrong file produces a valid-looking X.Y.Z that every other check here
 # accepts. That is precisely the bug this manifest exists to end: a version key
@@ -73,14 +73,14 @@ case "$flat" in
   *) bad "antigravity matches its VERSION file" "expected $agv_expected in: $out" ;;
 esac
 
-# The six must be DISTINCT reads, not one file echoed six times. A mapping bug
+# The seven must be DISTINCT reads, not one file echoed seven times. A mapping bug
 # that pointed several slugs at the same manifest would satisfy every assertion
 # above only if those plugins happened to share a version - so assert the shape
-# of the real tree instead: not all six versions are equal today.
-uniq_count=$(printf '%s' "$flat" | grep -oE '"(claude|codex|cursor|copilot|gemini|antigravity)":"[0-9]+\.[0-9]+\.[0-9]+"' \
+# of the real tree instead: not all seven versions are equal today.
+uniq_count=$(printf '%s' "$flat" | grep -oE '"(claude|codex|cursor|copilot|gemini|antigravity|kiro)":"[0-9]+\.[0-9]+\.[0-9]+"' \
   | sed -E 's/.*:"//; s/"//' | sort -u | wc -l | tr -d ' ')
-if [ "$uniq_count" -gt 1 ]; then ok "the six versions are not one value repeated ($uniq_count distinct)"; else
-  bad "the six versions are not one value repeated" "all six read $uniq_count distinct value(s)"; fi
+if [ "$uniq_count" -gt 1 ]; then ok "the seven versions are not one value repeated ($uniq_count distinct)"; else
+  bad "the seven versions are not one value repeated" "all seven read $uniq_count distinct value(s)"; fi
 
 # ── Fail-hard cases, against fixture trees ───────────────────────────────────
 # A build that emits a manifest with a hole is worse than a build that fails:
@@ -89,10 +89,11 @@ fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/plugins/rogue/.claude-plugin" "$fixture/plugins/codex/.codex-plugin" \
          "$fixture/plugins/cursor/.cursor-plugin" "$fixture/plugins/copilot" \
-         "$fixture/plugins/gemini" "$fixture/plugins/antigravity"
+         "$fixture/plugins/gemini" "$fixture/plugins/antigravity" "$fixture/plugins/kiro"
 echo '{"version":"9.9.9"}' > "$fixture/plugins/rogue/.claude-plugin/plugin.json"
 echo '{"version":"9.9.9"}' > "$fixture/plugins/codex/.codex-plugin/plugin.json"
 echo '{"version":"9.9.9"}' > "$fixture/plugins/cursor/.cursor-plugin/plugin.json"
+echo '{"version":"9.9.9"}' > "$fixture/plugins/kiro/plugin.json"
 echo '{"version":"9.9.9"}' > "$fixture/plugins/copilot/plugin.json"
 echo '{"version":"9.9.9"}' > "$fixture/plugins/gemini/gemini-extension.json"
 echo '9.9.9' > "$fixture/plugins/antigravity/VERSION"

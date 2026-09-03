@@ -151,6 +151,28 @@ if [ -d "plugins/antigravity" ]; then
   rm -rf "$AGVSTAGE"
 fi
 
+# ── Kiro plugin tarball ──────────────────────────────────────────────────────
+# Kiro has no plugin CLI or marketplace; the one-line installer downloads THIS
+# tarball, extracts it, and copies it to ~/.rogue/plugins/kiro — outside every
+# Kiro path — then writes the hook files that point Kiro at the bridge. Like
+# Antigravity, the archive's TOP DIR *is* the plugin: plugin.json sits at the
+# archive root. Versionless name keeps the /releases/latest/download/ URL
+# stable. Cross-platform by content (ships both hook.sh and hook.ps1).
+if [ -d "plugins/kiro" ]; then
+  KIRO_VERSION=$(plugin_version kiro)
+  echo "→ kiro plugin version: $KIRO_VERSION"
+  KRSTAGE=$(mktemp -d)
+  KRTOP="$KRSTAGE/rogue-plugin-kiro"
+  mkdir -p "$KRTOP"
+  cp -R plugins/kiro/. "$KRTOP/"
+  cp LICENSE "$KRTOP/" 2>/dev/null || true
+  KROUT="$DIST/rogue-plugin-kiro.tar.gz"
+  tar -czf "$KROUT" -C "$KRSTAGE" "rogue-plugin-kiro"
+  KRSIZE=$(wc -c < "$KROUT" | awk '{print $1}')
+  echo "✓ $KROUT  ($KRSIZE bytes, version $KIRO_VERSION)"
+  rm -rf "$KRSTAGE"
+fi
+
 # ── GitHub Copilot CLI plugin tarball ────────────────────────────────────────
 # Primary Copilot install path is `copilot plugin marketplace add <repo>` (git),
 # but we also ship a versionless tarball so /releases/latest/download URLs are

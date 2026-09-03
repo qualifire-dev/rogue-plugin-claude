@@ -2,7 +2,7 @@
 set -euo pipefail
 # Print the per-plugin version manifest as JSON.
 #
-# THIS IS THE ONLY PLACE THE SIX VERSION FILES ARE READ. build-release.sh calls
+# THIS IS THE ONLY PLACE THE SEVEN VERSION FILES ARE READ. build-release.sh calls
 # it once and derives every per-tarball echo from the result, so the manifest
 # attached to a release and the tarballs beside it cannot disagree. Reading a
 # version file twice is exactly how they would.
@@ -75,6 +75,7 @@ CURSOR_V=$(read_json_version "plugins/cursor/.cursor-plugin/plugin.json")
 COPILOT_V=$(read_json_version "plugins/copilot/plugin.json")
 GEMINI_V=$(read_json_version "plugins/gemini/gemini-extension.json")
 ANTIGRAVITY_V=$(read_plain_version "plugins/antigravity/VERSION")
+KIRO_V=$(read_json_version "plugins/kiro/plugin.json")
 
 cat <<JSON
 {
@@ -85,7 +86,8 @@ cat <<JSON
     "cursor": "$CURSOR_V",
     "copilot": "$COPILOT_V",
     "gemini": "$GEMINI_V",
-    "antigravity": "$ANTIGRAVITY_V"
+    "antigravity": "$ANTIGRAVITY_V",
+    "kiro": "$KIRO_V"
   }
 }
 JSON
