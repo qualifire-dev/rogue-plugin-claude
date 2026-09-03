@@ -132,7 +132,9 @@ function New-KiroHookEntries {
             timeout = $KiroHookTimeout
         }
     }
-    return ,$entries
+    # No unary comma: callers collect the entries with @(), and a comma-wrapped
+    # array would land inside it as ONE element - serialising hooks as [[...]].
+    return $entries
 }
 
 # UTF-8 without BOM: Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes one,
@@ -245,7 +247,7 @@ function Install-KiroHooks {
     $hooksDir = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'hooks')
     $hookFile = Write-KiroHookFile $PluginDir $hooksDir
     Ok "Hook file written -> $hookFile"
-    $agentEntries = New-KiroHookEntries $PluginDir 'kiro_cli' $KiroAgentTriggers
+    $agentEntries = @(New-KiroHookEntries $PluginDir 'kiro_cli' $KiroAgentTriggers)
     if (Get-Command kiro-cli -ErrorAction SilentlyContinue) {
         $null = Install-KiroRogueAgent
         Set-KiroDefaultAgent

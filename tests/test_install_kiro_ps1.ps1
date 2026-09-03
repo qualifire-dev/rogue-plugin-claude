@@ -114,7 +114,7 @@ $custom = Join-Path $agentsDir 'custom.json'
   "prompt": "be careful"
 }
 '@ | Set-Content -LiteralPath $custom -Encoding UTF8
-$entries = New-KiroHookEntries $pluginDir 'kiro_cli' $KiroAgentTriggers
+$entries = @(New-KiroHookEntries $pluginDir 'kiro_cli' $KiroAgentTriggers)
 Assert-Eq (Merge-KiroAgentHooks $custom $entries) 'merged' 'custom agent merges'
 $c = Read-Json $custom
 Assert-Eq $c.model 'claude-sonnet-4' 'custom agent keeps its model'
