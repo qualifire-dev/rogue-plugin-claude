@@ -149,7 +149,7 @@ the one path. This is the same precedence the eleven dispatchers implement and
 ROGUE_LOG_DIR"), and its basename is arbitrary — so, exactly as for the plugin
 shipper, that file's lines are attributed per line off `provider=`, never per file.
 
-Otherwise glob `<dir>/{claude,codex,cursor,gemini,copilot,antigravity}.log` plus each
+Otherwise glob `<dir>/{claude,codex,cursor,gemini,copilot,antigravity,kiro}.log` plus each
 `.1`. Ship `.1` **before** its live file so the batch stays chronological.
 
 **Payload.** Let the task narrow the request, all optional:

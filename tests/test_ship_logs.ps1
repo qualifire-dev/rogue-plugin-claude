@@ -307,6 +307,7 @@ $callers = @(
     @{ file = 'plugins/codex/scripts/heartbeat.ps1';       slug = 'codex';       family = 'openai' }
     @{ file = 'plugins/copilot/scripts/heartbeat.ps1';     slug = 'copilot';     family = 'copilot' }
     @{ file = 'plugins/antigravity/scripts/heartbeat.ps1'; slug = 'antigravity'; family = 'antigravity' }
+    @{ file = 'plugins/kiro/scripts/heartbeat.ps1';        slug = 'kiro';        family = 'kiro' }
     @{ file = 'plugins/cursor/scripts/hook.ps1';           slug = 'cursor';      family = 'cursor' }
 )
 foreach ($caller in $callers) {
@@ -339,11 +340,11 @@ foreach ($caller in $callers) {
 
 # ── the five copies are the same file ──────────────────────────────────────
 Write-Host ''
-Write-Host '== the five plugin copies match scripts/shared/ship-logs.ps1'
+Write-Host '== the six plugin copies match scripts/shared/ship-logs.ps1'
 # Every per-plugin difference is an ARGUMENT, which is what lets this be a byte
 # comparison instead of a review. scripts/shared/ is the only editable copy.
 $canonical = [System.IO.File]::ReadAllBytes((Join-Path $repo 'scripts/shared/ship-logs.ps1'))
-foreach ($plugin in @('rogue', 'codex', 'cursor', 'copilot', 'antigravity')) {
+foreach ($plugin in @('rogue', 'codex', 'cursor', 'copilot', 'antigravity', 'kiro')) {
     $copyPath = Join-Path $repo "plugins/$plugin/scripts/ship-logs.ps1"
     if (-not (Test-Path -LiteralPath $copyPath)) { Fail "missing $copyPath"; continue }
     $copy = [System.IO.File]::ReadAllBytes($copyPath)

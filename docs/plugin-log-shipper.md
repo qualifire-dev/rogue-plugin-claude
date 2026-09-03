@@ -12,8 +12,8 @@ ever matters.
 ## Files
 
 ```text
-plugins/{rogue,codex,cursor,copilot,antigravity}/scripts/ship-logs.sh    byte-identical ×5
-plugins/{rogue,codex,cursor,copilot,antigravity}/scripts/ship-logs.ps1   byte-identical ×5
+plugins/{rogue,codex,cursor,copilot,antigravity,kiro}/scripts/ship-logs.sh    byte-identical ×6
+plugins/{rogue,codex,cursor,copilot,antigravity,kiro}/scripts/ship-logs.ps1   byte-identical ×6
 plugins/gemini/scripts/ship-logs.mjs                                     Node-only, per repo rule
 tests/test_ship_logs.sh
 tests/test_ship_logs.ps1
@@ -23,7 +23,7 @@ Callers (one line each, no `hooks.json` change anywhere):
 
 | plugin | call site |
 |---|---|
-| claude, codex, copilot, antigravity | `scripts/heartbeat.sh` / `heartbeat.ps1` |
+| claude, codex, copilot, antigravity, kiro | `scripts/heartbeat.sh` / `heartbeat.ps1` |
 | gemini | `scripts/heartbeat.mjs` |
 | cursor | the inline beacon block in `hook.sh` / `hook.ps1` (it has no heartbeat script) |
 
