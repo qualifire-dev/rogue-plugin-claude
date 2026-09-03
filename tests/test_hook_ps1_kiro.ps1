@@ -143,6 +143,11 @@ else { Write-Host "FAIL [no literal exit 2]: found $literalExit2"; $fails++ }
 $count++
 if ($src -match "Add-KiroSessionId \`$payload \`$env:KIRO_SESSION_ID") { Write-Host '  ok: main body injects KIRO_SESSION_ID into the payload' }
 else { Write-Host 'FAIL [main body injects KIRO_SESSION_ID]'; $fails++ }
+# ROGUE_HOOK_TIMEOUT=0 must fall back to the default: -TimeoutSec 0 is NO timeout,
+# which would hand the budget to Kiro's own 10s (mirrors hook.sh's `-gt 0` clamp).
+$count++
+if ($src -match '\[int\]\$t -gt 0\) \{ \$timeoutSec = \[int\]\$t \}') { Write-Host '  ok: a zero ROGUE_HOOK_TIMEOUT keeps the default budget' }
+else { Write-Host 'FAIL [a zero ROGUE_HOOK_TIMEOUT keeps the default budget]'; $fails++ }
 
 Write-Host ""
 if ($fails -eq 0) { Write-Host "All $count Kiro PowerShell bridge tests passed."; exit 0 }

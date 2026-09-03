@@ -163,6 +163,10 @@ function Get-KiroSurface {
 # preserving the vendor's bytes (no re-serialisation). A body that already has
 # the field, a value outside the bare token charset, or a body that is not an
 # object comes back unchanged - fail-open to today's 2.x behaviour.
+# "Already has the field" is a SUBSTRING check (no JSON parser here, in lockstep
+# with hook.sh): a NESTED key of the same name skips the injection, which is the
+# fail-open direction - the event is still recorded, without a session id.
+# Prompt text cannot trip it: a quote inside a JSON string is escaped.
 function Add-KiroSessionId {
     param([string]$Payload, [string]$SessionId)
     if (-not $Payload) { return $Payload }
@@ -281,10 +285,10 @@ if (-not $url) {
 
 # curl budget in hook.sh; here the request timeout. The hook file gives the
 # command 10s, so 8s leaves room without letting Kiro's own timeout be what
-# fails us open.
+# fails us open. Zero falls back to the default: -TimeoutSec 0 means NO timeout.
 $timeoutSec = 8
 $t = $creds['ROGUE_HOOK_TIMEOUT']
-if ($t -match '^[0-9]+$') { $timeoutSec = [int]$t }
+if ($t -match '^[0-9]{1,9}$' -and [int]$t -gt 0) { $timeoutSec = [int]$t }
 
 # -- actor resolution (mirrors actor.sh) -------------------------------------
 $actorName = $creds['ROGUE_ACTOR_NAME']

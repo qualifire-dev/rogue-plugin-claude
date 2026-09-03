@@ -34,7 +34,10 @@
 # decision blocks on the IDE only (model-mediated); timeout and exit 1 are both
 # fail-open. Hence the two transports.
 #
-# Credential resolution (later file wins; process env wins over all):
+# Credential resolution (later file wins, INCLUDING over the process env — the
+# files are sourced, and env-file.sh writes `export X=…`, so a value in a later
+# file overwrites whatever the hook inherited; hook.ps1 differs and lets the
+# process env beat every file):
 #   1. ${PLUGIN_ROOT}/env        (baked into a compiled customer plugin)
 #   2. /etc/rogue/env            (MDM-provisioned)
 #   3. $HOME/.rogue-env          (per-user / installer-written)
@@ -129,21 +132,30 @@ URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks
 
 # curl budget, in seconds. The hook file gives the command 10s and the route
 # evaluates within 3s, so 8s leaves room for the network without ever letting
-# Kiro's own timeout be what fails us open. Tests shorten it.
+# Kiro's own timeout be what fails us open. Tests shorten it. Zero falls back to
+# the default too: `curl --max-time 0` means NO timeout, which would hand the
+# budget to Kiro's 10s. `-gt` also rejects a value too wide for the shell's int.
 HOOK_TIMEOUT="${ROGUE_HOOK_TIMEOUT:-8}"
 case "$HOOK_TIMEOUT" in ''|*[!0-9]*) HOOK_TIMEOUT=8 ;; esac
+[ "$HOOK_TIMEOUT" -gt 0 ] 2>/dev/null || HOOK_TIMEOUT=8
 
 # The 2.x engine sends no session_id in the body; it exposes KIRO_SESSION_ID in
 # the hook's environment instead. Copy it into the body under the field the 3.0
 # engine uses, so the route sees one shape. A body that already carries the
 # field is left untouched, byte for byte.
 #
-# Two mutation paths that must agree on the field: jq when on PATH (a real JSON
-# edit; note it re-serializes compact), else string concat that preserves the
-# vendor's bytes. The value is env-controlled text spliced into JSON on the
-# second path, so anything outside a bare token charset is refused outright.
-# Fail-open everywhere: the worst case is the 2.x behaviour of today, an event
-# with no session id.
+# ONE mutation path, string concat, so the posted bytes never depend on whether
+# jq is on PATH and the vendor's bytes are preserved (jq would re-serialise the
+# whole body compact). It matches hook.ps1's Add-KiroSessionId line for line.
+# The value is env-controlled text spliced into JSON, so anything outside a bare
+# token charset is refused outright.
+#
+# "Already carries the field" is a SUBSTRING check: without a JSON parser there
+# is no cheap way to tell a top-level key from a NESTED key of the same name (an
+# MCP tool's arguments, say). Prompt text cannot trip it — a quote inside a JSON
+# string is escaped. The false positive skips the injection, which is fail-open:
+# the event is still recorded, just without a session id (the 2.x behaviour of
+# today). Fail-open everywhere else too.
 # $1 = body; echoes the (possibly augmented) body.
 inject_session_id() {
   _body="$1"
@@ -151,10 +163,6 @@ inject_session_id() {
   case "${KIRO_SESSION_ID:-}" in
     ''|*[!A-Za-z0-9_.:-]*) printf '%s' "$_body"; return ;;
   esac
-  if command -v jq >/dev/null 2>&1; then
-    _out=$(printf '%s' "$_body" | jq -c --arg sid "$KIRO_SESSION_ID" '. + {session_id:$sid}' 2>/dev/null)
-    case "$_out" in '{'*'}') printf '%s' "$_out"; return ;; esac
-  fi
   # Trim trailing whitespace so the single-'}' strip lands on the real closing
   # brace, then again inside so `{\n}` is seen as the empty object it is.
   _body="${_body%"${_body##*[![:space:]]}"}"
