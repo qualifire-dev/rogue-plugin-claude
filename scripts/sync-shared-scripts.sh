@@ -31,13 +31,18 @@ SRC="$REPO/scripts/shared"
 # implementations (plugins/gemini/scripts/ship-logs.mjs, and the beacon throttle
 # inlined in heartbeat.mjs) because Gemini CLI guarantees Node 20+, which is why
 # there is no sh/PowerShell pair to keep in lockstep there.
+# actor.sh is shared by the plugins whose bridge runs under a plain shell with no
+# host-supplied identity; plugins/rogue keeps its own (it ranks
+# CLAUDE_CODE_USER_EMAIL above git and screens the Cowork sandbox identity), and
+# cursor resolves the actor inline.
 ROWS=(
-  "ship-logs.sh|rogue codex cursor copilot antigravity"
-  "ship-logs.ps1|rogue codex cursor copilot antigravity"
-  "beacon.sh|rogue codex cursor copilot antigravity"
-  "beacon.ps1|rogue codex cursor copilot antigravity"
-  "env-file.sh|rogue codex cursor copilot antigravity"
-  "env-file.ps1|rogue codex cursor copilot antigravity"
+  "ship-logs.sh|rogue codex cursor copilot antigravity kiro"
+  "ship-logs.ps1|rogue codex cursor copilot antigravity kiro"
+  "beacon.sh|rogue codex cursor copilot antigravity kiro"
+  "beacon.ps1|rogue codex cursor copilot antigravity kiro"
+  "env-file.sh|rogue codex cursor copilot antigravity kiro"
+  "env-file.ps1|rogue codex cursor copilot antigravity kiro"
+  "actor.sh|codex copilot antigravity kiro"
 )
 
 # An unrecognized argument is an ERROR, not a silent write: the two modes have
