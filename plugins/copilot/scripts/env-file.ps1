@@ -33,14 +33,18 @@ function Write-RogueEnvFile {
     $lines.Add('# Managed by the Rogue plugins. Read by hook subprocesses at runtime.')
     $lines.Add('# Delete this file to revoke credentials.')
     foreach ($key in $managed) {
-        $lines.Add("export $key=$(Format-RogueEnvValue ([string]$Values[$key]))")
+        $value = [string]$Values[$key]
+        if ($value -match "[`r`n]") {
+            throw "Refusing to write ${Path}: the value for $key contains a line break"
+        }
+        $lines.Add("export $key=$(Format-RogueEnvValue $value)")
     }
 
     if (Test-Path -LiteralPath $Path) {
         $owned = '^\s*(?:export\s+)?(?:' +
             (($managed | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\s*='
         $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-        foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop)) {
             if ($line -match $owned)  { continue }
             if ($line -match $header) { continue }
             $lines.Add($line)

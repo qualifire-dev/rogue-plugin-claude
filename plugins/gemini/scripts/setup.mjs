@@ -31,6 +31,15 @@ const MANAGED = {
   ROGUE_ACTOR_NAME: actorName,
 };
 
+for (const [key, value] of Object.entries(MANAGED)) {
+  if (/[\r\n]/.test(String(value))) {
+    process.stderr.write(
+      `Refusing to write ${ENV_FILE}: the value for ${key} contains a line break\n`,
+    );
+    process.exit(1);
+  }
+}
+
 const HEADER = [
   "# Managed by the Rogue plugins. Read by hook subprocesses at runtime.",
   "# Delete this file to revoke credentials.",
@@ -45,7 +54,12 @@ try {
     .split(/\r?\n/)
     .filter((line, index, all) => !(index === all.length - 1 && line === ""))
     .filter((line) => !OWNED.test(line) && !OWN_HEADER.test(line));
-} catch {}
+} catch (err) {
+  if (err.code !== "ENOENT") {
+    process.stderr.write(`Could not read ${ENV_FILE}: ${err.message}\n`);
+    process.exit(1);
+  }
+}
 
 const contents =
   [...HEADER, ...Object.entries(MANAGED).map(([k, v]) => `export ${k}=${q(v)}`), ...preserved]

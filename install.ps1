@@ -242,7 +242,14 @@ if ($ApiKey) {
     }
 
     function Format-EnvVal { param([string]$Val) return "'" + $Val.Replace("'", "'\''") + "'" }
-    $managed = @('ROGUE_API_KEY', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME', 'ROGUE_BASE_URL')
+    $managed = @('ROGUE_API_KEY', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME')
+    if ($BaseUrlExplicit) { $managed += 'ROGUE_BASE_URL' }
+    foreach ($pair in @(@('ROGUE_API_KEY', $ApiKey), @('ROGUE_ACTOR_EMAIL', $Email),
+                        @('ROGUE_ACTOR_NAME', $Name), @('ROGUE_BASE_URL', $BaseUrl))) {
+        if ([string]$pair[1] -match "[`r`n]") {
+            Die "Refusing to write ${EnvFile}: the value for $($pair[0]) contains a line break"
+        }
+    }
     $envLines = @(
         '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.',
         '# Delete this file to revoke credentials.',
@@ -250,11 +257,13 @@ if ($ApiKey) {
         "export ROGUE_ACTOR_EMAIL=$(Format-EnvVal $Email)",
         "export ROGUE_ACTOR_NAME=$(Format-EnvVal $Name)"
     )
-    if ($BaseUrl -ne $ROGUE_BASE_URL_DEFAULT) { $envLines += "export ROGUE_BASE_URL=$(Format-EnvVal $BaseUrl)" }
+    if ($BaseUrlExplicit -and $BaseUrl -ne $ROGUE_BASE_URL_DEFAULT) {
+        $envLines += "export ROGUE_BASE_URL=$(Format-EnvVal $BaseUrl)"
+    }
     if (Test-Path -LiteralPath $EnvFile) {
         $owned = '^\s*(?:export\s+)?(?:' + ($managed -join '|') + ')\s*='
         $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
-        foreach ($line in (Get-Content -LiteralPath $EnvFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        foreach ($line in (Get-Content -LiteralPath $EnvFile -Encoding UTF8 -ErrorAction Stop)) {
             if ($line -match $owned -or $line -match $header) { continue }
             $envLines += $line
         }

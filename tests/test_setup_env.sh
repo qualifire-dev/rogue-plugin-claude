@@ -256,7 +256,9 @@ chmod 000 "$unread_probe"
 if cat "$unread_probe" >/dev/null 2>&1; then
   echo "  skip: mode 000 is readable anyway (running as root?)"
 else
-  for impl in shared install; do
+  impls="shared install"
+  command -v node >/dev/null 2>&1 && impls="$impls node"
+  for impl in $impls; do
     unread_env="$SANDBOX/unreadable-$impl.env"
     seed "$unread_env"
     before="$(cat "$unread_env")"
@@ -265,13 +267,16 @@ else
     if [ "$impl" = shared ]; then
       "$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "should-not-land" ROGUE_ACTOR_EMAIL "x@y.z" ROGUE_ACTOR_NAME "X"' \
         _ "$REPO/scripts/shared/env-file.sh" "$unread_env" >/dev/null 2>&1
-    else
+    elif [ "$impl" = install ]; then
       ROGUE_INSTALL_LIB_ONLY=1 bash -c '
         . "$1"
         ENV_FILE="$2"
         ROGUE_API_KEY="should-not-land"; ROGUE_ACTOR_EMAIL="x@y.z"; ROGUE_ACTOR_NAME="X"
         write_env_file
       ' _ "$REPO/install.sh" "$unread_env" >/dev/null 2>&1
+    else
+      ROGUE_ENV_FILE="$unread_env" node "$REPO/plugins/gemini/scripts/setup.mjs" \
+        "should-not-land" "x@y.z" "X" >/dev/null 2>&1
     fi
     unread_rc=$?
     set -e
@@ -291,6 +296,84 @@ ROGUE_INSTALL_LIB_ONLY=1 bash -c '
   write_env_file >/dev/null 2>&1
 ' _ "$REPO/install.sh" "$def_env"
 check "install.sh: default base url not written" "0" "$(count_lines "$def_env" '^export ROGUE_BASE_URL=')"
+
+nl_env="$SANDBOX/linebreak.env"
+seed "$nl_env"
+nl_before="$(cat "$nl_env")"
+NL_NAME="$(printf 'a\nb')"
+set +e
+"$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "k" ROGUE_ACTOR_EMAIL "e@x.io" ROGUE_ACTOR_NAME "$3"' \
+  _ "$REPO/scripts/shared/env-file.sh" "$nl_env" "$NL_NAME" >/dev/null 2>&1
+nl_rc=$?
+set -e
+check "shared: line break in a value is refused" "1"           "$([ "$nl_rc" = 0 ] && echo 0 || echo 1)"
+check "shared: line break leaves the file alone" "$nl_before"  "$(cat "$nl_env")"
+
+cr_env="$SANDBOX/carriage.env"
+seed "$cr_env"
+set +e
+"$SH" -c '. "$1"; rogue_write_env_file "$2" ROGUE_API_KEY "$3" ROGUE_ACTOR_EMAIL "e@x.io" ROGUE_ACTOR_NAME "N"' \
+  _ "$REPO/scripts/shared/env-file.sh" "$cr_env" "$(printf 'k\rx')" >/dev/null 2>&1
+cr_rc=$?
+set -e
+check "shared: carriage return in a value is refused" "1" "$([ "$cr_rc" = 0 ] && echo 0 || echo 1)"
+
+for plugin in rogue codex cursor copilot antigravity; do
+  pnl_env="$SANDBOX/linebreak-$plugin.env"
+  seed "$pnl_env"
+  pnl_before="$(cat "$pnl_env")"
+  set +e
+  ROGUE_ENV_FILE="$pnl_env" bash "$REPO/plugins/$plugin/scripts/setup.sh" "k" "e@x.io" "$NL_NAME" >/dev/null 2>&1
+  pnl_rc=$?
+  set -e
+  check "$plugin: line break refused"            "1"            "$([ "$pnl_rc" = 0 ] && echo 0 || echo 1)"
+  check "$plugin: line break leaves file intact" "$pnl_before"  "$(cat "$pnl_env")"
+done
+
+if command -v node >/dev/null 2>&1; then
+  gnl_env="$SANDBOX/linebreak-gemini.env"
+  seed "$gnl_env"
+  gnl_before="$(cat "$gnl_env")"
+  set +e
+  ROGUE_ENV_FILE="$gnl_env" node "$REPO/plugins/gemini/scripts/setup.mjs" "k" "e@x.io" "$NL_NAME" >/dev/null 2>&1
+  gnl_rc=$?
+  set -e
+  check "gemini: line break refused"            "1"           "$([ "$gnl_rc" = 0 ] && echo 0 || echo 1)"
+  check "gemini: line break leaves file intact" "$gnl_before" "$(cat "$gnl_env")"
+fi
+
+inl_env="$SANDBOX/linebreak-install.env"
+seed "$inl_env"
+inl_before="$(cat "$inl_env")"
+set +e
+ROGUE_INSTALL_LIB_ONLY=1 NL_NAME="$NL_NAME" bash -c '
+  . "$1"
+  ENV_FILE="$2"
+  ROGUE_API_KEY="k"; ROGUE_ACTOR_EMAIL="e@x.io"; ROGUE_ACTOR_NAME="$NL_NAME"
+  write_env_file
+' _ "$REPO/install.sh" "$inl_env" >/dev/null 2>&1
+inl_rc=$?
+set -e
+check "install.sh: line break refused"            "1"           "$([ "$inl_rc" = 0 ] && echo 0 || echo 1)"
+check "install.sh: line break leaves file intact" "$inl_before" "$(cat "$inl_env")"
+
+mdm_env="$SANDBOX/mdm-base-url.env"
+cat > "$mdm_env" <<'MDM'
+export ROGUE_API_KEY='onbox'
+export ROGUE_LOG_DIR='/var/log/rogue'
+MDM
+mdm_etc="$SANDBOX/mdm-etc-env"
+printf "export ROGUE_BASE_URL='https://mdm.example'\n" > "$mdm_etc"
+mdm_install="$SANDBOX/install-mdm.sh"
+sed "s#/etc/rogue/env#$mdm_etc#g" "$REPO/install.sh" > "$mdm_install"
+ROGUE_INSTALL_LIB_ONLY=1 bash -c '
+  . "$1"
+  ENV_FILE="$2"
+  NON_INTERACTIVE=1
+  configure_credentials >/dev/null 2>&1
+' _ "$mdm_install" "$mdm_env"
+check "mdm base url not copied into the per-user file" "0"                "$(count_lines "$mdm_env" '^export ROGUE_BASE_URL=')"
+check "mdm run still keeps other settings"             "/var/log/rogue"   "$(sourced "$mdm_env" ROGUE_LOG_DIR)"
 
 [ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }
 echo "all env-file writer checks passed"

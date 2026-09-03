@@ -291,6 +291,64 @@ if ($bash) {
     Write-Host '  skip: bash not available (sh/PowerShell comparison)'
 }
 
+$nlFile = New-SeededFile 'linebreak.env'
+$nlBefore = [System.IO.File]::ReadAllText($nlFile)
+$nlThrew = $false
+try {
+    Write-RogueEnvFile -Path $nlFile -Values ([ordered]@{
+        ROGUE_API_KEY     = 'k'
+        ROGUE_ACTOR_EMAIL = 'e@x.io'
+        ROGUE_ACTOR_NAME  = "a`nb"
+    }) | Out-Null
+} catch { $nlThrew = $true }
+Check 'line break in a value is refused'  $true      $nlThrew
+Check 'line break leaves the file alone'  $nlBefore  ([System.IO.File]::ReadAllText($nlFile))
+
+$crFile = New-SeededFile 'carriage.env'
+$crThrew = $false
+try {
+    Write-RogueEnvFile -Path $crFile -Values ([ordered]@{ ROGUE_API_KEY = "k`rx" }) | Out-Null
+} catch { $crThrew = $true }
+Check 'carriage return in a value is refused' $true $crThrew
+
+Check 'line break leaves no temp behind' 0 `
+    (@(Get-ChildItem -LiteralPath $sandbox -Filter '*linebreak*.rogue-tmp.*' -Force).Count)
+
+if ($chmod) {
+    $unreadFile = New-SeededFile 'unreadable.env'
+    $unreadBefore = [System.IO.File]::ReadAllText($unreadFile)
+    & $chmod.Source 000 $unreadFile
+    $stillReadable = $true
+    try { [void][System.IO.File]::ReadAllText($unreadFile) } catch { $stillReadable = $false }
+    if ($stillReadable) {
+        Write-Host '  skip: mode 000 is readable anyway (running as root?)'
+    } else {
+        $unreadThrew = $false
+        try {
+            Write-RogueEnvFile -Path $unreadFile -Values ([ordered]@{ ROGUE_API_KEY = 'should-not-land' }) | Out-Null
+        } catch { $unreadThrew = $true }
+        & $chmod.Source 600 $unreadFile
+        Check 'unreadable file fails the write'  $true          $unreadThrew
+        Check 'unreadable file left intact'      $unreadBefore  ([System.IO.File]::ReadAllText($unreadFile))
+        Check 'unreadable file leaves no temp'   0 `
+            (@(Get-ChildItem -LiteralPath $sandbox -Filter '*unreadable*.rogue-tmp.*' -Force).Count)
+    }
+    & $chmod.Source 600 $unreadFile
+} else {
+    Write-Host '  skip: chmod not available (unreadable-file case)'
+}
+
+$installerText = Get-Content -Raw -LiteralPath (Join-Path $repo 'install.ps1')
+Check 'install.ps1: base url managed only when explicit' $true `
+    ($installerText -match "if \(\`$BaseUrlExplicit\) \{ \`$managed \+= 'ROGUE_BASE_URL' \}")
+Check 'install.ps1: base url written only when explicit' $true `
+    ($installerText -match 'if \(\$BaseUrlExplicit -and \$BaseUrl -ne \$ROGUE_BASE_URL_DEFAULT\)')
+Check 'install.ps1: merge read fails loudly' $true `
+    ($installerText -match 'Get-Content -LiteralPath \$EnvFile -Encoding UTF8 -ErrorAction Stop')
+Check 'library: merge read fails loudly' $true `
+    ((Get-Content -Raw -LiteralPath (Join-Path $repo 'scripts/shared/env-file.ps1')) -match `
+        'Get-Content -LiteralPath \$Path -Encoding UTF8 -ErrorAction Stop')
+
 Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue
 if ($script:fails -gt 0) { Write-Host "$($script:fails) check(s) failed"; exit 1 }
 Write-Host 'all env-file writer checks passed'

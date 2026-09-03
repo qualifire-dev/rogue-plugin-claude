@@ -550,8 +550,25 @@ env_preserved() {
   [ -z "$kept" ] || printf '%s\n' "$kept" | tr -d '\r'
 }
 
+env_has_break() {
+  local nl='
+'
+  local cr
+  cr="$(printf '\r')"
+  case "$1" in
+    *"$nl"*|*"$cr"*) return 0 ;;
+  esac
+  return 1
+}
+
 write_env_file() {
-  local keys="ROGUE_API_KEY|ROGUE_ACTOR_EMAIL|ROGUE_ACTOR_NAME|ROGUE_BASE_URL"
+  local keys="ROGUE_API_KEY|ROGUE_ACTOR_EMAIL|ROGUE_ACTOR_NAME"
+  [ "$BASE_URL_EXPLICIT" != "1" ] || keys="$keys|ROGUE_BASE_URL"
+  local k v
+  for k in ROGUE_API_KEY ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME ROGUE_BASE_URL; do
+    eval "v=\${$k:-}"
+    ! env_has_break "$v" || die "Refusing to write $ENV_FILE: the value for $k contains a line break"
+  done
   local tmp="$ENV_FILE.rogue-tmp.$$"
   (
     umask 077
@@ -561,7 +578,7 @@ write_env_file() {
       printf 'export ROGUE_API_KEY=%s\n' "$(env_quote "$ROGUE_API_KEY")" &&
       printf 'export ROGUE_ACTOR_EMAIL=%s\n' "$(env_quote "$ROGUE_ACTOR_EMAIL")" &&
       printf 'export ROGUE_ACTOR_NAME=%s\n' "$(env_quote "$ROGUE_ACTOR_NAME")" &&
-      { [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] ||
+      { [ "$BASE_URL_EXPLICIT" != "1" ] || [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] ||
         printf 'export ROGUE_BASE_URL=%s\n' "$(env_quote "$ROGUE_BASE_URL")"; } &&
       { [ ! -f "$ENV_FILE" ] || env_preserved "$keys"; }
     } > "$tmp"

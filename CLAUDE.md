@@ -330,6 +330,22 @@ write).
   they are piped to `bash`/`iex` with no plugin tree beside them. They are also
   the only writers that emit `ROGUE_BASE_URL`, and only when it differs from the
   default — writing the default would bake today's hostname into every install.
+- **The installers OWN `ROGUE_BASE_URL` only when the caller named one.** With no
+  `--base-url` / `-BaseUrl` and no `ROGUE_BASE_URL` in the invocation, the key is
+  left out of the managed set entirely and survives by omission like every other
+  knob. It has to work that way because `configure_credentials` sources
+  `/etc/rogue/env` before it writes: with the key always managed, the FLEET's URL
+  was copied into the per-user file on the first install of any MDM-managed box,
+  and since per-user is read last it then shadowed `/etc/rogue/env` forever — a
+  later MDM change could never take effect again. Managed-when-explicit keeps the
+  clear-a-stale-URL case below working and makes the leak unreachable.
+- **`auto-update.sh` must `unset ROGUE_BASE_URL` before running the installer.**
+  It sources all three env files, whose lines are `export`, so the installer child
+  inherited the on-disk value as an env var — which the next rule reads as the
+  caller naming it. That made every unattended 24h run "explicit" on any machine
+  that had a base URL configured at all, re-creating the leak above through the
+  one path nobody is watching. `auto-update.ps1` needs no such guard: its
+  `ReadEnvVar` returns a value instead of exporting one.
 - **"Explicit" means the caller NAMED a base URL, not that the value differs
   from the default** (`BASE_URL_EXPLICIT` / `$BaseUrlExplicit`, set by `--base-url`
   / `-BaseUrl` and by the `ROGUE_BASE_URL` env var). Inferring it from the value
@@ -337,12 +353,29 @@ write).
   outranked it and got written straight back, so a machine pinned to a staging
   host could never be moved back to SaaS. Since the default is never written,
   clearing it means the key is simply absent afterwards.
+- **A value containing CR or LF is REFUSED by every writer** — sh returns 3,
+  PowerShell throws, Node exits 1, and nothing is written. `rogue_env_quote` emits
+  a POSIX single-quoted string, so a newline inside a value spans lines, and the
+  preserve filter works per line: on the NEXT write the key's first line matches
+  the owned-key regex and is dropped while its continuation survives as a stray
+  fragment, leaving an unbalanced quote. Every dispatcher then dies sourcing the
+  file, which fails open — so the hooks are silently off for that machine. Main
+  never hit this because `printf %q` collapsed the value to a single `$'a\nb'`;
+  the merge writer is what makes it reachable, via `--actor-name`, the
+  `ROGUE_ACTOR_*` env vars, or a `git config user.name` carrying an escape.
 - **The write is temp-then-rename, in all three languages**, and every emit on the
   way is checked — the sh writers `&&` chain theirs (the group used to end in `:`,
   which masked a failed `printf` and then `mv`'d the partial file over a good one)
   and `rogue_env_preserved` distinguishes `grep` exit 1, nothing left to keep, from
   a real error. A failed write must leave the previous file exactly as it was: it
   is five other plugins' settings, not just this caller's credentials.
+- **An UNREADABLE existing file must fail the write in all three languages**, not
+  read as "nothing to preserve". The sh side does this with the single `grep` and
+  its status check; the other two had to be brought to match — `setup.mjs`
+  rethrows unless `err.code === 'ENOENT'`, and both PowerShell writers read the
+  merge source with `-ErrorAction Stop`, never `SilentlyContinue`, whose empty
+  enumeration is indistinguishable from an empty file and produced exactly the
+  truncation this section exists to prevent.
 - **That preserve filter is ONE `grep` with two `-e` patterns, never `grep | grep`.**
   A pipeline reports only its LAST status, so with two greps an unreadable env
   file died in the first one and the second saw empty input and exited 1 — which

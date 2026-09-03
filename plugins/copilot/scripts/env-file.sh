@@ -15,6 +15,16 @@ rogue_env_preserved() {
   [ -z "$_rogue_env_kept" ] || printf '%s\n' "$_rogue_env_kept" | tr -d '\r'
 }
 
+rogue_env_has_break() {
+  _rogue_env_nl='
+'
+  _rogue_env_cr="$(printf '\r')"
+  case "$1" in
+    *"$_rogue_env_nl"*|*"$_rogue_env_cr"*) return 0 ;;
+  esac
+  return 1
+}
+
 rogue_write_env_file() {
   _env_file="$1"; shift
   [ "$#" -ge 2 ] || return 2
@@ -25,6 +35,11 @@ rogue_write_env_file() {
   _env_keys=""
   _env_managed=""
   while [ "$#" -ge 2 ]; do
+    if rogue_env_has_break "$2"; then
+      printf 'rogue: refusing to write %s: the value for %s contains a line break\n' \
+        "$_env_file" "$1" >&2
+      return 3
+    fi
     _env_keys="${_env_keys}${_env_keys:+|}$1"
     _env_managed="${_env_managed}export $1=$(rogue_env_quote "$2")
 "
