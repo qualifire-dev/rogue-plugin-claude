@@ -443,5 +443,30 @@ esac
 rm -rf "$LAST_HOME"
 KEEP_HOME=0
 
+# ── Case 19: the 3.0 engine's agent-hook copy is dropped ────────────────────
+# That engine loads the hook file AND the 2.x agent configs, so without this
+# every event would be recorded twice. A PascalCase body under a camelCase
+# trigger can only be the 3.0 engine running a 2.x agent hook: no request, no
+# heartbeat, exit 0 - the hook-file copy of the same event does the enforcing.
+restart_mock "$BLOCK"
+rm -f "$HEADERS_FILE"
+KEEP_HOME=1
+run_bridge preToolUse kiro_cli "$FIX/cli3-PreToolUse-execute_bash.json"
+assert_eq "$LAST_RC:$(cat "$OUT_FILE")$(cat "$ERR_FILE")" "0:" "camelCase trigger + PascalCase body: exit 0, silent, even on a server block"
+assert_eq "$([ -e "$HEADERS_FILE" ] && echo posted || echo none)" "none" "...and nothing is posted"
+assert_contains "$(cat "$LAST_HOME/kiro.log")" " provider=kiro surface=kiro_cli event=PreToolUse outcome=duplicate" "...the drop is logged"
+rm -rf "$LAST_HOME"
+KEEP_HOME=0
+rm -f "$HB_MARKER"
+run_bridge agentSpawn kiro_cli "$FIX/cli3-SessionStart.json"
+sleep 0.3
+assert_eq "$([ -e "$HB_MARKER" ] && echo fired || echo silent)" "silent" "a dropped agentSpawn spawns no heartbeat"
+run_bridge PreToolUse kiro_ide "$FIX/cli3-PreToolUse-execute_bash.json"
+assert_eq "$LAST_RC" "2" "the hook-file copy (PascalCase trigger) of the same event still enforces"
+run_bridge preToolUse kiro_cli "$FIX/cli2-preToolUse-execute_bash.json"
+assert_eq "$LAST_RC" "2" "a 2.x event (camelCase body) is never dropped"
+run_bridge stop kiro_crew "$FIX/cli2-stop.json"
+assert_eq "$LAST_RC" "0" "a 2.x stop goes through (allow)"
+
 echo
 echo "All Kiro bridge tests passed (TEST_SH=$SH)."

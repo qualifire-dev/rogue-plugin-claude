@@ -55,14 +55,25 @@ entries are replaced, everything else is kept.
 | `~/.kiro/agents/rogue.json` | CLI 2.x engine | `kiro_cli` | created with `kiro-cli agent create --name rogue` (Kiro's defaults + the hooks) and made the default with `kiro-cli agent set-default rogue` **only when `kiro-cli settings chat.defaultAgent` reports none**; a default the user chose is left alone and printed (ADR 0001) |
 
 The 2.x engine's built-in default agent is not a file and cannot be shadowed, so
-without the `rogue` agent a plain `kiro-cli chat` carries no hooks. Each file
-fixes the bridge's surface to the surface it is authoritative for: no Kiro
-payload names its surface, and the IDE reads nothing but the hook file (the
-prompt block is IDE-only, so that file must say `kiro_ide`). A 3.0-engine
-session on a custom agent therefore fires both the hook file and the agent
-hooks — every event is recorded twice, once per surface. The agent-config merge
-runs on `node`; without it the hook file and the Crew wrappers are still written
-and the 2.x gap is named.
+without the `rogue` agent a plain `kiro-cli chat` carries no hooks. `kiro-cli
+agent create` refuses when the CLI is not logged in; the installer then says so,
+names `kiro-cli login`, and never touches the default — it is switched only to a
+`rogue.json` that exists and carries the hooks after the merge. The agent-config
+merge runs on `node`; without it the hook file and the Crew wrappers are still
+written and the 2.x gap is named.
+
+Each file fixes the bridge's surface to the surface it is authoritative for: no
+Kiro payload names its surface, and the IDE reads nothing but the hook file (the
+prompt block is IDE-only, so that file must say `kiro_ide`). The 3.0 engine (the
+IDE runs the same one) loads the hook file **and** the agent configs, so it
+would run the bridge twice per event; the bridge drops the agent-hook copy — a
+PascalCase `hook_event_name` arriving under a camelCase trigger can only be the
+3.0 engine running a 2.x agent hook — and logs it as `outcome=duplicate`, so each
+event is recorded once. The surviving copy is the hook file's, labelled
+`kiro_ide`: a `kiro-cli --v3` session is therefore reported as `kiro_ide` (and
+receives the IDE's prompt-block JSON, which the 3.0 CLI ignores) until the
+hardware matrix (FIRE-2038) finds a run-time signal that tells the two hosts
+apart. This is the one known mislabel.
 
 ## Credentials
 

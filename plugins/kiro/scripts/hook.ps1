@@ -179,6 +179,18 @@ function Add-KiroSessionId {
     return $pre + $sep + '"session_id":"' + $SessionId + '"}'
 }
 
+# The 3.0 engine (the IDE runs the same one) loads the agent configs written for
+# 2.x as well as the hook file, so it runs the bridge twice per event. The
+# agent-hook copy gives itself away - a PascalCase hook_event_name under a
+# camelCase trigger - and is dropped; the hook-file copy carries the same event
+# to the same decision. The 2.x engine spells the body in camelCase: never dropped.
+function Test-KiroDuplicateAgentHook {
+    param([string]$TriggerArg, [string]$Payload)
+    if ($TriggerArg -cnotin @('agentSpawn', 'userPromptSubmit', 'preToolUse', 'postToolUse', 'stop')) { return $false }
+    if ($Payload -and $Payload -match '"hook_event_name"\s*:\s*"([^"]*)"') { return [bool]($Matches[1] -cmatch '^[A-Z]') }
+    return $false
+}
+
 # STRICT shape match: the pair, not the substrings, so an allow that carries
 # "block" as some other field's value never trips it.
 function Test-KiroBlock {
@@ -240,6 +252,7 @@ try {
 # Stand down on non-Windows (Kiro runs hook.sh there; this guards a stray pwsh).
 if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) { exit 0 }
 
+$triggerArg = $EventName
 $EventName = ConvertTo-KiroEvent $EventName
 $script:surface = Get-KiroSurface $Surface
 $agent = if ($script:surface) { $script:surface } else { 'kiro_cli' }
@@ -311,6 +324,13 @@ try {
 } catch {}
 $payload = $payload.TrimStart([char]0xFEFF)
 $payload = Add-KiroSessionId $payload $env:KIRO_SESSION_ID
+
+# One copy per event on the 3.0 engine (see Test-KiroDuplicateAgentHook):
+# before the heartbeat and the request.
+if (Test-KiroDuplicateAgentHook $triggerArg $payload) {
+    Log "outcome=duplicate engine=3.0 trigger=$triggerArg"
+    exit 0
+}
 
 # -- install identity: host + version (mirrors install-id.sh) ----------------
 $installError = @()

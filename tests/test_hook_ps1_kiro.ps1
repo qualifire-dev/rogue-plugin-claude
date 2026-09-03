@@ -79,6 +79,19 @@ Assert-Eq (Add-KiroSessionId "{`n}`n" 's1') '{"session_id":"s1"}' 'a pretty-prin
 Assert-Eq (Add-KiroSessionId '[1,2]' 's1') '[1,2]' 'a non-object body is left alone'
 Assert-Eq (Add-KiroSessionId '' 's1') '' 'an empty body is left alone'
 
+# -- Test-KiroDuplicateAgentHook: the 3.0 engine's agent-hook copy ------------
+# That engine loads the hook file AND the 2.x agent configs; a PascalCase body
+# under a camelCase trigger can only be it running a 2.x agent hook.
+$cli3Pre = Read-Fixture 'cli3-PreToolUse-execute_bash.json'
+$cli2Pre = Read-Fixture 'cli2-preToolUse-execute_bash.json'
+Assert-Eq (Test-KiroDuplicateAgentHook 'preToolUse' $cli3Pre) 'True'  'camelCase trigger + PascalCase body is the 3.0 agent-hook copy'
+Assert-Eq (Test-KiroDuplicateAgentHook 'PreToolUse' $cli3Pre) 'False' 'the hook-file copy (PascalCase trigger) goes through'
+Assert-Eq (Test-KiroDuplicateAgentHook 'preToolUse' $cli2Pre) 'False' 'a 2.x body (camelCase) is never a duplicate'
+Assert-Eq (Test-KiroDuplicateAgentHook 'agentSpawn' (Read-Fixture 'cli3-SessionStart.json')) 'True' 'agentSpawn under a SessionStart body is dropped too'
+Assert-Eq (Test-KiroDuplicateAgentHook 'stop' (Read-Fixture 'cli2-stop.json')) 'False' 'a 2.x stop goes through'
+Assert-Eq (Test-KiroDuplicateAgentHook 'preToolUse' '{}') 'False' 'a body without hook_event_name goes through'
+Assert-Eq (Test-KiroDuplicateAgentHook 'preToolUse' '') 'False' 'an empty body goes through'
+
 # -- Test-KiroBlock: strict pair match -----------------------------------------
 Assert-Eq (Test-KiroBlock $BLOCK) 'True' 'the block shape matches'
 Assert-Eq (Test-KiroBlock '{ "decision" : "block" }') 'True' 'whitespace around the pair is tolerated'
