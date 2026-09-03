@@ -31,6 +31,7 @@
 #   --gemini               install only for Gemini CLI
 #   --copilot              install only for GitHub Copilot CLI
 #   --antigravity          install only for Google Antigravity
+#   --kiro                 install only for Kiro (IDE, CLI on both engines, Crew)
 #                          (no agent flag = auto-detect and install for every agent found)
 #   --api-key=KEY          same as ROGUE_API_KEY
 #   --actor-email=EMAIL    same as ROGUE_ACTOR_EMAIL
@@ -116,6 +117,7 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 #   gemini       Gemini CLI           command:gemini                      install_gemini      ← implemented
 #   copilot      Copilot CLI          command:copilot                     install_copilot     ← implemented
 #   antigravity  Google Antigravity   command:agy|~/.gemini/antigravity*  install_antigravity ← implemented
+#   kiro         Kiro (IDE/CLI/Crew)  command:kiro-cli|Kiro.app|~/.kiro    install_kiro        ← implemented
 #
 # Claude, Codex, and Copilot install via their native plugin CLIs (which git-clone
 # the marketplace). Cursor has NO plugin CLI — install is a file copy into
@@ -129,6 +131,8 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 # targets rogue@rogue-copilot to avoid resolving to the Claude plugin. Antigravity is
 # a copy-a-directory install (into ~/.gemini/config/plugins/rogue) PLUS the native
 # `agy plugin install` when the `agy` CLI is present (see antigravity_install_plugin).
+# Kiro has no plugin CLI either: the bridge is copied under ~/.rogue/plugins/kiro and
+# the installer writes the hook files that point Kiro at it (see kiro_install_plugin).
 
 # ── Marketplace + plugin install (Claude) ─────────────────────────────────────
 claude_install_plugin() {
@@ -389,6 +393,230 @@ antigravity_install_plugin() {
   fi
 }
 
+# ── Bridge install (Kiro IDE / CLI / Crew) ────────────────────────────────────
+# Kiro has no plugin CLI and no marketplace. The release tarball's top dir IS the
+# plugin (plugin.json at its root, like Antigravity); it is copied under
+# ~/.rogue/plugins/kiro — OUTSIDE every Kiro path, so a Kiro upgrade or a `.kiro/`
+# reset never removes the bridge — and the files that point Kiro at it are written
+# next. Measured on kiro-cli 2.21.0 / IDE 1.0.437 (FIRE-2030):
+#
+#   ~/.kiro/hooks/rogue.json     IDE 1.x + the 3.0 engine. Universal v1 format,
+#                                every monitored event, NO matcher (`*` is an
+#                                invalid regex there and the file fails to load).
+#   ~/.kiro/hooks/rogue-crew-*.sh Kiro Crew imports executable *.sh from that dir
+#                                by their `# event:` header — absolute path, no
+#                                shell metacharacters.
+#   <agent>.json "hooks": [...]  The 2.x engine (the default) reads hooks from
+#                                agent configs ONLY, so the block is merged into
+#                                every custom agent under ~/.kiro/agents and
+#                                ./.kiro/agents. Its built-in default agent is
+#                                not a file and cannot be shadowed, hence the
+#                                `rogue` agent created through kiro-cli and made
+#                                the default when the user set none (ADR 0001).
+#
+# No Kiro payload names its surface, so each file fixes the bridge's surface
+# argument to the surface it is authoritative for: the hook file → kiro_ide (the
+# IDE reads nothing else, and the prompt block is IDE-only), agent configs →
+# kiro_cli, the Crew wrappers → kiro_crew. The 3.0 engine loads BOTH the hook
+# file and the agent configs: the bridge drops the agent-hook copy there (a
+# PascalCase payload under a camelCase trigger), so each event is recorded once
+# — labelled kiro_ide, the one known mislabel, until the hardware matrix
+# (FIRE-2038) finds a run-time signal that tells the 3.0 CLI from the IDE.
+# Returns non-zero (never `die`s) so a missing asset cannot abort a run that
+# already installed other agents.
+# Escape a value for splicing into a JSON string literal (backslash, quote).
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+KIRO_PLUGIN_DIR="$HOME/.rogue/plugins/kiro"
+KIRO_HOOKS_DIR="$HOME/.kiro/hooks"
+KIRO_AGENT_NAME="rogue"
+KIRO_HOOK_TIMEOUT=10
+# The monitored events as the 3.0 engine / IDE spell them (hook file) and as the
+# 2.x engine spells them (agent configs). The bridge accepts either dialect.
+KIRO_FILE_EVENTS="SessionStart UserPromptSubmit PreToolUse PostToolUse Stop PostFileCreate PostFileSave PostFileDelete"
+KIRO_AGENT_TRIGGERS="agentSpawn userPromptSubmit preToolUse postToolUse stop"
+
+kiro_install_plugin() {
+  local tmp asset url src
+  asset="rogue-plugin-kiro.tar.gz"
+  if [ -n "${ROGUE_PLUGIN_VERSION:-}" ]; then
+    url="https://github.com/${ROGUE_PLUGIN_REPO}/releases/download/${ROGUE_PLUGIN_VERSION}/${asset}"
+  else
+    url="https://github.com/${ROGUE_PLUGIN_REPO}/releases/latest/download/${asset}"
+  fi
+
+  tmp="$(mktemp -d)" || { warn "Could not create a temp dir for the Kiro download."; return 1; }
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  note "Downloading plugin ${C_DIM}${asset}${C_RESET}"
+  if ! curl -fsSL --max-time 60 -o "$tmp/p.tar.gz" "$url"; then
+    warn "Kiro plugin asset not available yet ($url) — skipping Kiro. Re-run the installer once it's published."
+    return 1
+  fi
+  mkdir -p "$tmp/extract"
+  tar -xzf "$tmp/p.tar.gz" -C "$tmp/extract" \
+    || { warn "Could not extract the Kiro plugin tarball — skipping Kiro."; return 1; }
+
+  # The tarball stages a top dir (rogue-plugin-kiro/) whose ROOT is the plugin.
+  src="$(find "$tmp/extract" -maxdepth 2 -type f -name plugin.json -exec dirname {} \; | head -1)"
+  [ -n "$src" ] && [ -f "$src/scripts/hook.sh" ] \
+    || { warn "Kiro plugin manifest missing in download — skipping Kiro."; return 1; }
+
+  mkdir -p "$(dirname "$KIRO_PLUGIN_DIR")"
+  rm -rf "$KIRO_PLUGIN_DIR"
+  mkdir -p "$KIRO_PLUGIN_DIR"
+  cp -R "$src/." "$KIRO_PLUGIN_DIR/"
+  chmod 755 "$KIRO_PLUGIN_DIR"/scripts/*.sh
+  ok "Plugin installed → ${C_DIM}$KIRO_PLUGIN_DIR${C_RESET}"
+}
+
+# The hook command Kiro runs through `sh`: the bridge by absolute path (quoted,
+# a home directory may contain spaces), the event it was installed under, and
+# the surface.
+kiro_bridge_cmd() { printf '"%s" %s %s' "$KIRO_PLUGIN_DIR/scripts/hook.sh" "$1" "$2"; }
+
+# kiro_hooks_json <surface> <trigger>... — the hooks array both Kiro formats
+# share: [{name, trigger, action:{type:"command", command}, timeout}].
+kiro_hooks_json() {
+  local surface="$1" sep="" t
+  shift
+  printf '['
+  for t in "$@"; do
+    printf '%s\n    {"name": "rogue-%s", "trigger": "%s", "action": {"type": "command", "command": "%s"}, "timeout": %s}' \
+      "$sep" "$t" "$t" "$(json_escape "$(kiro_bridge_cmd "$t" "$surface")")" "$KIRO_HOOK_TIMEOUT"
+    sep=","
+  done
+  printf '\n  ]'
+}
+
+kiro_write_hook_file() {
+  mkdir -p "$KIRO_HOOKS_DIR"
+  # shellcheck disable=SC2086
+  printf '{\n  "version": "v1",\n  "hooks": %s\n}\n' "$(kiro_hooks_json kiro_ide $KIRO_FILE_EVENTS)" \
+    > "$KIRO_HOOKS_DIR/rogue.json"
+  ok "Hook file written → ${C_DIM}$KIRO_HOOKS_DIR/rogue.json${C_RESET}"
+}
+
+# Crew's importer takes the script path as the command: absolute, executable,
+# and free of shell metacharacters — which is why the bridge path below is
+# unquoted. A home directory that needs quoting cannot be imported by Crew at
+# all, so it is quoted for the shell and flagged rather than silently broken.
+kiro_write_crew_script() { # <basename> <event>
+  local f="$KIRO_HOOKS_DIR/$1" bridge="$KIRO_PLUGIN_DIR/scripts/hook.sh"
+  case "$bridge" in
+    *[!A-Za-z0-9_./-]*) warn "$bridge contains characters Kiro Crew refuses in a hook path — Crew may not import $1."
+                        bridge="\"$bridge\"" ;;
+  esac
+  printf '#!/bin/sh\n# event: %s\n# Rogue Security bridge for Kiro Crew, written by install.sh. Re-run it to upgrade.\nexec %s %s kiro_crew\n' \
+    "$2" "$bridge" "$2" > "$f"
+  chmod 755 "$f"
+}
+
+kiro_write_crew_scripts() {
+  kiro_write_crew_script rogue-crew-pre.sh PreToolUse
+  kiro_write_crew_script rogue-crew-post.sh PostToolUse
+  ok "Crew wrappers written → ${C_DIM}$KIRO_HOOKS_DIR/rogue-crew-{pre,post}.sh${C_RESET}"
+}
+
+# Merge Rogue's hooks into one agent config, keeping every other field and every
+# hook that is not ours (ours are the `rogue-*` names, so a re-run replaces its
+# own entries instead of stacking them). node, as apply_statusline_setting: it
+# preserves key order, and jq/python3 may be absent.
+# Exit codes: 0 merged, 20 not a JSON object, 21 `hooks` is not the array form.
+kiro_merge_agent_hooks() { # <file> <hooks-json>
+  node - "$1" "$2" <<'NODE'
+const fs = require('fs');
+const [file, hooksJson] = process.argv.slice(2);
+let cfg;
+try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { process.exit(20); }
+if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) process.exit(20);
+if (cfg.hooks !== undefined && !Array.isArray(cfg.hooks)) process.exit(21);
+const ours = h => h && typeof h.name === 'string' && h.name.startsWith('rogue-');
+cfg.hooks = (cfg.hooks || []).filter(h => !ours(h)).concat(JSON.parse(hooksJson));
+fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+NODE
+}
+
+# Every custom agent config the 2.x engine can load: the global dir and the
+# workspace dir of the directory the installer runs from.
+kiro_merge_agent_dirs() {
+  local hooks dir f rc
+  # shellcheck disable=SC2086
+  hooks="$(kiro_hooks_json kiro_cli $KIRO_AGENT_TRIGGERS)"
+  for dir in "$HOME/.kiro/agents" "$PWD/.kiro/agents"; do
+    [ -d "$dir" ] || continue
+    for f in "$dir"/*.json; do
+      [ -f "$f" ] || continue
+      kiro_merge_agent_hooks "$f" "$hooks"; rc=$?
+      case "$rc" in
+        0)  ok "Agent hooks merged → ${C_DIM}$f${C_RESET}" ;;
+        20) warn "Skipping $f — not a JSON object (fix it and re-run to add the Rogue hooks)." ;;
+        21) warn "Skipping $f — its \"hooks\" block is not the array form (fix it and re-run to add the Rogue hooks)." ;;
+        *)  warn "Skipping $f — could not merge the Rogue hooks (node exited $rc)." ;;
+      esac
+    done
+  done
+}
+
+# ADR 0001: the built-in default agent cannot carry hooks, so a `rogue` agent is
+# created from Kiro's own defaults and becomes the default ONLY when the user set
+# none. A default the user chose is left alone and reported: changing it would
+# silently change which agent every `kiro-cli chat` runs.
+kiro_ensure_rogue_agent() {
+  local cfg="$HOME/.kiro/agents/$KIRO_AGENT_NAME.json" err
+  [ -f "$cfg" ] && return 0
+  # `agent create` opens $EDITOR on the new file; `true` returns at once.
+  if err="$(EDITOR=true VISUAL=true kiro-cli agent create --name "$KIRO_AGENT_NAME" </dev/null 2>&1)" && [ -f "$cfg" ]; then
+    ok "Agent ${C_DIM}$KIRO_AGENT_NAME${C_RESET} created via ${C_DIM}kiro-cli agent create${C_RESET}"
+    return 0
+  fi
+  # kiro-cli 2.21.0 refuses `agent create` when it is not logged in, so this is
+  # the ordinary first-run path on a fresh machine, not a corner case.
+  warn "kiro-cli agent create --name $KIRO_AGENT_NAME failed — plain 'kiro-cli chat' on the 2.x engine will carry no Rogue hooks."
+  [ -n "$err" ] && note "${C_DIM}${err}${C_RESET}"
+  note "If kiro-cli is not logged in, run ${C_DIM}kiro-cli login${C_RESET} and re-run this installer; the default agent is left as it is."
+  return 1
+}
+
+# The merged config carries our entries under their `rogue-*` names.
+kiro_agent_carries_hooks() { grep -q '"rogue-preToolUse"' "$1" 2>/dev/null; }
+
+kiro_set_default_agent() {
+  local current
+  if current="$(kiro-cli settings chat.defaultAgent 2>/dev/null)" && [ -n "$current" ]; then
+    ok "Default agent already set (${C_DIM}$current${C_RESET}) — left unchanged."
+    [ "$current" = "$KIRO_AGENT_NAME" ] || [ "$current" = "\"$KIRO_AGENT_NAME\"" ] \
+      || note "On the 2.x engine only agents with the Rogue hooks are covered; switch with ${C_DIM}kiro-cli agent set-default $KIRO_AGENT_NAME${C_RESET}."
+    return 0
+  fi
+  if kiro-cli agent set-default "$KIRO_AGENT_NAME" >/dev/null 2>&1; then
+    ok "Default agent set to ${C_DIM}$KIRO_AGENT_NAME${C_RESET} (no default was set)"
+  else
+    warn "kiro-cli agent set-default $KIRO_AGENT_NAME failed — run it by hand so plain 'kiro-cli chat' carries the Rogue hooks."
+  fi
+}
+
+# The default is switched only to a `rogue` agent that exists AND carries the
+# hooks after the merge: pointing the CLI at an agent `agent create` never wrote
+# (not logged in, say) would break every plain `kiro-cli chat`.
+kiro_wire_cli() {
+  local have_agent=1 cfg="$HOME/.kiro/agents/$KIRO_AGENT_NAME.json"
+  if have_cmd kiro-cli; then
+    kiro_ensure_rogue_agent && have_agent=0
+  else
+    note "kiro-cli not on PATH — the IDE and the 3.0 engine load ${C_DIM}$KIRO_HOOKS_DIR/rogue.json${C_RESET} directly."
+  fi
+  kiro_merge_agent_dirs
+  [ "$have_agent" -eq 0 ] || return 0
+  if kiro_agent_carries_hooks "$cfg"; then
+    kiro_set_default_agent
+  else
+    warn "$cfg carries no Rogue hooks after the merge — the default agent is left as it is."
+  fi
+  return 0
+}
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 # Validate the key AND register this install via /api/v1/hooks/status (the same
 # heartbeat the SessionStart hook calls). Echoes the HTTP status code (empty on
@@ -414,6 +642,7 @@ status_agent_ctx() { # sets SC_FAMILY / SC_AGENT from $agents
     cursor)  SC_FAMILY="cursor";  SC_AGENT="cursor" ;;
     gemini)  SC_FAMILY="gemini";  SC_AGENT="gemini_cli" ;;
     copilot) SC_FAMILY="copilot"; SC_AGENT="github_copilot" ;;
+    kiro)    SC_FAMILY="kiro";    SC_AGENT="kiro_cli" ;;
     *)       SC_FAMILY="claude";  SC_AGENT="claude_code" ;;
   esac
 }
@@ -424,11 +653,10 @@ status_check() { # status_check <api-key> <actor-email>
   status_agent_ctx
   # POST /api/v1/hooks/status with a JSON body — the GET route was removed
   # (see plugins/rogue/scripts/heartbeat.sh). The former x-rogue-agent-*
-  # headers now ride the body; x-rogue-api-key stays a header. esc() so a host
-  # or email with a " or \ can't break the JSON.
-  esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  # headers now ride the body; x-rogue-api-key stays a header. json_escape so a
+  # host or email with a " or \ can't break the JSON.
   json=$(printf '{"agent_family":"%s","agent":"%s","host":"%s","actor_email":"%s"}' \
-    "$SC_FAMILY" "$SC_AGENT" "$(esc "$host")" "$(esc "${2:-}")")
+    "$SC_FAMILY" "$SC_AGENT" "$(json_escape "$host")" "$(json_escape "${2:-}")")
   resp=$(curl -s -w $'\n%{http_code}' --max-time 10 -X POST \
     "$ROGUE_BASE_URL/api/v1/hooks/status" \
     -H "x-rogue-api-key: $1" \
@@ -726,10 +954,27 @@ install_copilot() {
   note "Then restart Copilot CLI and run ${C_DIM}/rogue:status${C_RESET} to verify."
 }
 
+install_kiro() {
+  printf '\n%sRogue Security%s — Kiro\n' "$C_TEAL" "$C_RESET" >&2
+  # The agent-config merge runs on node; without it the IDE / 3.0 engine hook
+  # file and the Crew wrappers are still written, and the 2.x gap is named.
+  # Non-fatal: a failed Kiro install must not abort the run (see kiro_install_plugin).
+  kiro_install_plugin || return 0
+  kiro_write_hook_file
+  kiro_write_crew_scripts
+  if have_cmd node; then
+    kiro_wire_cli
+  else
+    warn "node not found — skipping the agent-config hooks (the 2.x engine reads hooks from agent configs only). Install node and re-run."
+  fi
+  note "Kiro loads hooks at start: restart the IDE / Crew, and open a new ${C_DIM}kiro-cli chat${C_RESET}."
+  note "IDE: hooks never run in an untrusted workspace — trust the workspace first."
+}
+
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 # Accepts `--flag=value` and `--flag value`. Sets the same globals the env knobs
 # do, so the rest of the script is flag-agnostic. CLI flags override env vars.
-usage() { sed -n '2,42p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,43p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; }
 
 parse_args() {
   while [ "$#" -gt 0 ]; do
@@ -749,6 +994,7 @@ parse_args() {
       --gemini)          WANT="$WANT gemini" ;;
       --copilot)         WANT="$WANT copilot" ;;
       --antigravity)     WANT="$WANT antigravity" ;;
+      --kiro)            WANT="$WANT kiro" ;;
       --non-interactive) NON_INTERACTIVE=1 ;;
       --no-statusline)   ROGUE_NO_STATUSLINE=1 ;;
       -h|--help)         usage; exit 0 ;;
@@ -757,6 +1003,10 @@ parse_args() {
     shift
   done
 }
+
+# Kiro ships no `kiro` binary on PATH: the CLI is `kiro-cli`, the IDE is an app
+# bundle on macOS, and both surfaces (Crew too) keep their state under ~/.kiro.
+kiro_detected() { have_cmd kiro-cli || [ -d /Applications/Kiro.app ] || [ -d "$HOME/.kiro" ]; }
 
 # ── Dispatch: detect installed agents, install for each ───────────────────────
 main() {
@@ -777,6 +1027,8 @@ main() {
         antigravity)
           { have_cmd agy || [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.gemini/antigravity-ide" ] || [ -d "$HOME/.gemini/antigravity-cli" ]; } \
             || die "--antigravity requested but no Antigravity install was detected (looked for: agy CLI, ~/.gemini/antigravity*). Install Google Antigravity first." ;;
+        kiro)
+          kiro_detected || die "--kiro requested but no Kiro install was detected (looked for: kiro-cli, /Applications/Kiro.app, ~/.kiro). Install Kiro (https://kiro.dev) first." ;;
       esac
     done
   else
@@ -791,7 +1043,8 @@ main() {
     have_cmd gemini && agents="$agents gemini"
     have_cmd copilot && agents="$agents copilot"
     { have_cmd agy || [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.gemini/antigravity-ide" ] || [ -d "$HOME/.gemini/antigravity-cli" ]; } && agents="$agents antigravity"
-    [ -n "$agents" ] || die "No supported coding agent found (looked for: claude, codex, cursor, gemini, copilot, antigravity). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), GitHub Copilot CLI (https://github.com/github/copilot-cli), or Google Antigravity first."
+    kiro_detected && agents="$agents kiro"
+    [ -n "$agents" ] || die "No supported coding agent found (looked for: claude, codex, cursor, gemini, copilot, antigravity, kiro). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), GitHub Copilot CLI (https://github.com/github/copilot-cli), Google Antigravity, or Kiro (https://kiro.dev) first."
   fi
 
   # Credentials once — every plugin reads the shared ~/.rogue-env.
@@ -805,6 +1058,7 @@ main() {
       gemini)      install_gemini ;;
       copilot)     install_copilot ;;
       antigravity) install_antigravity ;;
+      kiro)        install_kiro ;;
     esac
   done
 

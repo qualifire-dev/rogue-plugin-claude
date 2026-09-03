@@ -175,6 +175,23 @@ inject_session_id() {
 
 BODY="$(inject_session_id "$(cat)")"
 
+# ── one copy per event on the 3.0 engine ─────────────────────────────────────
+# The 3.0 engine (the IDE runs the same one) loads the agent configs written
+# for 2.x AS WELL AS the hook file, so it would run this bridge twice per event:
+# from the hook file (PascalCase trigger) and from the agent hook (camelCase
+# trigger). The second copy gives itself away — a PascalCase hook_event_name in
+# the body of a hook installed under a camelCase trigger — and is dropped here,
+# before the heartbeat and the request: the hook-file copy carries the same
+# event to the same decision. The 2.x engine spells the body in camelCase, so
+# nothing is ever dropped there.
+body_event() { printf '%s' "$1" | sed -nE 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n1; }
+case "$EVENT_ARG" in
+  agentSpawn|userPromptSubmit|preToolUse|postToolUse|stop)
+    case "$(body_event "$BODY")" in
+      [[:upper:]]*) log "outcome=duplicate engine=3.0 trigger=$EVENT_ARG"; exit 0 ;;
+    esac ;;
+esac
+
 # ── presence heartbeat (SessionStart unthrottled, Stop throttled) ────────────
 # Fired from here rather than from a second hook entry so the installer writes
 # one command per event. heartbeat.sh takes the surface and the trigger, exactly

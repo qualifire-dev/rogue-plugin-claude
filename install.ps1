@@ -42,7 +42,9 @@
 .PARAMETER Copilot
     Install only for GitHub Copilot CLI.
 .PARAMETER Antigravity
-    Install only for Google Antigravity. With no agent switch, every detected agent is installed.
+    Install only for Google Antigravity.
+.PARAMETER Kiro
+    Install only for Kiro (IDE, CLI on both engines). With no agent switch, every detected agent is installed.
 #>
 [CmdletBinding()]
 param(
@@ -57,7 +59,8 @@ param(
     [switch]$Cursor,
     [switch]$Gemini,
     [switch]$Copilot,
-    [switch]$Antigravity
+    [switch]$Antigravity,
+    [switch]$Kiro
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,6 +85,217 @@ function Ok   { param([string]$M) Write-Host "v  $M" -ForegroundColor Green }
 function Warn2{ param([string]$M) Write-Host "!  $M" -ForegroundColor Yellow }
 function Die  { param([string]$M) Write-Host "x  $M" -ForegroundColor Red; exit 1 }
 
+# -- Kiro (IDE / CLI / Crew) -----------------------------------------------------
+# Kiro has no plugin CLI and no marketplace (mirrors install.sh). The bridge is
+# copied to %USERPROFILE%\.rogue\plugins\kiro - OUTSIDE every Kiro path - and the
+# files that point Kiro at it are written by the functions below. Measured on
+# kiro-cli 2.21.0 / IDE 1.0.437 (FIRE-2030):
+#
+#   %USERPROFILE%\.kiro\hooks\rogue.json   IDE 1.x + the 3.0 engine. Universal v1,
+#                                          every monitored event, NO matcher (`*` is
+#                                          an invalid regex there).
+#   <agent>.json "hooks": [...]            The 2.x engine (the default) reads hooks
+#                                          from agent configs ONLY: merged into every
+#                                          custom agent, plus a `rogue` agent created
+#                                          through kiro-cli and made the default when
+#                                          the user set none (ADR 0001).
+#
+# The Crew wrappers are POSIX shell scripts and are not written here. No Kiro
+# payload names its surface, so each file fixes the bridge's surface argument:
+# hook file -> kiro_ide (the IDE reads nothing else, and the prompt block is
+# IDE-only), agent configs -> kiro_cli. The 3.0 engine loads BOTH: the bridge
+# drops the agent-hook copy there, so each event is recorded once, labelled
+# kiro_ide - the one known mislabel until FIRE-2038 finds a run-time signal.
+#
+# Paths are built with [IO.Path]::Combine, not 'a\b' literals: the unit tests load
+# these functions on Linux through the ROGUE_INSTALL_LIB_ONLY seam, where a
+# backslash is an ordinary filename character.
+$KiroHookTimeout   = 10
+$KiroFileEvents    = @('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+                       'PostFileCreate', 'PostFileSave', 'PostFileDelete')
+$KiroAgentTriggers = @('agentSpawn', 'userPromptSubmit', 'preToolUse', 'postToolUse', 'stop')
+
+function Get-KiroBridgeCommand {
+    param([string]$PluginDir, [string]$EventName, [string]$Surface)
+    $bridge = [System.IO.Path]::Combine($PluginDir, 'scripts', 'hook.ps1')
+    return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$bridge`" $EventName $Surface"
+}
+
+# The hooks array both Kiro formats share:
+# [{name, trigger, action:{type:"command", command}, timeout}].
+function New-KiroHookEntries {
+    param([string]$PluginDir, [string]$Surface, [string[]]$Triggers)
+    $entries = @()
+    foreach ($t in $Triggers) {
+        $entries += [ordered]@{
+            name    = "rogue-$t"
+            trigger = $t
+            action  = [ordered]@{ type = 'command'; command = (Get-KiroBridgeCommand $PluginDir $t $Surface) }
+            timeout = $KiroHookTimeout
+        }
+    }
+    # No unary comma: callers collect the entries with @(), and a comma-wrapped
+    # array would land inside it as ONE element - serialising hooks as [[...]].
+    return $entries
+}
+
+# UTF-8 without BOM: Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes one,
+# and a BOM is not JSON.
+function Write-KiroJsonFile {
+    param([string]$Path, $Document)
+    $json = $Document | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($Path, $json + "`n", (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-KiroHookFile {
+    param([string]$PluginDir, [string]$HooksDir)
+    New-Item -ItemType Directory -Path $HooksDir -Force | Out-Null
+    $doc = [ordered]@{ version = 'v1'; hooks = @(New-KiroHookEntries $PluginDir 'kiro_ide' $KiroFileEvents) }
+    $path = Join-Path $HooksDir 'rogue.json'
+    Write-KiroJsonFile $path $doc
+    return $path
+}
+
+function Test-KiroOwnedHook {
+    param($Hook)
+    if ($null -eq $Hook) { return $false }
+    $name = $Hook.name
+    return ($name -is [string] -and $name.StartsWith('rogue-'))
+}
+
+# Merge Rogue's hooks into one agent config, keeping every other field and every
+# hook that is not ours (ours are the `rogue-*` names, so a re-run replaces its own
+# entries instead of stacking them). Returns 'merged', 'unparseable' (not a JSON
+# object) or 'not-array' (a `hooks` block in some other form); never throws, so
+# one bad file cannot stop the run.
+function Merge-KiroAgentHooks {
+    param([string]$File, [object[]]$Entries)
+    try { $cfg = Get-Content -Raw -LiteralPath $File -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { return 'unparseable' }
+    if ($null -eq $cfg -or $cfg -is [array] -or $cfg -isnot [PSCustomObject]) { return 'unparseable' }
+    $prop = $cfg.PSObject.Properties['hooks']
+    $kept = @()
+    if ($prop) {
+        if ($prop.Value -isnot [System.Collections.IList]) { return 'not-array' }
+        $kept = @($prop.Value | Where-Object { -not (Test-KiroOwnedHook $_) })
+    }
+    $merged = @($kept + $Entries)
+    if ($prop) { $prop.Value = $merged }
+    else { $cfg | Add-Member -NotePropertyName hooks -NotePropertyValue $merged }
+    Write-KiroJsonFile $File $cfg
+    return 'merged'
+}
+
+function Merge-KiroAgentDirs {
+    param([string[]]$Dirs, [object[]]$Entries)
+    foreach ($dir in $Dirs) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File)) {
+            switch (Merge-KiroAgentHooks $f.FullName $Entries) {
+                'merged'      { Ok "Agent hooks merged -> $($f.FullName)" }
+                'unparseable' { Warn2 "Skipping $($f.FullName) - not a JSON object (fix it and re-run to add the Rogue hooks)." }
+                'not-array'   { Warn2 "Skipping $($f.FullName) - its hooks block is not the array form (fix it and re-run to add the Rogue hooks)." }
+            }
+        }
+    }
+}
+
+# kiro-cli is a native command: it writes its errors to stderr and answers in the
+# exit code, both of which $ErrorActionPreference = 'Stop' would turn into a
+# terminating error. Run it under Continue and hand back both channels.
+function Invoke-KiroCli {
+    param([string[]]$CliArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = (& kiro-cli @CliArgs 2>$null | Out-String).Trim() } catch { $out = '' }
+    finally { $ErrorActionPreference = $prev }
+    return @{ Output = $out; ExitCode = $LASTEXITCODE }
+}
+
+# ADR 0001: the built-in default agent cannot carry hooks, so a `rogue` agent is
+# created from Kiro's own defaults. Returns $true when the config exists afterwards.
+function Install-KiroRogueAgent {
+    $cfg = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents', 'rogue.json')
+    if (Test-Path -LiteralPath $cfg) { return $true }
+    # `agent create` opens the editor on the new file (install.sh points it at
+    # `true`); a command that returns at once keeps the installer from blocking
+    # on an editor window. Unverified on Windows hardware (FIRE-2038).
+    $prevEditor = $env:EDITOR; $prevVisual = $env:VISUAL
+    $env:EDITOR = 'cmd /c exit'; $env:VISUAL = $env:EDITOR
+    try { $null = Invoke-KiroCli @('agent', 'create', '--name', 'rogue') }
+    finally { $env:EDITOR = $prevEditor; $env:VISUAL = $prevVisual }
+    if (-not (Test-Path -LiteralPath $cfg)) {
+        # kiro-cli 2.21.0 refuses `agent create` when it is not logged in, so this
+        # is the ordinary first-run path on a fresh machine.
+        Warn2 "kiro-cli agent create --name rogue failed - plain 'kiro-cli chat' on the 2.x engine will carry no Rogue hooks."
+        Log 'If kiro-cli is not logged in, run kiro-cli login and re-run this installer; the default agent is left as it is.'
+        return $false
+    }
+    Ok 'Agent rogue created via kiro-cli agent create'
+    return $true
+}
+
+# The merged config carries our entries under their `rogue-*` names.
+function Test-KiroAgentCarriesHooks {
+    param([string]$File)
+    if (-not (Test-Path -LiteralPath $File)) { return $false }
+    return [bool]((Get-Content -Raw -LiteralPath $File) -match '"rogue-preToolUse"')
+}
+
+# The default becomes `rogue` ONLY when the user set none; a default the user chose
+# is left alone and reported, because changing it would silently change which agent
+# every `kiro-cli chat` runs.
+function Set-KiroDefaultAgent {
+    $current = Invoke-KiroCli @('settings', 'chat.defaultAgent')
+    if ($current.ExitCode -eq 0 -and $current.Output) {
+        Ok "Default agent already set ($($current.Output)) - left unchanged."
+        if ($current.Output -ne 'rogue' -and $current.Output -ne '"rogue"') {
+            Log 'On the 2.x engine only agents with the Rogue hooks are covered; switch with: kiro-cli agent set-default rogue'
+        }
+        return
+    }
+    $set = Invoke-KiroCli @('agent', 'set-default', 'rogue')
+    if ($set.ExitCode -eq 0) { Ok 'Default agent set to rogue (no default was set)' }
+    else { Warn2 "kiro-cli agent set-default rogue failed - run it by hand so plain 'kiro-cli chat' carries the Rogue hooks." }
+}
+
+# Everything after the bridge copy: the hook file, the rogue agent, the merges,
+# and the default - switched only to a `rogue` agent that exists AND carries the
+# hooks after the merge: pointing the CLI at an agent `agent create` never wrote
+# (not logged in, say) would break every plain `kiro-cli chat`.
+function Install-KiroHooks {
+    param([string]$PluginDir, [string]$WorkspaceDir)
+    $hooksDir = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'hooks')
+    $hookFile = Write-KiroHookFile $PluginDir $hooksDir
+    Ok "Hook file written -> $hookFile"
+    $agentEntries = @(New-KiroHookEntries $PluginDir 'kiro_cli' $KiroAgentTriggers)
+    $haveAgent = $false
+    if (Get-Command kiro-cli -ErrorAction SilentlyContinue) {
+        $haveAgent = Install-KiroRogueAgent
+    } else {
+        Log "kiro-cli not on PATH - the IDE and the 3.0 engine load $hookFile directly."
+    }
+    Merge-KiroAgentDirs @(
+        [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents'),
+        [System.IO.Path]::Combine($WorkspaceDir, '.kiro', 'agents')
+    ) $agentEntries
+    if (-not $haveAgent) { return }
+    $rogueCfg = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents', 'rogue.json')
+    if (Test-KiroAgentCarriesHooks $rogueCfg) { Set-KiroDefaultAgent }
+    else { Warn2 "$rogueCfg carries no Rogue hooks after the merge - the default agent is left as it is." }
+}
+
+# Kiro ships no `kiro` binary on PATH: the CLI is `kiro-cli`, the IDE installs
+# under %LOCALAPPDATA%\Programs\Kiro, and both keep their state under %USERPROFILE%\.kiro.
+function Test-KiroInstalled {
+    if (Get-Command kiro-cli -ErrorAction SilentlyContinue) { return $true }
+    if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\Kiro'))) { return $true }
+    return [bool](Test-Path (Join-Path $env:USERPROFILE '.kiro'))
+}
+
+# Test seam: load only the functions above (tests/test_install_kiro_ps1.ps1).
+if ($env:ROGUE_INSTALL_LIB_ONLY) { return }
+
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -96,7 +310,7 @@ Write-Host "Rogue Security (Windows)" -ForegroundColor Cyan
 # agent still needs its binary; Cursor is a plain file copy, so it installs regardless.
 # Antigravity has no `antigravity` binary on PATH — detect the `agy` CLI or its data
 # dirs under %USERPROFILE%\.gemini (IDE and/or manual-CLI installs).
-$explicit = $Claude -or $Codex -or $Cursor -or $Gemini -or $Copilot -or $Antigravity
+$explicit = $Claude -or $Codex -or $Cursor -or $Gemini -or $Copilot -or $Antigravity -or $Kiro
 if ($explicit) {
     $hasClaude      = [bool]$Claude
     $hasCodex       = [bool]$Codex
@@ -104,6 +318,7 @@ if ($explicit) {
     $hasGemini      = [bool]$Gemini
     $hasCopilot     = [bool]$Copilot
     $hasAntigravity = [bool]$Antigravity
+    $hasKiro        = [bool]$Kiro
     if ($hasClaude -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
         Die "-Claude requested but the 'claude' CLI is not on PATH. Install Claude Code (https://claude.com/code) first."
     }
@@ -119,6 +334,9 @@ if ($explicit) {
     if ($hasAntigravity -and -not ((Get-Command agy -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.gemini\antigravity*')))) {
         Die "-Antigravity requested but no Antigravity install was detected (looked for: agy CLI, %USERPROFILE%\.gemini\antigravity*). Install Google Antigravity first."
     }
+    if ($hasKiro -and -not (Test-KiroInstalled)) {
+        Die "-Kiro requested but no Kiro install was detected (looked for: kiro-cli, %LOCALAPPDATA%\Programs\Kiro, %USERPROFILE%\.kiro). Install Kiro (https://kiro.dev) first."
+    }
 } else {
     $hasClaude      = [bool](Get-Command claude -ErrorAction SilentlyContinue)
     $hasCodex       = [bool](Get-Command codex  -ErrorAction SilentlyContinue)
@@ -126,8 +344,9 @@ if ($explicit) {
     $hasGemini      = [bool](Get-Command gemini -ErrorAction SilentlyContinue)
     $hasCopilot     = [bool](Get-Command copilot -ErrorAction SilentlyContinue)
     $hasAntigravity = [bool](Get-Command agy -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.gemini\antigravity*'))
-    if (-not ($hasClaude -or $hasCodex -or $hasCursor -or $hasGemini -or $hasCopilot -or $hasAntigravity)) {
-        Die "No supported coding agent found (looked for: claude, codex, cursor, gemini, copilot, antigravity). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), GitHub Copilot CLI (https://github.com/github/copilot-cli), or Google Antigravity first."
+    $hasKiro        = Test-KiroInstalled
+    if (-not ($hasClaude -or $hasCodex -or $hasCursor -or $hasGemini -or $hasCopilot -or $hasAntigravity -or $hasKiro)) {
+        Die "No supported coding agent found (looked for: claude, codex, cursor, gemini, copilot, antigravity, kiro). Install Claude Code (https://claude.com/code), OpenAI Codex, Cursor (https://cursor.com), Gemini CLI (https://geminicli.com), GitHub Copilot CLI (https://github.com/github/copilot-cli), Google Antigravity, or Kiro (https://kiro.dev) first."
     }
 }
 # Claude shells out to git to clone the marketplace; git is required only for it.
@@ -224,6 +443,7 @@ if ($ApiKey) {
         elseif ($hasCursor)  { $scFamily = 'cursor';  $scAgent = 'cursor' }
         elseif ($hasGemini)  { $scFamily = 'gemini';  $scAgent = 'gemini_cli' }
         elseif ($hasCopilot) { $scFamily = 'copilot'; $scAgent = 'github_copilot' }
+        elseif ($hasKiro)    { $scFamily = 'kiro';    $scAgent = 'kiro_cli' }
         $body = @{ agent_family = $scFamily; agent = $scAgent; host = $hostName; actor_email = [string]$Email } | ConvertTo-Json -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
         $resp = Invoke-WebRequest -Uri "$($BaseUrl.TrimEnd('/'))/api/v1/hooks/status" -Method Post `
@@ -499,6 +719,44 @@ if ($hasAntigravity) {
         Warn2 'Fully quit and reopen Antigravity, then run /rogue:status to verify.'
     } catch {
         Warn2 "Antigravity plugin not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Kiro: download the release tarball (top dir IS the plugin), copy it to
+# %USERPROFILE%\.rogue\plugins\kiro, then write the hook wiring (see the Kiro
+# helpers near the top). Non-fatal: a failed Kiro install must not abort the run.
+if ($hasKiro) {
+    Write-Host ""
+    Write-Host "Rogue Security - Kiro" -ForegroundColor Cyan
+    $asset = 'rogue-plugin-kiro.tar.gz'
+    if ($env:ROGUE_PLUGIN_VERSION) {
+        $url = "https://github.com/$PluginRepo/releases/download/$($env:ROGUE_PLUGIN_VERSION)/$asset"
+    } else {
+        $url = "https://github.com/$PluginRepo/releases/latest/download/$asset"
+    }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rogue-kiro-" + [System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        Log "Downloading plugin $asset"
+        $tarball = Join-Path $tmp 'p.tar.gz'
+        Invoke-WebRequest -Uri $url -OutFile $tarball -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        & tar -xzf $tarball -C $tmp
+        if ($LASTEXITCODE -ne 0) { throw "Could not extract the Kiro plugin tarball (is 'tar' available?)." }
+        $src = Get-ChildItem -Path $tmp -Recurse -File -Filter 'plugin.json' |
+            Where-Object { Test-Path ([System.IO.Path]::Combine($_.Directory.FullName, 'scripts', 'hook.ps1')) } |
+            Select-Object -First 1
+        if (-not $src) { throw "Kiro plugin manifest missing in download." }
+        $pluginDir = [System.IO.Path]::Combine($env:USERPROFILE, '.rogue', 'plugins', 'kiro')
+        if (Test-Path $pluginDir) { Remove-Item -Recurse -Force $pluginDir }
+        New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
+        Copy-Item -Recurse -Force (Join-Path $src.Directory.FullName '*') $pluginDir
+        Ok "Plugin installed -> $pluginDir"
+        Install-KiroHooks -PluginDir $pluginDir -WorkspaceDir (Get-Location).Path
+        Warn2 'Kiro loads hooks at start: restart the IDE and open a new kiro-cli chat. IDE hooks never run in an untrusted workspace.'
+    } catch {
+        Warn2 "Kiro plugin not installed ($($_.Exception.Message)). If the asset isn't published yet, re-run the installer once it is."
     } finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     }
