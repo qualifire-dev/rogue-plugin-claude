@@ -81,7 +81,9 @@ In practice it is absent in two cases:
    Antigravity products share one install, so a filesystem probe cannot tell which
    is running), and guessing is worse than omitting.
 
-The other five plugins determine their surface on every line they write.
+Every other plugin determines its surface on every line it writes — kiro from the
+install-time argument, the rest from a constant or an environment variable that is
+present before the first line.
 
 ### First version that ships it
 
