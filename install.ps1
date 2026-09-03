@@ -72,6 +72,7 @@ $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $en
 if (-not $ApiKey)     { $ApiKey     = $env:ROGUE_API_KEY }
 if (-not $Email)      { $Email      = $env:ROGUE_ACTOR_EMAIL }
 if (-not $Name)       { $Name       = $env:ROGUE_ACTOR_NAME }
+$BaseUrlExplicit = [bool]$BaseUrl -or [bool]$env:ROGUE_BASE_URL
 if (-not $BaseUrl)    { $BaseUrl    = if ($env:ROGUE_BASE_URL) { $env:ROGUE_BASE_URL } else { $ROGUE_BASE_URL_DEFAULT } }
 if (-not $PluginRepo) { $PluginRepo = if ($env:ROGUE_PLUGIN_REPO) { $env:ROGUE_PLUGIN_REPO } else { 'qualifire-dev/rogue-plugins' } }
 if ($env:ROGUE_NON_INTERACTIVE) { $NonInteractive = $true }
@@ -134,19 +135,49 @@ if ($hasClaude -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
     Die "git not found. Install Git for Windows (https://git-scm.com/download/win) first."
 }
 
+function ConvertFrom-ShellQuoted {
+    param([string]$Val)
+    if ($null -eq $Val) { return $Val }
+    $sb = [System.Text.StringBuilder]::new()
+    $i = 0; $n = $Val.Length
+    $state = 'normal'   # normal | single | double
+    while ($i -lt $n) {
+        $c = $Val[$i]
+        switch ($state) {
+            'single' {
+                if ($c -eq "'") { $state = 'normal' } else { [void]$sb.Append($c) }
+            }
+            'double' {
+                if ($c -eq '"') { $state = 'normal' }
+                elseif ($c -eq '\' -and ($i + 1) -lt $n -and ('"\$`'.IndexOf($Val[$i+1]) -ge 0)) {
+                    [void]$sb.Append($Val[$i+1]); $i++
+                } else { [void]$sb.Append($c) }
+            }
+            default {
+                if ($c -eq "'") { $state = 'single' }
+                elseif ($c -eq '"') { $state = 'double' }
+                elseif ($c -eq '\' -and ($i + 1) -lt $n) { [void]$sb.Append($Val[$i+1]); $i++ }
+                else { [void]$sb.Append($c) }
+            }
+        }
+        $i++
+    }
+    return $sb.ToString()
+}
+
 # Load existing creds from disk (same priority as the dispatcher: later wins).
 function Load-ExistingCreds {
     foreach ($f in @('C:\ProgramData\rogue\env', (Join-Path $env:USERPROFILE '.rogue-env'))) {
         if (-not (Test-Path -LiteralPath $f)) { continue }
-        foreach ($line in (Get-Content -LiteralPath $f -ErrorAction SilentlyContinue)) {
+        foreach ($line in (Get-Content -LiteralPath $f -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($line -match '^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.+)$') {
                 $k = $Matches[1]
-                $v = $Matches[2].Trim() -replace "^'(.*)'$", '$1' -replace '^"(.*)"$', '$1'
+                $v = ConvertFrom-ShellQuoted $Matches[2].Trim()
                 switch ($k) {
                     'ROGUE_API_KEY'     { if (-not $script:ApiKey)  { $script:ApiKey  = $v } }
                     'ROGUE_ACTOR_EMAIL' { if (-not $script:Email)   { $script:Email   = $v } }
                     'ROGUE_ACTOR_NAME'  { if (-not $script:Name)    { $script:Name    = $v } }
-                    'ROGUE_BASE_URL'    { if ($script:BaseUrl -eq $ROGUE_BASE_URL_DEFAULT) { $script:BaseUrl = $v } }
+                    'ROGUE_BASE_URL'    { if (-not $script:BaseUrlExplicit) { $script:BaseUrl = $v } }
                 }
             }
         }
@@ -210,26 +241,51 @@ if ($ApiKey) {
         }
     }
 
-    # Write %USERPROFILE%\.rogue-env via setup.ps1's format (POSIX single-quoted).
     function Format-EnvVal { param([string]$Val) return "'" + $Val.Replace("'", "'\''") + "'" }
+    $managed = @('ROGUE_API_KEY', 'ROGUE_ACTOR_EMAIL', 'ROGUE_ACTOR_NAME')
+    if ($BaseUrlExplicit) { $managed += 'ROGUE_BASE_URL' }
+    foreach ($pair in @(@('ROGUE_API_KEY', $ApiKey), @('ROGUE_ACTOR_EMAIL', $Email),
+                        @('ROGUE_ACTOR_NAME', $Name), @('ROGUE_BASE_URL', $BaseUrl))) {
+        if ([string]$pair[1] -match "[`r`n]") {
+            Die "Refusing to write ${EnvFile}: the value for $($pair[0]) contains a line break"
+        }
+    }
     $envLines = @(
-        '# Managed by the rogue Claude plugin installer. Read by hook subprocesses at runtime.',
+        '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.',
         '# Delete this file to revoke credentials.',
         "export ROGUE_API_KEY=$(Format-EnvVal $ApiKey)",
         "export ROGUE_ACTOR_EMAIL=$(Format-EnvVal $Email)",
         "export ROGUE_ACTOR_NAME=$(Format-EnvVal $Name)"
     )
-    if ($BaseUrl -ne $ROGUE_BASE_URL_DEFAULT) { $envLines += "export ROGUE_BASE_URL=$(Format-EnvVal $BaseUrl)" }
+    if ($BaseUrlExplicit -and $BaseUrl -ne $ROGUE_BASE_URL_DEFAULT) {
+        $envLines += "export ROGUE_BASE_URL=$(Format-EnvVal $BaseUrl)"
+    }
+    if (Test-Path -LiteralPath $EnvFile) {
+        $owned = '^\s*(?:export\s+)?(?:' + ($managed -join '|') + ')\s*='
+        $header = '^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)'
+        foreach ($line in (Get-Content -LiteralPath $EnvFile -Encoding UTF8 -ErrorAction Stop)) {
+            if ($line -match $owned -or $line -match $header) { continue }
+            $envLines += $line
+        }
+    }
     $envDir = Split-Path $EnvFile
     if ($envDir -and -not (Test-Path $envDir)) { New-Item -ItemType Directory -Path $envDir -Force | Out-Null }
-    Set-Content -Path $EnvFile -Value $envLines -Encoding UTF8
+    $envTmp = "$EnvFile.rogue-tmp.$PID"
     try {
-        $acl = Get-Acl $EnvFile
-        $acl.SetAccessRuleProtection($true, $false)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, 'FullControl', 'Allow')
-        $acl.SetAccessRule($rule); Set-Acl $EnvFile $acl
-    } catch { Warn2 "Could not restrict permissions on $EnvFile (non-fatal)." }
+        [System.IO.File]::WriteAllText($envTmp, (($envLines -join "`n") + "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+        try {
+            $acl = Get-Acl $envTmp
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, 'FullControl', 'Allow')
+            $acl.SetAccessRule($rule); Set-Acl $envTmp $acl
+        } catch { Warn2 "Could not restrict permissions on $EnvFile (non-fatal)." }
+        Move-Item -LiteralPath $envTmp -Destination $EnvFile -Force
+    } catch {
+        Remove-Item -LiteralPath $envTmp -Force -ErrorAction SilentlyContinue
+        Die "Could not write $EnvFile"
+    }
     Ok "Credentials written to $EnvFile"
 }
 
