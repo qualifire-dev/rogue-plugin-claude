@@ -34,8 +34,9 @@ json() { # json <file> <python-expr over d>
 BIN="$WORK/bin"
 FARM="$WORK/farm"
 mkdir -p "$BIN" "$FARM"
+# gzip is here for GNU tar, which shells out to it (bsdtar on macOS does not).
 for b in bash sh dirname basename date mkdir cat sed grep tr tail head awk wc hostname whoami \
-         tar cp rm mv chmod find mktemp uname env printf sleep true node python3 ls touch; do
+         tar gzip cp rm mv chmod find mktemp uname env printf sleep true node python3 ls touch; do
   src="$(command -v "$b" 2>/dev/null || true)"
   [ -n "$src" ] || continue
   ln -s "$src" "$FARM/$(basename "$src")" 2>/dev/null || true
