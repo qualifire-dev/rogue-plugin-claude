@@ -48,23 +48,32 @@ collects.
 spawned detached by the bridge on `SessionStart` (unthrottled) and on every
 `Stop` (throttled by the shared `scripts/beacon.sh`). It POSTs
 `/api/v1/hooks/status` so this install shows up in the Coding Agents roster,
-then runs the log shipper. The body:
+then runs the log shipper. The body is built by one function that the status
+script reuses - `rogue_kiro_status_body` in `scripts/kiro-host.sh`,
+`Get-StatusBody` in `heartbeat.ps1` - because the backend fingerprints the row
+on host, actor, family and agent, and a second copy of the fields is a second
+chance to open a second row for one install:
 
-| field | value | from |
-| --- | --- | --- |
-| `agent_family` | `kiro` | fixed |
-| `agent` | the surface argument (`kiro_ide` / `kiro_cli` / `kiro_crew`) | the hook file the event came through |
-| `version` | this plugin's version | `plugin.json`, via `scripts/install-id.sh` |
-| `agent_version` | the Kiro build the surface runs under | `scripts/kiro-host.sh`: `kiro-cli --version` for the CLI and Crew, the app bundle (`Info.plist`, or the install's `package.json` on Windows) for the IDE |
-| `default_agent` | the CLI's `chat.defaultAgent`; **omitted** when none is set or off the CLI | `kiro-host.sh`: `kiro-cli settings chat.defaultAgent` |
-| `host`, `actor_email`, `actor_name` | the install identity | `install-id.sh`, `actor.sh` |
+| field | value | from | stored by the roster today |
+| --- | --- | --- | --- |
+| `agent_family` | `kiro` | fixed | yes |
+| `agent` | the surface argument (`kiro_ide` / `kiro_cli` / `kiro_crew`) | the hook file the event came through | yes, part of the row's fingerprint |
+| `version` | this plugin's version | `plugin.json`, via `scripts/install-id.sh` | yes, drives the "outdated" badge |
+| `host`, `actor_email`, `actor_name` | the install identity | `install-id.sh`, `actor.sh` | yes, the rest of the fingerprint |
+| `agent_version` | the Kiro build the surface runs under | `scripts/kiro-host.sh`: `kiro-cli --version` for the CLI and Crew, the app bundle (`Info.plist`, or the install's `package.json` on Windows) for the IDE | **no** |
+| `default_agent` | the CLI's `chat.defaultAgent`; **omitted** when none is set or off the CLI | `kiro-host.sh`: `kiro-cli settings chat.defaultAgent` | **no** |
 
-Two versions ride one row on purpose: `version` is what the "outdated" badge
-compares against the release manifest, `agent_version` is what support needs
-when a Kiro release changes hook behaviour. `default_agent` exists because on
-the 2.x engine only agents that carry the Rogue hooks are covered (ADR 0001): a
-machine whose default moved away from `rogue` is uncovered, and the roster is
-where an admin would see that.
+`agent_version` and `default_agent` are sent ahead of the backend. The
+`/hooks/status` schema in rogue-aidr-api (`StatusBodySchema`) lists neither,
+and unknown body fields are stripped rather than rejected, so the POST lands
+and the two values are dropped on arrival: the roster does not show the Kiro
+build or the CLI default agent yet. Until the backend half (schema, a column
+on `coding_agent`, the roster UI) ships in the monorepo, `status.sh` /
+`status.ps1` on the machine is where both are visible. They are sent now
+rather than later because the contract is the interesting part: `agent_version`
+is what support needs when a Kiro release changes hook behaviour, and on the
+2.x engine only agents that carry the Rogue hooks are covered (ADR 0001), so a
+`default_agent` that moved away from `rogue` is an uncovered machine.
 
 ## Status
 
