@@ -37,7 +37,54 @@ event, and when a 2.x body carries no `session_id` the bridge copies
 
 One line per event lands in `~/.rogue/logs/kiro.log`
 (`provider=kiro surface=<surface> event=<Event> outcome=… http=… rc=… raw=…`),
-see `docs/hook-log-format.md`.
+see `docs/hook-log-format.md`. The shared shipper (`scripts/ship-logs.sh` /
+`.ps1`, a byte-identical copy of `scripts/shared/`) uploads it in the
+background, and knows `kiro` as one of the per-agent logs its support form
+collects.
+
+## Roster heartbeat
+
+`scripts/heartbeat.sh <surface> <trigger>` (`heartbeat.ps1` on Windows) is
+spawned detached by the bridge on `SessionStart` (unthrottled) and on every
+`Stop` (throttled by the shared `scripts/beacon.sh`). It POSTs
+`/api/v1/hooks/status` so this install shows up in the Coding Agents roster,
+then runs the log shipper. The body:
+
+| field | value | from |
+| --- | --- | --- |
+| `agent_family` | `kiro` | fixed |
+| `agent` | the surface argument (`kiro_ide` / `kiro_cli` / `kiro_crew`) | the hook file the event came through |
+| `version` | this plugin's version | `plugin.json`, via `scripts/install-id.sh` |
+| `agent_version` | the Kiro build the surface runs under | `scripts/kiro-host.sh`: `kiro-cli --version` for the CLI and Crew, the app bundle (`Info.plist`, or the install's `package.json` on Windows) for the IDE |
+| `default_agent` | the CLI's `chat.defaultAgent`; **omitted** when none is set or off the CLI | `kiro-host.sh`: `kiro-cli settings chat.defaultAgent` |
+| `host`, `actor_email`, `actor_name` | the install identity | `install-id.sh`, `actor.sh` |
+
+Two versions ride one row on purpose: `version` is what the "outdated" badge
+compares against the release manifest, `agent_version` is what support needs
+when a Kiro release changes hook behaviour. `default_agent` exists because on
+the 2.x engine only agents that carry the Rogue hooks are covered (ADR 0001): a
+machine whose default moved away from `rogue` is uncovered, and the roster is
+where an admin would see that.
+
+## Status
+
+Kiro has no slash-command surface for a `/rogue:status` skill, so the status
+command is a script:
+
+```
+sh ~/.rogue/plugins/kiro/scripts/status.sh
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.rogue\plugins\kiro\scripts\status.ps1"
+```
+
+It reports the credential sources and the resolved key (last four characters),
+the installed surfaces with their Kiro builds, the hook wiring the installer
+wrote (hook file, Crew wrappers, agent configs carrying the hooks, the 2.x
+default agent and whether it is covered), the `/hooks/status` check (HTTP code,
+organisation, running vs latest plugin version) and the last 20 lines of
+`kiro.log`. It posts the heartbeat's own body, resolved through the same
+helpers, so it refreshes the install's roster row rather than opening a second
+one. Exit 0 when configured and the API answered 200, 1 otherwise, so a managed
+rollout can verify a machine from a script.
 
 ## What the installer writes
 
@@ -93,6 +140,8 @@ be sure it applies on both.
 
 ```
 bash tests/test_hook_sh_kiro.sh            # bridge end to end against tests/mock_server.py
+bash tests/test_status_kiro_sh.sh          # status.sh under a temp HOME with a fake kiro-cli and curl
+sh tests/test_heartbeat_sh.sh              # beacon throttle + the kiro heartbeat body
 bash tests/test_install_kiro_sh.sh         # install.sh --kiro under a temp HOME with a fake kiro-cli
 pwsh tests/test_install_kiro_ps1.ps1       # the same wiring in install.ps1
 TEST_SH=dash bash tests/test_hook_sh_kiro.sh
