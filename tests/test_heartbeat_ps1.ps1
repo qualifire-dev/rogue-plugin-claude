@@ -244,7 +244,7 @@ try {
     # plugins disagree about the interval or the stamp path throttles inconsistently.
     $shared = Join-Path $repo 'scripts/shared/beacon.ps1'
     $sharedBytes = [System.IO.File]::ReadAllBytes($shared)
-    foreach ($p in 'rogue','codex','cursor','copilot','antigravity') {
+    foreach ($p in 'rogue','codex','cursor','copilot','antigravity','kiro') {
         $copy = Join-Path $repo "plugins/$p/scripts/beacon.ps1"
         $same = $false
         if (Test-Path -LiteralPath $copy) {
@@ -274,6 +274,7 @@ try {
         @{ Plugin = 'codex';       File = 'scripts/heartbeat.ps1'; Slug = 'codex';       Session = 'SessionStart' },
         @{ Plugin = 'copilot';     File = 'scripts/heartbeat.ps1'; Slug = 'copilot';     Session = 'sessionStart' },
         @{ Plugin = 'antigravity'; File = 'scripts/heartbeat.ps1'; Slug = 'antigravity'; Session = 'SessionStart' },
+        @{ Plugin = 'kiro';        File = 'scripts/heartbeat.ps1'; Slug = 'kiro';        Session = 'SessionStart' },
         # Cursor has no heartbeat.ps1 - its beacon is inline in the dispatcher, which is
         # also the only plugin where a throttled beacon is worth a log line (the
         # decision happens where the log is being written).
@@ -323,6 +324,18 @@ try {
         ($agHook -match '\[regex\]::Match\(\$payload, .\"initialNumSteps\"')
     Check "antigravity never globs initialNumSteps" $true `
         (-not ($agHook -match '-like .\*"initialNumSteps"'))
+    # Kiro's surface is an install-time argument, so the spawn must forward it
+    # alongside the trigger or the heartbeat's roster row keys on kiro_cli while the
+    # per-event header says kiro_ide - two rows for one install.
+    $kiroHook = Get-Content -Raw (Join-Path $repo 'plugins/kiro/scripts/hook.ps1')
+    Check "kiro hook.ps1 spawns the heartbeat with the surface and the trigger" $true `
+        ($kiroHook -match "'-File',\`$hb,\`$agent,\`$EventName")
+    Check "kiro hook.ps1 spawns it on SessionStart and Stop only" $true `
+        ($kiroHook -match "\`$EventName -eq 'SessionStart' -or \`$EventName -eq 'Stop'")
+    $kiroHb = Get-Content -Raw (Join-Path $repo 'plugins/kiro/scripts/heartbeat.ps1')
+    Check "kiro heartbeat.ps1 takes the surface positionally" $true `
+        ($kiroHb -match "param\(\[string\]\`$Agent = '', \[string\]\`$Trigger = 'SessionStart'\)")
+    Check "kiro heartbeat.ps1 reports family kiro" $true ($kiroHb -match "agent_family = 'kiro'")
 }
 finally {
     $env:USERPROFILE = $saveProfile
