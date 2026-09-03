@@ -3,7 +3,7 @@
 Every Rogue plugin's hook dispatcher appends **one line per invocation** to its own
 file under `~/.rogue/logs/` (`%USERPROFILE%\.rogue\logs\` on Windows) —
 `claude.log`, `codex.log`, `cursor.log`, `gemini.log`, `copilot.log`,
-`antigravity.log`.
+`antigravity.log`, `kiro.log`.
 
 ```
 2026-08-13T07:02:05Z provider=claude surface=cli event=PreToolUse outcome=allow
@@ -48,6 +48,7 @@ and nothing else — never a path, a user name, a host name, or a window title.
 | `cursor` | `cursor` | single surface — a constant |
 | `copilot` | `github_copilot` | single surface — a constant |
 | `gemini` | `gemini_cli` | single surface — a constant |
+| `kiro` | `kiro_ide` / `kiro_cli` / `kiro_crew` | the bridge's second argument, fixed by the installer per hook file; no Kiro payload names its surface |
 
 Each plugin resolves this **once**, from the signal its heartbeat already uses, and
 the two read one shared table:
@@ -80,7 +81,9 @@ In practice it is absent in two cases:
    Antigravity products share one install, so a filesystem probe cannot tell which
    is running), and guessing is worse than omitting.
 
-The other five plugins determine their surface on every line they write.
+Every other plugin determines its surface on every line it writes — kiro from the
+install-time argument, the rest from a constant or an environment variable that is
+present before the first line.
 
 ### First version that ships it
 
@@ -92,6 +95,7 @@ The other five plugins determine their surface on every line they write.
 | copilot | 1.2.1 |
 | antigravity | 1.0.24 |
 | gemini | 1.0.25 |
+| kiro | 1.0.0 |
 
 ### Guarantees
 

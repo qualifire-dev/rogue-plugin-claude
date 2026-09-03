@@ -55,25 +55,29 @@ dispatch() { # dispatch <slug> <event>  → runs the dispatcher for <slug>
         "$SH" "$REPO/plugins/antigravity/scripts/hook.sh" "$2" ;;
     gemini)
       node "$REPO/plugins/gemini/scripts/hook.mjs" "$2" ;;
+    kiro)
+      # The surface is an install-time argument, not detected: the hook file
+      # names it after the event.
+      "$SH" "$REPO/plugins/kiro/scripts/hook.sh" "$2" kiro_cli ;;
   esac
 }
 
 event_for() { # the dispatchers' own casing for a pre-tool event
   case "$1" in
     claude|antigravity) echo PreToolUse ;;
-    codex)              echo PreToolUse ;;
+    codex|kiro)         echo PreToolUse ;;
     cursor|copilot)     echo preToolUse ;;
     gemini)             echo BeforeTool ;;
   esac
 }
 
-SLUGS='claude codex cursor copilot antigravity gemini'
+SLUGS='claude codex cursor copilot antigravity gemini kiro'
 
 # `gemini` needs node; skip it (loudly) rather than failing the suite on a box
 # without it — every other dispatcher is pure sh + curl.
 if ! command -v node >/dev/null 2>&1; then
   echo "NOTE: node not found — skipping the gemini dispatcher"
-  SLUGS='claude codex cursor copilot antigravity'
+  SLUGS='claude codex cursor copilot antigravity kiro'
 fi
 
 # fire <slug> <home> [VAR=value ...] — run the dispatcher in an isolated HOME.
@@ -104,6 +108,7 @@ done
 #   claude  - CLAUDE_CODE_ENTRYPOINT is set by `fire` below, as the real client does
 #   codex   - ROGUE_CODEX_SURFACE unset defaults to codex_cli, matching heartbeat.sh
 #   cursor / copilot / gemini - single-surface plugins, so a constant
+#   kiro    - the surface argument the hook file was written with (kiro_cli here)
 #   antigravity - resolved from the payload's transcriptPath, and the unconfigured
 #     path exits BEFORE stdin is read, so there is nothing to resolve from. The
 #     token is optional precisely so this line can simply omit it.
@@ -114,6 +119,7 @@ surface_for() {
     cursor)      echo cursor ;;
     copilot)     echo github_copilot ;;
     gemini)      echo gemini_cli ;;
+    kiro)        echo kiro_cli ;;
     antigravity) echo '' ;;
   esac
 }

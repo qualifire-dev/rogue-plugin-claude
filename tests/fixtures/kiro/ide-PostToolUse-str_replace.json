@@ -1,0 +1,13 @@
+{
+  "session_id": "sess_dd301140-90cd-4942-b805-c94c30676dec",
+  "hook_event_name": "PostToolUse",
+  "cwd": "/workspace",
+  "tool_name": "str_replace",
+  "tool_input": {
+    "path": "notes/hello-ide.txt",
+    "oldStr": "hello",
+    "newStr": "hello",
+    "replace_all": false
+  },
+  "tool_response": "Replaced text in notes/hello-ide.txt"
+}

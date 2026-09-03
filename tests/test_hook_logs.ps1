@@ -32,6 +32,7 @@ $cases = @(
     @{ slug = 'cursor';      path = 'plugins/cursor/scripts/hook.ps1';      event = 'preToolUse' }
     @{ slug = 'copilot';     path = 'plugins/copilot/scripts/hook.ps1';     event = 'preToolUse' }
     @{ slug = 'antigravity'; path = 'plugins/antigravity/scripts/hook.ps1'; event = 'PreToolUse' }
+    @{ slug = 'kiro';        path = 'plugins/kiro/scripts/hook.ps1';        event = 'PreToolUse' }
 )
 
 function Pass { param([string]$M) Write-Host "  ok: $M" }
@@ -209,6 +210,7 @@ Write-Host "== the optional surface token"
 # emit shape is forced both ways with -Surface.
 $surfaceDefaults = @{
     claude = ''; codex = ''; antigravity = ''   # resolved per session in the main body
+    kiro = ''                                   # an install-time argument, read in the main body
     cursor = 'cursor'; copilot = 'github_copilot'
 }
 foreach ($c in $cases) {

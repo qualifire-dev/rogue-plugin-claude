@@ -229,6 +229,17 @@ jobs:
           SH=dash sh tests/test_heartbeat_sh.sh
           SH=bash bash tests/test_heartbeat_sh.sh
 
+      - name: Kiro bridge end to end (mock server)
+        # Kiro's decision is the bridge's EXIT CODE (PreToolUse block = exit 2)
+        # rather than a relayed body, so unlike the other dispatcher e2e suites
+        # this one is the only automated check of the enforcement itself, and it
+        # runs here. It needs python3 + curl only (readiness is probed with curl,
+        # not nc). Both shells: dash is what Kiro's `sh` resolves to on Linux.
+        run: |
+          set -euo pipefail
+          TEST_SH=dash bash tests/test_hook_sh_kiro.sh
+          TEST_SH=bash bash tests/test_hook_sh_kiro.sh
+
       - name: Log-shipper end to end (real HTTP)
         # The contract suite above stubs `curl`, so it can only assert what the
         # shipper WOULD send. This one runs the real pipeline - real dispatcher, real
@@ -308,6 +319,7 @@ jobs:
           pwsh -NoProfile -File tests/test_hook_ps1.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
+          pwsh -NoProfile -File tests/test_hook_ps1_kiro.ps1
           pwsh -NoProfile -File tests/test_hook_logs.ps1
           pwsh -NoProfile -File tests/test_ship_logs.ps1
           pwsh -NoProfile -File tests/test_heartbeat_ps1.ps1
@@ -354,6 +366,8 @@ jobs:
           powershell -NoProfile -File tests/test_hook_ps1_copilot.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_hook_ps1_antigravity.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          powershell -NoProfile -File tests/test_hook_ps1_kiro.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           powershell -NoProfile -File tests/test_hook_logs.ps1
           if ($LASTEXITCODE -ne 0) { exit 1 }

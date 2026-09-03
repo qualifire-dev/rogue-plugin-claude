@@ -1,7 +1,8 @@
 """
 Tiny HTTP mock that records the inbound headers (so the smoke test can assert
 on x-rogue-event etc.) and returns whatever bytes the env var MOCK_RESPONSE
-contains. Sends MOCK_STATUS as the HTTP status (default 200).
+contains. Sends MOCK_STATUS as the HTTP status (default 200). MOCK_DELAY (seconds,
+default 0) holds the response back so a bridge's timeout path can be exercised.
 
 Usage:
     MOCK_RESPONSE='{"hookSpecificOutput":{"permissionDecision":"deny"}}' \
@@ -11,6 +12,7 @@ import http.server
 import json
 import os
 import sys
+import time
 
 
 HEADERS_PATH = sys.argv[2] if len(sys.argv) > 2 else "/tmp/rogue-mock-headers.json"
@@ -27,6 +29,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "body": body_in.decode("utf-8", errors="replace"),
                 "path": self.path,
             }, f)
+        time.sleep(float(os.environ.get("MOCK_DELAY", "0")))
         status = int(os.environ.get("MOCK_STATUS", "200"))
         body = os.environ.get("MOCK_RESPONSE", "{}").encode()
         self.send_response(status)
