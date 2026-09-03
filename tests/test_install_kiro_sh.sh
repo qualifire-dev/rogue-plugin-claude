@@ -56,12 +56,18 @@ chmod +x "$BIN/curl"
 # kiro-cli 2.21.0's shape: `settings chat.defaultAgent` prints the value (exit
 # 0) or "error: No value associated with chat.defaultAgent" (exit 1); `agent
 # create --name X` writes X.json into the global agent dir from Kiro's
-# defaults; `agent set-default X` records the choice.
+# defaults (and records the $EDITOR it would open on it), or refuses with the
+# real CLI's not-logged-in error when KIRO_FAKE_CREATE_FAILS is set; `agent
+# set-default X` records the choice.
 cat > "$BIN/kiro-cli" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$KIRO_CLI_LOG"
 case "${1:-} ${2:-}" in
   "agent create")
+    printf '%s' "${EDITOR-unset}" > "$KIRO_STATE/editor"
+    if [ -n "${KIRO_FAKE_CREATE_FAILS:-}" ]; then
+      echo "error: You are not logged in, please log in with kiro-cli login" >&2; exit 1
+    fi
     name=""
     while [ $# -gt 0 ]; do case "$1" in --name) name="$2"; shift ;; esac; shift; done
     mkdir -p "$HOME/.kiro/agents"
@@ -97,13 +103,14 @@ run_install() {
   set +e
   ( cd "$home/ws" && env -i PATH="$path" HOME="$home" TARBALL="$TARBALL" \
       KIRO_CLI_LOG="$home/kiro-cli.log" KIRO_STATE="$home/state" \
+      KIRO_FAKE_CREATE_FAILS="${KIRO_FAKE_CREATE_FAILS:-}" \
       NO_COLOR=1 ROGUE_NON_INTERACTIVE=1 ROGUE_API_KEY=test-key \
       bash "$REPO/install.sh" "$@" ) > "$OUT" 2> "$ERR"
   LAST_RC=$?
   set -e
 }
 
-seed_agents() { # <home>: one custom agent with its own hooks, one workspace agent, one broken file
+seed_agents() { # <home>: one custom agent with its own hooks, one workspace agent, one broken file, one map-form hooks block
   mkdir -p "$1/.kiro/agents" "$1/ws/.kiro/agents"
   cat > "$1/.kiro/agents/custom.json" <<'JSON'
 {
@@ -118,6 +125,7 @@ seed_agents() { # <home>: one custom agent with its own hooks, one workspace age
 JSON
   printf '{"name":"ws","tools":[]}\n' > "$1/ws/.kiro/agents/ws.json"
   printf '{"name": "broken", "tools": [\n' > "$1/.kiro/agents/broken.json"
+  printf '{"name":"m","hooks":{"preToolUse":[{"command":"echo"}]}}\n' > "$1/.kiro/agents/mapform.json"
 }
 
 FULL_PATH="$BIN:$FARM"
@@ -191,9 +199,16 @@ check "unparseable agent config is left byte for byte" \
 grep -q "broken.json" "$ERR" && ok "unparseable agent config is named in a warning" \
   || bad "unparseable agent config is named in a warning" "$(cat "$ERR")"
 
+# ── a hooks block in another form: left alone with a warning, run still succeeds
+check "map-form hooks block is left byte for byte" \
+  '{"name":"m","hooks":{"preToolUse":[{"command":"echo"}]}}' "$(cat "$H/.kiro/agents/mapform.json")"
+grep -q 'mapform.json.*not the array form' "$ERR" && ok "map-form hooks block is named in a warning" \
+  || bad "map-form hooks block is named in a warning" "$(cat "$ERR")"
+
 # ── the rogue agent: created, merged, made default (none was set) ───────────
 grep -q "^agent create --name rogue$" "$H/kiro-cli.log" && ok "rogue agent created via kiro-cli agent create --name rogue" \
   || bad "rogue agent created via kiro-cli" "$(cat "$H/kiro-cli.log")"
+check "agent create runs with a no-op EDITOR (it opens the new file)" "true" "$(cat "$H/state/editor")"
 ROGUE="$H/.kiro/agents/rogue.json"
 check "rogue agent keeps Kiro's defaults"  "created by kiro-cli" "$(json "$ROGUE" 'd["description"]')"
 check "rogue agent carries the hooks"      "5" "$(json "$ROGUE" 'len([h for h in d["hooks"] if h["name"].startswith("rogue-")])')"
@@ -274,6 +289,26 @@ else
   check "--kiro with no Kiro install fails loud" "1" "$LAST_RC"
   grep -q "kiro" "$ERR" && ok "--kiro failure names what was looked for" || bad "--kiro failure names what was looked for" "$(cat "$ERR")"
 fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. `agent create` fails (kiro-cli not logged in): everything else is wired,
+#    the default is NEVER switched to an agent that does not exist
+# ═════════════════════════════════════════════════════════════════════════════
+H8="$WORK/home8"
+mkdir -p "$H8"
+seed_agents "$H8"
+KIRO_FAKE_CREATE_FAILS=1 run_install "$H8" "$FULL_PATH" --kiro
+check "install with a failing agent create exits 0" "0" "$LAST_RC"
+grep -q "^agent create --name rogue$" "$H8/kiro-cli.log" && ok "agent create was attempted" \
+  || bad "agent create was attempted" "$(cat "$H8/kiro-cli.log")"
+[ -e "$H8/.kiro/agents/rogue.json" ] && bad "no rogue.json when create failed" "rogue.json exists" \
+  || ok "no rogue.json when create failed"
+check "agent set-default is never called for an agent that does not exist" "0" "$(grep -c "^agent set-default" "$H8/kiro-cli.log" || true)"
+[ -e "$H8/state/default" ] && bad "the CLI default is left unset" "$(cat "$H8/state/default")" || ok "the CLI default is left unset"
+grep -q "kiro-cli login" "$ERR" && ok "the warning names kiro-cli login" || bad "the warning names kiro-cli login" "$(cat "$ERR")"
+grep -q "not logged in" "$ERR" && ok "the CLI's own error is shown" || bad "the CLI's own error is shown" "$(cat "$ERR")"
+[ -f "$H8/.kiro/hooks/rogue.json" ] && ok "hook file still written" || bad "hook file still written" "missing"
+check "custom agents are still merged" "6" "$(json "$H8/.kiro/agents/custom.json" 'len(d["hooks"])')"
 
 echo ""
 if [ "$fails" -eq 0 ]; then echo "test_install_kiro_sh: all passed"; else echo "test_install_kiro_sh: $fails failure(s)"; exit 1; fi

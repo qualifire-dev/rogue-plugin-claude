@@ -103,7 +103,9 @@ function Die  { param([string]$M) Write-Host "x  $M" -ForegroundColor Red; exit 
 # The Crew wrappers are POSIX shell scripts and are not written here. No Kiro
 # payload names its surface, so each file fixes the bridge's surface argument:
 # hook file -> kiro_ide (the IDE reads nothing else, and the prompt block is
-# IDE-only), agent configs -> kiro_cli.
+# IDE-only), agent configs -> kiro_cli. The 3.0 engine loads BOTH: the bridge
+# drops the agent-hook copy there, so each event is recorded once, labelled
+# kiro_ide - the one known mislabel until FIRE-2038 finds a run-time signal.
 #
 # Paths are built with [IO.Path]::Combine, not 'a\b' literals: the unit tests load
 # these functions on Linux through the ROGUE_INSTALL_LIB_ONLY seam, where a
@@ -215,13 +217,29 @@ function Invoke-KiroCli {
 function Install-KiroRogueAgent {
     $cfg = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents', 'rogue.json')
     if (Test-Path -LiteralPath $cfg) { return $true }
-    $null = Invoke-KiroCli @('agent', 'create', '--name', 'rogue')
+    # `agent create` opens the editor on the new file (install.sh points it at
+    # `true`); a command that returns at once keeps the installer from blocking
+    # on an editor window. Unverified on Windows hardware (FIRE-2038).
+    $prevEditor = $env:EDITOR; $prevVisual = $env:VISUAL
+    $env:EDITOR = 'cmd /c exit'; $env:VISUAL = $env:EDITOR
+    try { $null = Invoke-KiroCli @('agent', 'create', '--name', 'rogue') }
+    finally { $env:EDITOR = $prevEditor; $env:VISUAL = $prevVisual }
     if (-not (Test-Path -LiteralPath $cfg)) {
-        Warn2 "kiro-cli agent create --name rogue failed - the 2.x engine's built-in default agent will carry no Rogue hooks."
+        # kiro-cli 2.21.0 refuses `agent create` when it is not logged in, so this
+        # is the ordinary first-run path on a fresh machine.
+        Warn2 "kiro-cli agent create --name rogue failed - plain 'kiro-cli chat' on the 2.x engine will carry no Rogue hooks."
+        Log 'If kiro-cli is not logged in, run kiro-cli login and re-run this installer; the default agent is left as it is.'
         return $false
     }
     Ok 'Agent rogue created via kiro-cli agent create'
     return $true
+}
+
+# The merged config carries our entries under their `rogue-*` names.
+function Test-KiroAgentCarriesHooks {
+    param([string]$File)
+    if (-not (Test-Path -LiteralPath $File)) { return $false }
+    return [bool]((Get-Content -Raw -LiteralPath $File) -match '"rogue-preToolUse"')
 }
 
 # The default becomes `rogue` ONLY when the user set none; a default the user chose
@@ -241,16 +259,19 @@ function Set-KiroDefaultAgent {
     else { Warn2 "kiro-cli agent set-default rogue failed - run it by hand so plain 'kiro-cli chat' carries the Rogue hooks." }
 }
 
-# Everything after the bridge copy: the hook file, the rogue agent, the merges.
+# Everything after the bridge copy: the hook file, the rogue agent, the merges,
+# and the default - switched only to a `rogue` agent that exists AND carries the
+# hooks after the merge: pointing the CLI at an agent `agent create` never wrote
+# (not logged in, say) would break every plain `kiro-cli chat`.
 function Install-KiroHooks {
     param([string]$PluginDir, [string]$WorkspaceDir)
     $hooksDir = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'hooks')
     $hookFile = Write-KiroHookFile $PluginDir $hooksDir
     Ok "Hook file written -> $hookFile"
     $agentEntries = @(New-KiroHookEntries $PluginDir 'kiro_cli' $KiroAgentTriggers)
+    $haveAgent = $false
     if (Get-Command kiro-cli -ErrorAction SilentlyContinue) {
-        $null = Install-KiroRogueAgent
-        Set-KiroDefaultAgent
+        $haveAgent = Install-KiroRogueAgent
     } else {
         Log "kiro-cli not on PATH - the IDE and the 3.0 engine load $hookFile directly."
     }
@@ -258,6 +279,18 @@ function Install-KiroHooks {
         [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents'),
         [System.IO.Path]::Combine($WorkspaceDir, '.kiro', 'agents')
     ) $agentEntries
+    if (-not $haveAgent) { return }
+    $rogueCfg = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents', 'rogue.json')
+    if (Test-KiroAgentCarriesHooks $rogueCfg) { Set-KiroDefaultAgent }
+    else { Warn2 "$rogueCfg carries no Rogue hooks after the merge - the default agent is left as it is." }
+}
+
+# Kiro ships no `kiro` binary on PATH: the CLI is `kiro-cli`, the IDE installs
+# under %LOCALAPPDATA%\Programs\Kiro, and both keep their state under %USERPROFILE%\.kiro.
+function Test-KiroInstalled {
+    if (Get-Command kiro-cli -ErrorAction SilentlyContinue) { return $true }
+    if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\Kiro'))) { return $true }
+    return [bool](Test-Path (Join-Path $env:USERPROFILE '.kiro'))
 }
 
 # Test seam: load only the functions above (tests/test_install_kiro_ps1.ps1).
@@ -270,14 +303,6 @@ try {
 
 Write-Host ""
 Write-Host "Rogue Security (Windows)" -ForegroundColor Cyan
-
-# Kiro ships no `kiro` binary on PATH: the CLI is `kiro-cli`, the IDE installs
-# under %LOCALAPPDATA%\Programs\Kiro, and both keep their state under %USERPROFILE%\.kiro.
-function Test-KiroInstalled {
-    if (Get-Command kiro-cli -ErrorAction SilentlyContinue) { return $true }
-    if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\Kiro'))) { return $true }
-    return [bool](Test-Path (Join-Path $env:USERPROFILE '.kiro'))
-}
 
 # Agent selection. -Claude/-Codex/-Cursor pick an explicit set; with none, auto-detect
 # every supported agent. claude/codex ship a CLI on PATH; Cursor's `cursor` command is

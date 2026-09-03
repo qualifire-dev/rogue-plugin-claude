@@ -6,8 +6,8 @@
 # ROGUE_INSTALL_LIB_ONLY seam (the script returns right after defining them) and
 # driven against a temporary USERPROFILE with a fake kiro-cli on PATH: the hook
 # file's shape, the agent-config merge (kept fields, kept foreign hooks, a
-# re-run that does not stack, an unparseable file skipped), and both
-# default-agent branches of ADR 0001. Runs on any platform with PowerShell;
+# re-run that does not stack, an unparseable file skipped), both default-agent
+# branches of ADR 0001, a failing `agent create`, and the detection probe. Runs on any platform with PowerShell;
 # validate.yml also runs it under Windows PowerShell 5.1, whose JSON cmdlets
 # differ from pwsh 7's.
 
@@ -28,14 +28,21 @@ $env:KIRO_STATE   = $state
 
 # The fake kiro-cli: `settings chat.defaultAgent` prints the value (exit 0) or an
 # error (exit 1); `agent create --name X` writes X.json from Kiro's defaults into
-# the global agent dir; `agent set-default X` records the choice. A .ps1 resolves
-# by bare name from PATH on Windows; on Linux/macOS a sh shim beside it does.
+# the global agent dir (recording the EDITOR it would open on it), or refuses
+# with the real CLI's not-logged-in error when KIRO_FAKE_CREATE_FAILS is set;
+# `agent set-default X` records the choice. A .ps1 resolves by bare name from
+# PATH on Windows; on Linux/macOS a sh shim beside it does.
 $fakeCli = Join-Path $bin 'kiro-cli.ps1'
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Argv)
 Add-Content -LiteralPath $env:KIRO_CLI_LOG -Value ($Argv -join ' ')
 $sub = "$($Argv[0]) $($Argv[1])"
 if ($sub -eq 'agent create') {
+    [System.IO.File]::WriteAllText((Join-Path $env:KIRO_STATE 'editor'), [string]$env:EDITOR)
+    if ($env:KIRO_FAKE_CREATE_FAILS) {
+        [Console]::Error.WriteLine('error: You are not logged in, please log in with kiro-cli login')
+        exit 1
+    }
     $name = $Argv[[array]::IndexOf($Argv, '--name') + 1]
     $dir = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents')
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -77,6 +84,18 @@ function Assert-Eq {
 }
 function Read-Json { param([string]$Path) return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json) }
 function Get-RogueHooks { param($Cfg) return @($Cfg.hooks | Where-Object { $_.name -like 'rogue-*' }) }
+
+# -- Test-KiroInstalled: kiro-cli on PATH, or %USERPROFILE%\.kiro -----------------
+Assert-Eq (Test-KiroInstalled) $true 'detection: kiro-cli on PATH'
+$env:PATH = $prevPath
+$env:USERPROFILE = Join-Path $work 'nokiro'
+New-Item -ItemType Directory -Path $env:USERPROFILE -Force | Out-Null
+if (Get-Command kiro-cli -ErrorAction SilentlyContinue) { Write-Host '  skip: detection with nothing to find (a real kiro-cli is on PATH)' }
+else { Assert-Eq (Test-KiroInstalled) $false 'detection: nothing to find' }
+New-Item -ItemType Directory -Path (Join-Path $env:USERPROFILE '.kiro') -Force | Out-Null
+Assert-Eq (Test-KiroInstalled) $true 'detection: %USERPROFILE%\.kiro alone is enough'
+$env:USERPROFILE = $home1
+$env:PATH = $bin + [System.IO.Path]::PathSeparator + $prevPath
 
 $pluginDir = [System.IO.Path]::Combine($home1, '.rogue', 'plugins', 'kiro')
 $bridge    = [System.IO.Path]::Combine($pluginDir, 'scripts', 'hook.ps1')
@@ -162,6 +181,8 @@ $rogueCfg = Join-Path $agentsDir 'rogue.json'
 Assert-Eq (Test-Path -LiteralPath $rogueCfg) $true 'rogue.json exists in the global agent dir'
 Assert-Eq ((Read-Json $rogueCfg).description) 'created by kiro-cli' "rogue agent keeps Kiro's defaults"
 Assert-Eq ((Get-Content -LiteralPath $env:KIRO_CLI_LOG) -join '|') 'agent create --name rogue' 'created via kiro-cli agent create --name rogue'
+Assert-Eq ([string]::IsNullOrEmpty([System.IO.File]::ReadAllText((Join-Path $state 'editor')))) $false 'agent create runs with a no-op EDITOR (it opens the new file)'
+Assert-Eq ([string]$env:EDITOR) ([string]$null) 'the EDITOR override does not leak past the call'
 Assert-Eq (Install-KiroRogueAgent) $true 'a second call is a no-op'
 Assert-Eq (@(Get-Content -LiteralPath $env:KIRO_CLI_LOG).Count) 1 'a second call does not re-create the agent'
 
@@ -192,6 +213,23 @@ $null = (Install-KiroHooks -PluginDir $pluginDir -WorkspaceDir $ws 6>&1 | Out-St
 Assert-Eq (@((Read-Json $custom).hooks).Count) 6 'a second full run still does not stack'
 Assert-Eq (@(Get-ChildItem -LiteralPath $hooksDir -Filter 'rogue*.json').Count) 1 'a second full run leaves one hook file'
 Assert-Eq (@(Get-Content -LiteralPath $env:KIRO_CLI_LOG | Where-Object { $_ -like 'agent create*' }).Count) 0 'a second full run never re-creates the agent'
+
+# -- agent create fails (kiro-cli not logged in): the default is never switched --
+$env:USERPROFILE = Join-Path $work 'home-nologin'
+$agents2 = [System.IO.Path]::Combine($env:USERPROFILE, '.kiro', 'agents')
+New-Item -ItemType Directory -Path $agents2 -Force | Out-Null
+'{"name":"custom2","tools":[]}' | Set-Content -LiteralPath (Join-Path $agents2 'custom2.json') -Encoding UTF8
+Remove-Item -LiteralPath $env:KIRO_CLI_LOG -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $state 'default') -ErrorAction SilentlyContinue
+$env:KIRO_FAKE_CREATE_FAILS = '1'
+$out = (Install-KiroHooks -PluginDir $pluginDir -WorkspaceDir $ws 6>&1 | Out-String)
+$env:KIRO_FAKE_CREATE_FAILS = $null
+Assert-Eq (@(Get-Content -LiteralPath $env:KIRO_CLI_LOG | Where-Object { $_ -like 'agent create*' }).Count) 1 'agent create was attempted'
+Assert-Eq (Test-Path -LiteralPath (Join-Path $agents2 'rogue.json')) $false 'no rogue.json when create failed'
+Assert-Eq (@(Get-Content -LiteralPath $env:KIRO_CLI_LOG | Where-Object { $_ -like 'agent set-default*' }).Count) 0 'agent set-default is never called for an agent that does not exist'
+Assert-Eq (Test-Path -LiteralPath (Join-Path $state 'default')) $false 'the CLI default is left unset'
+Assert-Eq ($out -match 'kiro-cli login') $true 'the warning names kiro-cli login'
+Assert-Eq (@((Read-Json (Join-Path $agents2 'custom2.json')).hooks).Count) 5 'custom agents are still merged'
 
 $env:USERPROFILE = $prevProfile
 $env:PATH = $prevPath

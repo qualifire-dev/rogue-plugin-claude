@@ -417,8 +417,16 @@ antigravity_install_plugin() {
 # No Kiro payload names its surface, so each file fixes the bridge's surface
 # argument to the surface it is authoritative for: the hook file → kiro_ide (the
 # IDE reads nothing else, and the prompt block is IDE-only), agent configs →
-# kiro_cli, the Crew wrappers → kiro_crew. Returns non-zero (never `die`s) so a
-# missing asset cannot abort a run that already installed other agents.
+# kiro_cli, the Crew wrappers → kiro_crew. The 3.0 engine loads BOTH the hook
+# file and the agent configs: the bridge drops the agent-hook copy there (a
+# PascalCase payload under a camelCase trigger), so each event is recorded once
+# — labelled kiro_ide, the one known mislabel, until the hardware matrix
+# (FIRE-2038) finds a run-time signal that tells the 3.0 CLI from the IDE.
+# Returns non-zero (never `die`s) so a missing asset cannot abort a run that
+# already installed other agents.
+# Escape a value for splicing into a JSON string literal (backslash, quote).
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
 KIRO_PLUGIN_DIR="$HOME/.rogue/plugins/kiro"
 KIRO_HOOKS_DIR="$HOME/.kiro/hooks"
 KIRO_AGENT_NAME="rogue"
@@ -463,8 +471,6 @@ kiro_install_plugin() {
   ok "Plugin installed → ${C_DIM}$KIRO_PLUGIN_DIR${C_RESET}"
 }
 
-kiro_json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-
 # The hook command Kiro runs through `sh`: the bridge by absolute path (quoted,
 # a home directory may contain spaces), the event it was installed under, and
 # the surface.
@@ -478,7 +484,7 @@ kiro_hooks_json() {
   printf '['
   for t in "$@"; do
     printf '%s\n    {"name": "rogue-%s", "trigger": "%s", "action": {"type": "command", "command": "%s"}, "timeout": %s}' \
-      "$sep" "$t" "$t" "$(kiro_json_escape "$(kiro_bridge_cmd "$t" "$surface")")" "$KIRO_HOOK_TIMEOUT"
+      "$sep" "$t" "$t" "$(json_escape "$(kiro_bridge_cmd "$t" "$surface")")" "$KIRO_HOOK_TIMEOUT"
     sep=","
   done
   printf '\n  ]'
@@ -558,16 +564,23 @@ kiro_merge_agent_dirs() {
 # none. A default the user chose is left alone and reported: changing it would
 # silently change which agent every `kiro-cli chat` runs.
 kiro_ensure_rogue_agent() {
-  local cfg="$HOME/.kiro/agents/$KIRO_AGENT_NAME.json"
+  local cfg="$HOME/.kiro/agents/$KIRO_AGENT_NAME.json" err
   [ -f "$cfg" ] && return 0
   # `agent create` opens $EDITOR on the new file; `true` returns at once.
-  if EDITOR=true VISUAL=true kiro-cli agent create --name "$KIRO_AGENT_NAME" </dev/null >/dev/null 2>&1 && [ -f "$cfg" ]; then
+  if err="$(EDITOR=true VISUAL=true kiro-cli agent create --name "$KIRO_AGENT_NAME" </dev/null 2>&1)" && [ -f "$cfg" ]; then
     ok "Agent ${C_DIM}$KIRO_AGENT_NAME${C_RESET} created via ${C_DIM}kiro-cli agent create${C_RESET}"
-  else
-    warn "kiro-cli agent create --name $KIRO_AGENT_NAME failed — the 2.x engine's built-in default agent will carry no Rogue hooks."
-    return 1
+    return 0
   fi
+  # kiro-cli 2.21.0 refuses `agent create` when it is not logged in, so this is
+  # the ordinary first-run path on a fresh machine, not a corner case.
+  warn "kiro-cli agent create --name $KIRO_AGENT_NAME failed — plain 'kiro-cli chat' on the 2.x engine will carry no Rogue hooks."
+  [ -n "$err" ] && note "${C_DIM}${err}${C_RESET}"
+  note "If kiro-cli is not logged in, run ${C_DIM}kiro-cli login${C_RESET} and re-run this installer; the default agent is left as it is."
+  return 1
 }
+
+# The merged config carries our entries under their `rogue-*` names.
+kiro_agent_carries_hooks() { grep -q '"rogue-preToolUse"' "$1" 2>/dev/null; }
 
 kiro_set_default_agent() {
   local current
@@ -584,13 +597,24 @@ kiro_set_default_agent() {
   fi
 }
 
+# The default is switched only to a `rogue` agent that exists AND carries the
+# hooks after the merge: pointing the CLI at an agent `agent create` never wrote
+# (not logged in, say) would break every plain `kiro-cli chat`.
 kiro_wire_cli() {
-  if ! have_cmd kiro-cli; then
+  local have_agent=1 cfg="$HOME/.kiro/agents/$KIRO_AGENT_NAME.json"
+  if have_cmd kiro-cli; then
+    kiro_ensure_rogue_agent && have_agent=0
+  else
     note "kiro-cli not on PATH — the IDE and the 3.0 engine load ${C_DIM}$KIRO_HOOKS_DIR/rogue.json${C_RESET} directly."
-    return 0
   fi
-  kiro_ensure_rogue_agent || true
-  kiro_set_default_agent
+  kiro_merge_agent_dirs
+  [ "$have_agent" -eq 0 ] || return 0
+  if kiro_agent_carries_hooks "$cfg"; then
+    kiro_set_default_agent
+  else
+    warn "$cfg carries no Rogue hooks after the merge — the default agent is left as it is."
+  fi
+  return 0
 }
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -629,11 +653,10 @@ status_check() { # status_check <api-key> <actor-email>
   status_agent_ctx
   # POST /api/v1/hooks/status with a JSON body — the GET route was removed
   # (see plugins/rogue/scripts/heartbeat.sh). The former x-rogue-agent-*
-  # headers now ride the body; x-rogue-api-key stays a header. esc() so a host
-  # or email with a " or \ can't break the JSON.
-  esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  # headers now ride the body; x-rogue-api-key stays a header. json_escape so a
+  # host or email with a " or \ can't break the JSON.
   json=$(printf '{"agent_family":"%s","agent":"%s","host":"%s","actor_email":"%s"}' \
-    "$SC_FAMILY" "$SC_AGENT" "$(esc "$host")" "$(esc "${2:-}")")
+    "$SC_FAMILY" "$SC_AGENT" "$(json_escape "$host")" "$(json_escape "${2:-}")")
   resp=$(curl -s -w $'\n%{http_code}' --max-time 10 -X POST \
     "$ROGUE_BASE_URL/api/v1/hooks/status" \
     -H "x-rogue-api-key: $1" \
@@ -941,7 +964,6 @@ install_kiro() {
   kiro_write_crew_scripts
   if have_cmd node; then
     kiro_wire_cli
-    kiro_merge_agent_dirs
   else
     warn "node not found — skipping the agent-config hooks (the 2.x engine reads hooks from agent configs only). Install node and re-run."
   fi
