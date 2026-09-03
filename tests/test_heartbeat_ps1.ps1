@@ -336,6 +336,17 @@ try {
     Check "kiro heartbeat.ps1 takes the surface positionally" $true `
         ($kiroHb -match "param\(\[string\]\`$Agent = '', \[string\]\`$Trigger = 'SessionStart'\)")
     Check "kiro heartbeat.ps1 reports family kiro" $true ($kiroHb -match "agent_family = 'kiro'")
+    # Two versions on one row: the plugin's and Kiro's own (the CLI from
+    # `kiro-cli --version`, the IDE from its install), plus the CLI's default
+    # agent - the sh heartbeat is tested behaviourally for the same three.
+    Check "kiro heartbeat.ps1 sends agent_version" $true ($kiroHb -match 'agent_version\s*=\s*\$kiroVer')
+    Check "kiro heartbeat.ps1 asks kiro-cli for its version" $true ($kiroHb -match '& kiro-cli --version')
+    Check "kiro heartbeat.ps1 asks kiro-cli for the default agent" $true `
+        ($kiroHb -match '& kiro-cli settings chat\.defaultAgent')
+    Check "kiro heartbeat.ps1 sends default_agent only when one is set" $true `
+        ($kiroHb -match "if \(\`$kiroDefault\) \{ \`$fields\['default_agent'\] = \`$kiroDefault \}")
+    Check "kiro heartbeat.ps1 resolves the host after the surface" $true `
+        ($kiroHb -match 'Resolve-Surface\s+Resolve-KiroHost')
 }
 finally {
     $env:USERPROFILE = $saveProfile
