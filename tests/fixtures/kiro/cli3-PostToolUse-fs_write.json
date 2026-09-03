@@ -1,0 +1,11 @@
+{
+  "session_id": "sess_2355ff25-7c42-4c86-9ebe-c2ca491c9709",
+  "hook_event_name": "PostToolUse",
+  "cwd": "/workspace",
+  "tool_name": "fs_write",
+  "tool_input": {
+    "path": "notes/hello3.txt",
+    "text": "hello"
+  },
+  "tool_response": "Created the notes/hello3.txt file."
+}

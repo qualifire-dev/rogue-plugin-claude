@@ -1,0 +1,6 @@
+{
+  "session_id": "sess_5f976473-d5cb-4df3-b9e1-90ae847550b0",
+  "hook_event_name": "UserPromptSubmit",
+  "cwd": "/workspace",
+  "prompt": "Read README.md, then write notes/hello-ide.txt containing hello, then run the shell command echo ide-ok"
+}

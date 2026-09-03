@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "preToolUse",
+  "cwd": "/workspace",
+  "tool_name": "fs_write",
+  "tool_input": {
+    "command": "create",
+    "path": "/workspace/notes/hello.txt",
+    "file_text": "hello"
+  }
+}

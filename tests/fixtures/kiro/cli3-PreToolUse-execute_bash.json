@@ -1,0 +1,12 @@
+{
+  "session_id": "sess_2355ff25-7c42-4c86-9ebe-c2ca491c9709",
+  "hook_event_name": "PreToolUse",
+  "cwd": "/workspace",
+  "tool_name": "execute_bash",
+  "tool_input": {
+    "command": "echo spike3-ok",
+    "cwd": null,
+    "run_in_background": false,
+    "timeout": null
+  }
+}

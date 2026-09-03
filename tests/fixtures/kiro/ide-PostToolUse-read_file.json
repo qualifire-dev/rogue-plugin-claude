@@ -1,0 +1,12 @@
+{
+  "session_id": "sess_bb61f155-7185-4f65-8748-a1b38bf790d2",
+  "hook_event_name": "PostToolUse",
+  "cwd": "/workspace",
+  "tool_name": "read_file",
+  "tool_input": {
+    "path": "README.md",
+    "offset": null,
+    "limit": null
+  },
+  "tool_response": "<file name=\"README.md\" language=\"markdown\" >\n<content>\n# Kiro spike\n\nScratch workspace for Kiro hook capture.\nNothing important here.\n\n</content>\n</file>"
+}

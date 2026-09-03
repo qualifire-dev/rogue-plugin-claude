@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "userPromptSubmit",
+  "cwd": "/workspace",
+  "prompt": "Read README.md, then write the file notes/hello.txt containing the word hello, then run the shell command `echo spike-ok`."
+}

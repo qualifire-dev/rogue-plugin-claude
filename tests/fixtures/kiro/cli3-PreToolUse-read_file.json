@@ -1,0 +1,11 @@
+{
+  "session_id": "sess_2355ff25-7c42-4c86-9ebe-c2ca491c9709",
+  "hook_event_name": "PreToolUse",
+  "cwd": "/workspace",
+  "tool_name": "read_file",
+  "tool_input": {
+    "path": "README.md",
+    "offset": null,
+    "limit": null
+  }
+}

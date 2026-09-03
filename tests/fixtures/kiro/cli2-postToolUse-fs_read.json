@@ -1,0 +1,19 @@
+{
+  "hook_event_name": "postToolUse",
+  "cwd": "/workspace",
+  "tool_name": "fs_read",
+  "tool_input": {
+    "operations": [
+      {
+        "mode": "Line",
+        "path": "/workspace/README.md"
+      }
+    ]
+  },
+  "tool_response": {
+    "success": true,
+    "result": [
+      "# Kiro spike\n\nScratch workspace for Kiro hook capture.\nNothing important here."
+    ]
+  }
+}

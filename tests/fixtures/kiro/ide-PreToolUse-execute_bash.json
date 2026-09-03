@@ -1,0 +1,12 @@
+{
+  "session_id": "sess_bb61f155-7185-4f65-8748-a1b38bf790d2",
+  "hook_event_name": "PreToolUse",
+  "cwd": "/workspace",
+  "tool_name": "execute_bash",
+  "tool_input": {
+    "command": "echo ide-ok",
+    "cwd": null,
+    "run_in_background": false,
+    "timeout": null
+  }
+}

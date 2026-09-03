@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "preToolUse",
+  "cwd": "/workspace",
+  "tool_name": "fs_read",
+  "tool_input": {
+    "operations": [
+      {
+        "mode": "Line",
+        "path": "/workspace/README.md"
+      }
+    ]
+  }
+}
