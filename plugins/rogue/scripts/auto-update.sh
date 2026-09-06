@@ -119,6 +119,7 @@ echo "upgrade available: $INSTALLED -> $LATEST, running installer"
 # Re-run the one-line installer in non-interactive mode. Creds already in env
 # from sourcing ~/.rogue-env above, so no prompts.
 INSTALLER_URL="${ROGUE_INSTALLER_URL:-https://raw.githubusercontent.com/rogue-security/rogue-plugins/main/install.sh}"
+unset ROGUE_BASE_URL
 curl -fsSL --max-time 60 "$INSTALLER_URL" | ROGUE_NON_INTERACTIVE=1 bash
 RC=$?
 echo "installer exited rc=$RC"

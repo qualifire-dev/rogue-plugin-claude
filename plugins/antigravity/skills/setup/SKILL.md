@@ -50,7 +50,7 @@ Run the setup script with the API key, email, and name, from the plugin's instal
 
 - macOS / Linux:
 ```bash
-sh "./scripts/setup.sh" "$ROGUE_API_KEY" "<EMAIL>" "<NAME>"
+bash "./scripts/setup.sh" "$ROGUE_API_KEY" "<EMAIL>" "<NAME>"
 ```
 - Windows (PowerShell):
 ```powershell

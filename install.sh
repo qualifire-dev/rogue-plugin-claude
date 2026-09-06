@@ -48,7 +48,10 @@ set -u
 
 # ── Config ──────────────────────────────────────────────────────────────────
 ROGUE_PLUGIN_REPO="${ROGUE_PLUGIN_REPO:-qualifire-dev/rogue-plugins}"
-ROGUE_BASE_URL="${ROGUE_BASE_URL:-https://api.rogue.security}"
+ROGUE_BASE_URL_DEFAULT="https://api.rogue.security"
+BASE_URL_EXPLICIT=0
+[ -z "${ROGUE_BASE_URL:-}" ] || BASE_URL_EXPLICIT=1
+ROGUE_BASE_URL="${ROGUE_BASE_URL:-$ROGUE_BASE_URL_DEFAULT}"
 MARKETPLACE_NAME="rogue-marketplace"
 PLUGIN_NAME="rogue"
 CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -452,10 +455,13 @@ configure_credentials() {
   local flag_key="${ROGUE_API_KEY:-}"
   local flag_email="${ROGUE_ACTOR_EMAIL:-}"
   local flag_name="${ROGUE_ACTOR_NAME:-}"
+  local flag_base_url="$ROGUE_BASE_URL"
 
   # Pull anything already on disk / in env into scope.
   [ -r /etc/rogue/env ] && . /etc/rogue/env
   [ -r "$ENV_FILE" ]    && . "$ENV_FILE"
+
+  [ "$BASE_URL_EXPLICIT" = "1" ] && ROGUE_BASE_URL="$flag_base_url"
 
   local cur_key="${flag_key:-${ROGUE_API_KEY:-}}"
 
@@ -466,7 +472,7 @@ configure_credentials() {
   def_email="${flag_email:-${ROGUE_ACTOR_EMAIL:-$(git config --global user.email 2>/dev/null)}}"
   def_name="${flag_name:-${ROGUE_ACTOR_NAME:-$(git config --global user.name 2>/dev/null)}}"
   [ -n "$def_email" ] || def_email="${CLAUDE_CODE_USER_EMAIL:-}"
-  [ -n "$def_name" ]  || def_name="${CLAUDE_CODE_USER_EMAIL%@*}"
+  [ -n "$def_name" ]  || { def_name="${CLAUDE_CODE_USER_EMAIL:-}"; def_name="${def_name%@*}"; }
   [ -n "$def_email" ] || def_email="$(hostname 2>/dev/null)"
   [ -n "$def_name" ]  || def_name="$(whoami 2>/dev/null)"
 
@@ -531,18 +537,53 @@ configure_credentials() {
   write_env_file
 }
 
-# Write ~/.rogue-env (mode 600), same format as setup.sh. Reads ROGUE_API_KEY /
-# ROGUE_ACTOR_EMAIL / ROGUE_ACTOR_NAME from scope.
+env_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+env_preserved() {
+  local rc=0
+  local kept
+  kept="$(grep -Ev \
+    -e "^[[:space:]]*(export[[:space:]]+)?($1)[[:space:]]*=" \
+    -e '^[[:space:]]*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)' \
+    "$ENV_FILE")" || rc=$?
+  [ "$rc" -le 1 ] || return 1
+  [ -z "$kept" ] || printf '%s\n' "$kept" | tr -d '\r'
+}
+
+env_has_break() {
+  local nl='
+'
+  local cr
+  cr="$(printf '\r')"
+  case "$1" in
+    *"$nl"*|*"$cr"*) return 0 ;;
+  esac
+  return 1
+}
+
 write_env_file() {
-  umask 077
-  : > "$ENV_FILE"
-  {
-    printf '# Managed by the rogue Claude plugin. Read by hook subprocesses at runtime.\n'
-    printf '# Delete this file to revoke credentials.\n'
-    printf 'export ROGUE_API_KEY=%q\n' "$ROGUE_API_KEY"
-    printf 'export ROGUE_ACTOR_EMAIL=%q\n' "$ROGUE_ACTOR_EMAIL"
-    printf 'export ROGUE_ACTOR_NAME=%q\n' "$ROGUE_ACTOR_NAME"
-  } >> "$ENV_FILE"
+  local keys="ROGUE_API_KEY|ROGUE_ACTOR_EMAIL|ROGUE_ACTOR_NAME"
+  [ "$BASE_URL_EXPLICIT" != "1" ] || keys="$keys|ROGUE_BASE_URL"
+  local k v
+  for k in ROGUE_API_KEY ROGUE_ACTOR_EMAIL ROGUE_ACTOR_NAME ROGUE_BASE_URL; do
+    eval "v=\${$k:-}"
+    ! env_has_break "$v" || die "Refusing to write $ENV_FILE: the value for $k contains a line break"
+  done
+  local tmp="$ENV_FILE.rogue-tmp.$$"
+  (
+    umask 077
+    {
+      printf '# Managed by the Rogue plugins. Read by hook subprocesses at runtime.\n' &&
+      printf '# Delete this file to revoke credentials.\n' &&
+      printf 'export ROGUE_API_KEY=%s\n' "$(env_quote "$ROGUE_API_KEY")" &&
+      printf 'export ROGUE_ACTOR_EMAIL=%s\n' "$(env_quote "$ROGUE_ACTOR_EMAIL")" &&
+      printf 'export ROGUE_ACTOR_NAME=%s\n' "$(env_quote "$ROGUE_ACTOR_NAME")" &&
+      { [ "$BASE_URL_EXPLICIT" != "1" ] || [ "$ROGUE_BASE_URL" = "$ROGUE_BASE_URL_DEFAULT" ] ||
+        printf 'export ROGUE_BASE_URL=%s\n' "$(env_quote "$ROGUE_BASE_URL")"; } &&
+      { [ ! -f "$ENV_FILE" ] || env_preserved "$keys"; }
+    } > "$tmp"
+  ) || { rm -f "$tmp"; die "Could not write $ENV_FILE"; }
+  mv -f "$tmp" "$ENV_FILE" || { rm -f "$tmp"; die "Could not write $ENV_FILE"; }
   chmod 600 "$ENV_FILE"
   ok "Credentials written to ${C_DIM}$ENV_FILE${C_RESET} (mode 600)"
 }
@@ -701,7 +742,7 @@ parse_args() {
       --actor-email)     [ -n "$val" ] || { val="$2"; shift; }; ROGUE_ACTOR_EMAIL="$val" ;;
       --actor-name)      [ -n "$val" ] || { val="$2"; shift; }; ROGUE_ACTOR_NAME="$val" ;;
       --plugin-repo)     [ -n "$val" ] || { val="$2"; shift; }; ROGUE_PLUGIN_REPO="$val" ;;
-      --base-url)        [ -n "$val" ] || { val="$2"; shift; }; ROGUE_BASE_URL="$val" ;;
+      --base-url)        [ -n "$val" ] || { val="$2"; shift; }; ROGUE_BASE_URL="$val"; BASE_URL_EXPLICIT=1 ;;
       --claude)          WANT="$WANT claude" ;;
       --codex)           WANT="$WANT codex" ;;
       --cursor)          WANT="$WANT cursor" ;;
@@ -772,4 +813,4 @@ main() {
   note "Open a new session in each agent, then run ${C_DIM}/rogue:status${C_RESET} to verify."
 }
 
-main "$@"
+[ -n "${ROGUE_INSTALL_LIB_ONLY:-}" ] || main "$@"

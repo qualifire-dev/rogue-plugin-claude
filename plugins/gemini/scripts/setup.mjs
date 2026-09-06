@@ -23,23 +23,61 @@ if (!apiKey) {
 const HOME = os.homedir() || process.env.HOME || process.env.USERPROFILE || ".";
 const ENV_FILE = process.env.ROGUE_ENV_FILE || path.join(HOME, ".rogue-env");
 
-// POSIX single-quote so the value round-trips through both `sh . source` (the
-// other plugins) and this repo's Node parser. Escape embedded single quotes.
 const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
-const contents =
-  "# Managed by the rogue Gemini CLI extension. Read by hook subprocesses at runtime.\n" +
-  "# Delete this file to revoke credentials.\n" +
-  `export ROGUE_API_KEY=${q(apiKey)}\n` +
-  `export ROGUE_ACTOR_EMAIL=${q(actorEmail)}\n` +
-  `export ROGUE_ACTOR_NAME=${q(actorName)}\n`;
+const MANAGED = {
+  ROGUE_API_KEY: apiKey,
+  ROGUE_ACTOR_EMAIL: actorEmail,
+  ROGUE_ACTOR_NAME: actorName,
+};
 
-// mode 0o600 on write; chmod again in case the file pre-existed with wider bits.
-fs.writeFileSync(ENV_FILE, contents, { mode: 0o600 });
+for (const [key, value] of Object.entries(MANAGED)) {
+  if (/[\r\n]/.test(String(value))) {
+    process.stderr.write(
+      `Refusing to write ${ENV_FILE}: the value for ${key} contains a line break\n`,
+    );
+    process.exit(1);
+  }
+}
+
+const HEADER = [
+  "# Managed by the Rogue plugins. Read by hook subprocesses at runtime.",
+  "# Delete this file to revoke credentials.",
+];
+const OWNED = new RegExp(`^\\s*(?:export\\s+)?(?:${Object.keys(MANAGED).join("|")})\\s*=`);
+const OWN_HEADER = /^\s*# (Managed by the [Rr]ogue|Delete this file to revoke credentials)/;
+
+let preserved = [];
 try {
-  fs.chmodSync(ENV_FILE, 0o600);
-} catch {
-  /* Windows: POSIX mode bits are best-effort; the file lands under the user profile. */
+  preserved = fs
+    .readFileSync(ENV_FILE, "utf8")
+    .split(/\r?\n/)
+    .filter((line, index, all) => !(index === all.length - 1 && line === ""))
+    .filter((line) => !OWNED.test(line) && !OWN_HEADER.test(line));
+} catch (err) {
+  if (err.code !== "ENOENT") {
+    process.stderr.write(`Could not read ${ENV_FILE}: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+const contents =
+  [...HEADER, ...Object.entries(MANAGED).map(([k, v]) => `export ${k}=${q(v)}`), ...preserved]
+    .join("\n") + "\n";
+
+const TMP = `${ENV_FILE}.rogue-tmp.${process.pid}`;
+try {
+  fs.writeFileSync(TMP, contents, { mode: 0o600 });
+  try {
+    fs.chmodSync(TMP, 0o600);
+  } catch {}
+  fs.renameSync(TMP, ENV_FILE);
+} catch (err) {
+  try {
+    fs.unlinkSync(TMP);
+  } catch {}
+  process.stderr.write(`Could not write ${ENV_FILE}: ${err.message}\n`);
+  process.exit(1);
 }
 
 process.stdout.write("OK\n");
