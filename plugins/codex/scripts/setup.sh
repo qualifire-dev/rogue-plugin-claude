@@ -20,17 +20,12 @@ SURFACE="${4:-codex_cli}"
 
 ENV_FILE="${ROGUE_ENV_FILE:-$HOME/.rogue-env}"
 
-umask 077
-: > "$ENV_FILE"
-{
-  printf '# Managed by the rogue Codex plugin. Read by hook subprocesses at runtime.\n'
-  printf '# Delete this file to revoke credentials.\n'
-  printf 'export ROGUE_API_KEY=%q\n' "$API_KEY"
-  printf 'export ROGUE_ACTOR_EMAIL=%q\n' "$ACTOR_EMAIL"
-  printf 'export ROGUE_ACTOR_NAME=%q\n' "$ACTOR_NAME"
-  printf 'export ROGUE_CODEX_SURFACE=%q\n' "$SURFACE"
-} >> "$ENV_FILE"
-chmod 600 "$ENV_FILE"
+. "$(dirname "$0")/env-file.sh"
+rogue_write_env_file "$ENV_FILE" \
+  ROGUE_API_KEY "$API_KEY" \
+  ROGUE_ACTOR_EMAIL "$ACTOR_EMAIL" \
+  ROGUE_ACTOR_NAME "$ACTOR_NAME" \
+  ROGUE_CODEX_SURFACE "$SURFACE"
 
 echo "OK"
 echo "ENV_FILE=$ENV_FILE"

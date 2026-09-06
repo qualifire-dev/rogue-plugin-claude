@@ -13,38 +13,17 @@ $ErrorActionPreference = 'Stop'
 
 $EnvFile = if ($env:ROGUE_ENV_FILE) { $env:ROGUE_ENV_FILE } else { Join-Path $env:USERPROFILE '.rogue-env' }
 
-# Always POSIX single-quote so the value is safe whether the file is sourced by
-# hook.sh or decoded by hook.ps1's ConvertFrom-ShellQuoted. Each ' becomes '\''
-# (close, escaped ', reopen); the PS literal "'\''" is exactly the 4 chars ' \ ' '.
-function Format-EnvVal {
-    param([string]$Val)
-    return "'" + $Val.Replace("'", "'\''") + "'"
+. ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'env-file.ps1'))))
+
+$restricted = Write-RogueEnvFile -Path $EnvFile -Values ([ordered]@{
+    ROGUE_API_KEY     = $ApiKey
+    ROGUE_ACTOR_EMAIL = $Email
+    ROGUE_ACTOR_NAME  = $Name
+})
+
+if (-not $restricted) {
+    Write-Warning "Could not restrict permissions on $EnvFile"
 }
-
-$envLines = @(
-    '# Managed by the rogue Cursor plugin. Read by hook subprocesses at runtime.',
-    '# Delete this file to revoke credentials.',
-    "export ROGUE_API_KEY=$(Format-EnvVal $ApiKey)",
-    "export ROGUE_ACTOR_EMAIL=$(Format-EnvVal $Email)",
-    "export ROGUE_ACTOR_NAME=$(Format-EnvVal $Name)"
-)
-
-$envDir = Split-Path $EnvFile
-if ($envDir -and -not (Test-Path $envDir)) {
-    New-Item -ItemType Directory -Path $envDir -Force | Out-Null
-}
-Set-Content -Path $EnvFile -Value $envLines -Encoding UTF8
-
-# Restrict the file to the current user only (best-effort, mirrors chmod 600).
-try {
-    $acl = Get-Acl $EnvFile
-    $acl.SetAccessRuleProtection($true, $false)
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
-        'FullControl', 'Allow')
-    $acl.SetAccessRule($rule)
-    Set-Acl $EnvFile $acl
-} catch {}
 
 Write-Output "OK"
 Write-Output "ENV_FILE=$EnvFile"

@@ -44,6 +44,7 @@
 EVENT=""          # hook event name, from $1
 PLUGIN_ROOT=""    # <root> of this plugin, derived from $0
 BODY=""           # the hook payload, as received then enriched
+SURFACE=""        # antigravity | antigravity_ide | antigravity_cli, or empty
 URL=""            # where to POST it
 SUBAGENT_ID=""    # set by reattribute_subagent when this event is a subagent's
 SUBAGENT_NAME=""
@@ -74,7 +75,30 @@ load_env() {
   [ -r /etc/rogue/env ]       && . /etc/rogue/env
   [ -r "$HOME/.rogue-env" ]   && . "$HOME/.rogue-env"
 
-  ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$HOME/.rogue/hook.log}"
+  # Log destination — ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so
+  # a machine running Antigravity + Claude Code + Cursor + … used to interleave
+  # all of them into a single hook.log with no way to tell whose line was whose.
+  # Precedence: explicit file → directory override → per-agent default.
+  ROGUE_LOG_DIR="${ROGUE_LOG_DIR:-$HOME/.rogue/logs}"
+  ROGUE_LOG_FILE="${ROGUE_LOG_FILE:-$ROGUE_LOG_DIR/antigravity.log}"
+  # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+  # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+  # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+  # never leave the log growing unbounded.
+  ROGUE_LOG_MAX_BYTES="${ROGUE_LOG_MAX_BYTES:-10485760}"
+  # Clamp per the rule above: anything non-numeric becomes the default.
+  case "$ROGUE_LOG_MAX_BYTES" in ""|*[!0-9]*) ROGUE_LOG_MAX_BYTES=10485760 ;; esac
+  # An all-digit value can still overflow the shell's integer type: dash answers
+  # `[ "$cap" -gt 0 ]` with "Illegal number" on stderr and a FALSE, which reads
+  # as "rotation disabled" and lets the log grow unbounded. Node has the same
+  # bug through Number() -> Infinity; PowerShell is the only one that already
+  # lands on the default, and only because its cast error is silenced. All
+  # three clamp explicitly now. 18 digits is the widest value guaranteed to fit
+  # a signed 64-bit int; leading zeros are stripped first so "000...0" still
+  # reads as the rotation-disabling zero.
+  _lcap="$ROGUE_LOG_MAX_BYTES"
+  while [ "${_lcap#0}" != "$_lcap" ]; do _lcap="${_lcap#0}"; done
+  if [ "${#_lcap}" -gt 18 ]; then ROGUE_LOG_MAX_BYTES=10485760; fi
   # IDE store reads: off entirely with 0, read-but-never-attach with `log`.
   DB_PROMPT_MODE="${ROGUE_ANTIGRAVITY_DB_PROMPT:-1}"
   MISS_DIR="${ROGUE_ANTIGRAVITY_DBPROMPT_DIR:-$HOME/.rogue/antigravity-dbprompt}"
@@ -86,10 +110,39 @@ load_env() {
   URL="${ROGUE_API_URL:-${ROGUE_BASE_URL:-https://api.rogue.security}/api/v1/hooks/antigravity}"
 }
 
+# Trim the log before appending. Rotation lives on the WRITE PATH and not in a
+# periodic job on purpose: an UNCONFIGURED install writes a line per event and
+# never runs anything else, so a cap enforced anywhere else would not hold.
+rotate_log() {
+  [ -f "$ROGUE_LOG_FILE" ] || return 0
+  # Arithmetic, not a glob: "00" must mean zero here exactly as [int64]"00"
+  # and Number("00") do in the PowerShell and Node dispatchers.
+  [ "$ROGUE_LOG_MAX_BYTES" -gt 0 ] || return 0
+  # `wc -c` not `stat`: BSD and GNU stat take different flags for file size.
+  _lsz=$(wc -c < "$ROGUE_LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+  case "$_lsz" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_lsz" -ge "$ROGUE_LOG_MAX_BYTES" ] && mv -f "$ROGUE_LOG_FILE" "$ROGUE_LOG_FILE.1" 2>/dev/null
+  return 0
+}
+
 log() {
-  mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
-  printf '%s provider=antigravity event=%s %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null
+  # 0700 dir / 0600 file. The logged text is not only ours: it carries the
+  # server's block reason, which quotes the content that tripped the rule - a
+  # secret, a command, a slice of a prompt. Under the default umask the log
+  # lands 0644 and every other account on the box can read it. The umask
+  # applies to what THIS call creates, so a 0644 log from an older version
+  # keeps its mode; Windows needs no counterpart, since another standard user
+  # cannot read %USERPROFILE% to begin with.
+  ( umask 077
+    mkdir -p "$(dirname "$ROGUE_LOG_FILE")" 2>/dev/null
+    rotate_log
+    # `${SURFACE:+ surface=$SURFACE}` expands to NOTHING when the slug is empty -
+    # which is the normal case for an event whose payload carries no transcriptPath,
+    # and for every line written before read_body. Never `surface=`, never
+    # `surface=unknown`.
+    printf '%s provider=antigravity%s event=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SURFACE:+ surface=$SURFACE}" \
+      "$EVENT" "$*" >> "$ROGUE_LOG_FILE" 2>/dev/null )
 }
 sanitize() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 
@@ -567,15 +620,56 @@ load_actor() {
   return 0
 }
 
+# ROGUE_INSTALL_HOST / ROGUE_INSTALL_VERSION (shared with heartbeat.sh) plus the
+# surface, which only this script can resolve — it reads the event's
+# transcriptPath, exactly as the heartbeat's is derived. Sent as headers on every
+# event so the fleet roster's row stays fresh between session starts, which are
+# the only moments the heartbeat runs. Called after read_body: the surface needs
+# the payload.
+load_install_id() {
+  [ -r "${PLUGIN_ROOT}/scripts/install-id.sh" ] && . "${PLUGIN_ROOT}/scripts/install-id.sh"
+  # A degraded value is still sent (never a hard failure — see install-id.sh), but
+  # it is worth knowing about: an "unknown" host or version means this install
+  # reports itself imprecisely to the fleet roster.
+  [ -n "${ROGUE_INSTALL_ID_ERROR:-}" ] && log "error=install-id $ROGUE_INSTALL_ID_ERROR"
+  # ONE resolution, four consumers: the log token, the x-rogue-agent header, the
+  # heartbeat's roster agent and enrich_body's IDE-only branch. transcriptPath is
+  # the only reliable signal (three products share one install, so a filesystem
+  # probe cannot tell which is running), and it is absent from some events.
+  SURFACE=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  # Two variables off that one call, because the two consumers differ on what an
+  # unattributable payload means. The LOG token stays empty, and the line then
+  # carries no `surface=` at all rather than claiming one. The HEADER and the
+  # roster row are required fields, so they default to the 2.0 app - the same guess
+  # the backend's parser makes, so the row matches the events it stores.
+  ROGUE_INSTALL_AGENT="${SURFACE:-antigravity}"
+  return 0
+}
+
 # Buffer stdin so we can enrich it (PreInvocation/PostInvocation/Stop) before
 # POSTing.
 read_body() {
   BODY="$(cat)"
 }
 
-# Heartbeat on the first invocation of a session (invocationNum == 0). Fire
-# detached so the hook itself returns immediately regardless of heartbeat.sh's
-# own latency.
+# Heartbeat, fired detached so the hook itself returns immediately regardless of
+# heartbeat.sh's own latency.
+#
+# TWO TRIGGERS, because Antigravity has no SessionStart event and `invocationNum == 0`
+# is NOT one: it resets on every new prompt, so gating on it alone sent an
+# unthrottled beacon per turn, and it fires BEFORE the turn's own transcript rows
+# exist, so the log shipper riding along uploaded only turns 1..N-1.
+#
+#   SessionStart  first invocation of a NEW CONVERSATION - invocationNum 0 AND
+#                 initialNumSteps <= 1. Never throttled, so a fresh install or a new
+#                 conversation reaches the roster at once.
+#   Stop          every agent run's end: the per-TURN trigger, throttled by
+#                 scripts/beacon.sh, and late enough that the turn's rows are on disk
+#                 for the shipper.
+#
+# A continuation invocation (invocationNum 0 with more steps already recorded, e.g.
+# `agy -c`) deliberately fires NOTHING here - its Stop covers it, and treating it as
+# a session start would hand an unthrottled beacon to every resumed conversation.
 #
 # The surface is passed along because only the hook can know it: three products
 # share this one install, each with its own state dir, and the surface is
@@ -583,13 +677,46 @@ read_body() {
 # surfaceFromTranscript). heartbeat.sh alone can only guess from the filesystem,
 # and on a machine with more than one installed it guesses wrong — collapsing
 # every surface into one roster row.
+# Pass the SAME surface the event headers carry (load_install_id, which runs
+# first), never a freshly-derived one. An unattributable payload yields an empty
+# surface, and heartbeat.sh's own fallback then sniffs the filesystem and picks
+# antigravity_cli whenever `agy` is installed — so this event would report
+# `antigravity` while its heartbeat reported `antigravity_cli`, and one install
+# would own two roster rows. One resolution, one row.
 maybe_heartbeat() {
-  [ "$EVENT" = "PreInvocation" ] || return 0
-  case "$BODY" in
-    *'"invocationNum":0'*|*'"invocationNum": 0'*)
-      _hb_agent=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
-      ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$_hb_agent" >/dev/null 2>&1 & ) ;;
+  _hb_trigger=""
+  case "$EVENT" in
+    Stop) _hb_trigger="Stop" ;;
+    PreInvocation)
+      case "$BODY" in
+        *'"invocationNum":0'*|*'"invocationNum": 0'*)
+          # The step count is EXTRACTED and compared numerically, never glob-matched.
+          # A glob is what a first attempt used and it is wrong in a way that reads as
+          # correct: `*'"initialNumSteps":1'*` also matches 18, so every continuation
+          # of a long conversation looked like a fresh one and got an unthrottled
+          # beacon. Anchoring on the terminator instead would have to enumerate `,`
+          # and `}` and both spacings, and still break on pretty-printed JSON.
+          #
+          # The boundary is the count BEFORE this invocation: 0 on a brand-new
+          # conversation, 1 once the pending prompt has been recorded as a step.
+          _hb_steps="$(printf '%s' "$BODY" \
+            | sed -n 's/.*"initialNumSteps"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            | head -1)"
+          case "${_hb_steps:-}" in
+            ''|*[!0-9]*) ;;
+            *) [ "$_hb_steps" -le 1 ] && _hb_trigger="SessionStart" ;;
+          esac ;;
+      esac ;;
   esac
+  [ -n "$_hb_trigger" ] || return 0
+  # ROGUE_INSTALL_AGENT, not SURFACE: an unattributable payload leaves the log token
+  # empty, and an empty first argument makes heartbeat.sh fall back to sniffing the
+  # filesystem - which picks antigravity_cli whenever `agy` is installed, so the event
+  # would report `antigravity` while its own heartbeat reported `antigravity_cli` and
+  # one install would own two roster rows. Both come from the one resolution in
+  # load_install_id; only this consumer needs the default applied.
+  ( nohup sh "${PLUGIN_ROOT}/scripts/heartbeat.sh" "$ROGUE_INSTALL_AGENT" "$_hb_trigger" \
+      </dev/null >/dev/null 2>&1 & )
 }
 
 # Enrichment is per surface, because the surfaces differ in WHEN the transcript
@@ -602,7 +729,7 @@ maybe_heartbeat() {
 #     so the wait was pure latency on the event that blocks the developer. The
 #     prompt comes from the conversation store instead.
 enrich_body() {
-  _surface=$(surface_from_transcript "$(json_field transcriptPath "$BODY")")
+  _surface="$SURFACE"
   if [ "$_surface" = "antigravity_ide" ]; then
     case "$EVENT" in
       # The pending prompt, before the model call that would consume it.
@@ -654,6 +781,9 @@ post_and_relay() {
     -H "x-rogue-event: $EVENT" \
     -H "x-rogue-actor-email: $ROGUE_ACTOR_EMAIL" \
     -H "x-rogue-actor-name: $ROGUE_ACTOR_NAME" \
+    -H "x-rogue-host: $ROGUE_INSTALL_HOST" \
+    -H "x-rogue-version: $ROGUE_INSTALL_VERSION" \
+    -H "x-rogue-agent: $ROGUE_INSTALL_AGENT" \
     "$@" \
     -H 'Content-Type: application/json' \
     --data-binary @- --max-time 15 -w '\n%{http_code}')
@@ -689,6 +819,7 @@ main() {
   require_api_key        # exits before stdin is read when there is no key
   load_actor
   read_body
+  load_install_id        # host + version + the surface, resolved once from the payload
 
   maybe_heartbeat
   # Re-attribute BEFORE enriching: augment_with_transcript re-closes the JSON

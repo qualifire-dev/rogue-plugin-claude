@@ -231,7 +231,7 @@ Assert-Eq $concat '{"sessionId":"p1","toolName":"bash","agentId":"call_A","agent
 if (Get-Command jq -ErrorAction SilentlyContinue) {
     Assert-Eq (Add-AgentTag $BODY 'call_A' 'Task Agent') $concat 'jq path and concat path are byte-identical'
 } else {
-    Write-Host '  skip: jq not installed — jq path not exercised'
+    Write-Host '  skip: jq not installed - jq path not exercised'
 }
 
 if ($fails -gt 0) {

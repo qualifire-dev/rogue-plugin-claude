@@ -29,6 +29,9 @@
 # Set ROGUE_DEBUG=1 (process/user env var) to emit diagnostics to stderr;
 # Cursor shows stderr in its hook log without treating it as the response.
 #
+# Logs every invocation to $env:ROGUE_LOG_FILE (default
+# %USERPROFILE%\.rogue\logs\cursor.log), mirroring hook.sh.
+#
 # Credential resolution (later file wins; process env wins over all), the
 # Windows analogue of hook.sh's search:
 #   1. ${CURSOR_PLUGIN_ROOT}\env        (baked into a compiled customer plugin)
@@ -54,6 +57,12 @@ function Write-Raw {
     $stdout.Flush()
 }
 function Dbg { param([string]$Msg) if ($env:ROGUE_DEBUG) { [Console]::Error.WriteLine("[rogue] $Msg"); [Console]::Error.Flush() } }
+
+# Errors the hook survives, NOT gated on ROGUE_DEBUG (mirrors hook.sh's err):
+# this dispatcher keeps no log file, so a debug-gated message would mean nobody
+# ever learns the install reports itself imprecisely. stderr only — stdout is the
+# hook's JSON channel.
+function Err { param([string]$Msg) [Console]::Error.WriteLine("[rogue] error: $Msg"); [Console]::Error.Flush() }
 
 function Emit-Json {
     param([string]$Data)
@@ -118,6 +127,117 @@ function Repair-DoubleEncodedUtf8 {
         if ($repaired -ne $Text) { Dbg "repaired double-encoded UTF-8"; return $repaired }
     } catch { Dbg "no double-encode repair (text already valid UTF-8)" }
     return $Text
+}
+
+# ── hook log ───────────────────────────────────────────────────────────────
+# `Dbg` above only writes to stderr under ROGUE_DEBUG, which Cursor keeps in its
+# own per-session log — useless for after-the-fact diagnosis and unavailable to
+# /rogue:status. So every invocation also gets one durable line here, in the same
+# format hook.sh writes: "<ts> provider=cursor event=<E> <k=v>".
+#
+# ONE FILE PER AGENT. Every Rogue plugin shares ~/.rogue, so a single hook.log
+# would interleave Cursor with Claude Code / Codex / … and lose attribution.
+# Precedence: ROGUE_LOG_FILE → ROGUE_LOG_DIR/cursor.log → default, each read from
+# the merged credential map (so process env still wins, but the env files count).
+# $HOME backs up USERPROFILE so this file can also be dot-sourced on macOS/Linux
+# through the ROGUE_PS_LIB_ONLY seam below (tests).
+#
+# Resolved by Initialize-Logging AFTER the credential files are parsed, exactly
+# like hook.sh resolves these after sourcing them — so `~/.rogue-env`,
+# `C:\ProgramData\rogue\env` (MDM) and a bundled `env` can all relocate the log.
+# Reading $env: directly here instead would silently ignore every one of those
+# files, which is a real defect for a fleet that relocates logs by policy AND
+# would make the log shipper and the dispatcher disagree on the path.
+# Declared (not resolved) at file scope so the ROGUE_PS_LIB_ONLY seam below can
+# dot-source the helpers, and so Log is safe to call before initialisation.
+# The one surface this plugin has. A closed-vocabulary slug, lowercase, no space
+# and no '=', so a reader finds the value by scanning to the next 'key=' token. It
+# matches what heartbeat reports as the roster agent for this plugin.
+$script:surface = 'cursor'
+$script:logFile = $null
+$script:logMaxBytes = 10485760
+
+function Initialize-Logging {
+    # $Creds is the merged credential map (bundled env → MDM → per-user file, then
+    # process env last), so precedence is already correct by the time we read it.
+    # $HOME backs up USERPROFILE so this also works dot-sourced on macOS/Linux.
+    param([hashtable]$Creds = @{})
+    $f = $Creds['ROGUE_LOG_FILE']
+    if (-not $f) {
+        $d = $Creds['ROGUE_LOG_DIR']
+        if (-not $d) {
+            $userHome = $env:USERPROFILE
+            if (-not $userHome) { $userHome = $HOME }
+            if ($userHome) { $d = Join-Path (Join-Path $userHome '.rogue') 'logs' }
+        }
+        if ($d) { $f = Join-Path $d 'cursor.log' }
+    }
+    $script:logFile = $f
+    # Size cap. Over it, the current log is renamed to <file>.1 - exactly one
+    # generation kept, so worst case on disk is 2x this. A NUMERIC ZERO disables
+    # rotation; a NON-NUMERIC value falls back to this default, so a typo can
+    # never leave the log growing unbounded ([int64]'00' is 0, so a zero-padded
+    # zero disables too — matching hook.sh's `-gt 0` test).
+    $cap = $Creds['ROGUE_LOG_MAX_BYTES']
+    # TryParse, NOT a plain [int64] cast: the cast raises "Value was either too
+    # large or too small for an Int64" on an all-digit value too wide for 64
+    # bits. The file-scope $ErrorActionPreference = 'SilentlyContinue' swallows
+    # that error and the assignment is skipped, so the cap happens to keep its
+    # default - the right answer, but reached by accident and invisible if the
+    # preference ever changes. TryParse states the fallback instead, and keeps
+    # this reading like the other two dispatchers, where the same input IS a
+    # live bug (sh disables rotation, Node yields Infinity). '00' still parses
+    # to 0, so a zero-padded zero keeps disabling rotation.
+    $capValue = [int64]0
+    if ($cap -match '^[0-9]+$' -and [int64]::TryParse($cap, [ref]$capValue)) { $script:logMaxBytes = $capValue }
+    else { $script:logMaxBytes = 10485760 }
+}
+
+# Strip control characters: the logged text is SERVER-CONTROLLED (a block reason
+# can carry anything), and a raw newline or CR would forge extra log lines.
+function Sanitize { param([string]$S) if ($null -eq $S) { return '' } ($S -replace '[\x00-\x1f\x7f]', '') }
+
+# Rotation is enforced on the WRITE PATH rather than by a periodic job because an
+# UNCONFIGURED install writes a line per event and never runs anything else - a
+# cap enforced anywhere else would not hold.
+function Rotate-Log {
+    if (-not $logFile -or $logMaxBytes -le 0) { return }
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -ge $logMaxBytes) {
+            # Delete the previous generation first: `Move-Item -Force` onto an
+            # EXISTING destination is not reliable on Windows PowerShell 5.1, and
+            # with -ErrorAction SilentlyContinue a failure here would silently
+            # stop all further rotation and let the live log grow unbounded.
+            Remove-Item -LiteralPath "$logFile.1" -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+function Log {
+    param([string]$Msg)
+    try {
+        if (-not $logFile) { return }
+        $dir = Split-Path $logFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Rotate-Log
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        # AppendAllText with an explicit BOM-less UTF-8, NOT `Add-Content -Encoding
+        # UTF8`: on Windows PowerShell 5.1 that switch writes a UTF-8 BOM when it
+        # creates the file, so the first line of every new log (and of every file
+        # produced by a rotation) would start with EF BB BF and fail any parser
+        # that anchors on the timestamp. "`n" keeps the line ending identical to
+        # what the sh dispatchers write, so one log format covers both platforms.
+        # A constant: this plugin has exactly one surface, so there is nothing to
+        # detect and nothing that can fail. Written through the same conditional as
+        # the multi-surface plugins so all six dispatchers share one emit shape.
+        $surfaceToken = if ($script:surface) { " surface=$($script:surface)" } else { '' }
+        [System.IO.File]::AppendAllText(
+            $logFile,
+            "$stamp provider=cursor$surfaceToken event=$EventName $Msg`n",
+            (New-Object System.Text.UTF8Encoding $false))
+    } catch {}
 }
 
 # ── File pre-image (preToolUse only) — lockstep with hook.sh ───────────────
@@ -258,8 +378,25 @@ function Add-FilePreImage {
                 }
                 if ($len -gt 0) {
                     $buf = New-Object byte[] ([int]$len)
-                    $read = $fs.Read($buf, 0, [int]$len)
-                    if ($read -le 0) { return $Body }
+                    # LOOP: FileStream.Read is only guaranteed to return at least one
+                    # byte, not the count asked for. A single call that came up short
+                    # used to be base64-encoded and attached as if it were the WHOLE
+                    # file - the truncated pre-image the header above rules out, and a
+                    # divergence from hook.sh, whose `base64 < "$_fp"` always consumes
+                    # everything. A short total sends NO pre-image rather than a
+                    # partial one: not knowing the pre-edit state is safe, while
+                    # misreporting it is not. (Read-Range in ship-logs.ps1 carries the
+                    # same loop, for the same reason.)
+                    $read = 0
+                    while ($read -lt [int]$len) {
+                        $n = $fs.Read($buf, $read, [int]$len - $read)
+                        if ($n -le 0) { break }
+                        $read += $n
+                    }
+                    if ($read -ne [int]$len) {
+                        Dbg "pre-image short read ($read of $len B) -> sending none"
+                        return $Body
+                    }
                     $b64 = [Convert]::ToBase64String($buf, 0, $read)
                 }
             } finally { $fs.Close() }
@@ -499,8 +636,8 @@ function Resolve-RogueParentSession {
 }
 
 # Test seam: dot-sourcing with ROGUE_PS_LIB_ONLY=1 loads the functions above
-# (e.g. ConvertFrom-ShellQuoted) without running the dispatcher. Production
-# never sets this, so the hook always runs its main body.
+# (e.g. ConvertFrom-ShellQuoted, Rotate-Log) without running the dispatcher.
+# Production never sets this, so the hook always runs its main body.
 if ($env:ROGUE_PS_LIB_ONLY) { return }
 
 # Windows PowerShell 5.1 may negotiate only TLS 1.0/1.1 by default, which
@@ -544,14 +681,25 @@ foreach ($f in $credFiles) {
         }
     }
 }
-foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL') {
+# ROGUE_LOG_* ride the same list so a process-env value still beats the files,
+# which is what makes the resolved precedence identical to hook.sh's.
+foreach ($k in 'ROGUE_API_KEY','ROGUE_ACTOR_EMAIL','ROGUE_ACTOR_NAME','ROGUE_BASE_URL',
+               'ROGUE_LOG_FILE','ROGUE_LOG_DIR','ROGUE_LOG_MAX_BYTES',
+               'ROGUE_HEARTBEAT_MIN_INTERVAL') {
     $val = [Environment]::GetEnvironmentVariable($k)
     if ($val) { $creds[$k] = $val }
 }
 
+# Logging is initialised HERE - after the credential files are parsed, so they can
+# relocate the log - but BEFORE the API-key check below, so an unconfigured
+# install still records `outcome=unconfigured`.
+Initialize-Logging $creds
+Dbg "logFile=$logFile cap=$logMaxBytes"
+
 $apiKey = $creds['ROGUE_API_KEY']
 if (-not $apiKey) {
     Dbg "no API key after cred resolution -> fail-open"
+    Log "outcome=unconfigured"
     if ($EventName -eq 'sessionStart') {
         Write-Raw '{"additional_context": "Rogue Security plugin is installed but not configured. Run /rogue:setup to connect your API key."}'
     } else {
@@ -577,6 +725,41 @@ if (-not $actorEmail) {
     if ($env:USERNAME -and $env:COMPUTERNAME) { $actorEmail = "$($env:USERNAME)@$($env:COMPUTERNAME)" }
     elseif ($env:USERNAME) { $actorEmail = $env:USERNAME }
     else { $actorEmail = $env:COMPUTERNAME }
+}
+
+# ── install identity: host + plugin version ────────────────────────────────
+# The fleet roster keys an install on host + actor + family + agent, and until
+# now only the heartbeat below ever sent those, once, at session start. A session
+# still working a day later therefore aged out as disconnected. Sending the same
+# values as headers on EVERY event lets the backend refresh this exact row from
+# ordinary hook traffic. They must match the heartbeat body's values exactly, or
+# the two writers create two rows for one install.
+#
+# Neither lookup can fail the hook: a degraded value still identifies the install
+# well enough to keep the roster fresh, and no liveness bookkeeping is worth
+# breaking a session over. Both log an error, because "unknown" in the roster is a real
+# symptom worth chasing.
+$hostName = $env:COMPUTERNAME
+if (-not $hostName) { try { $hostName = [System.Net.Dns]::GetHostName() } catch { $hostName = '' } }
+if (-not $hostName) {
+    $hostName = 'unknown'
+    Err 'hostname unresolved; reporting host=unknown to the fleet roster'
+}
+
+# Plugin version from the manifest.
+$pluginVersion = 'unknown'
+$pluginJson = Join-Path $pluginRoot '.cursor-plugin/plugin.json'
+if (Test-Path -LiteralPath $pluginJson) {
+    try {
+        $v = (Get-Content -Raw -LiteralPath $pluginJson | ConvertFrom-Json).version
+        if ($v -match '^[0-9]+\.[0-9]+\.[0-9]+') { $pluginVersion = $Matches[0] }
+        # Manifest is there but carries no semver: schema drift, not a bad install.
+        else { Err "no version in $pluginJson; reporting version=unknown to the fleet roster" }
+    } catch {
+        Err "plugin.json parse failed ($($_.Exception.Message)); reporting version=unknown"
+    }
+} else {
+    Err "plugin manifest not found at $pluginJson; reporting version=unknown"
 }
 
 # ── payload from stdin ─────────────────────────────────────────────────────
@@ -628,6 +811,9 @@ $headers = @{
     'x-rogue-actor-email' = $actorEmail
     'x-rogue-actor-name'  = $actorName
     'x-rogue-source'      = 'cursor'
+    'x-rogue-host'        = $hostName
+    'x-rogue-version'     = $pluginVersion
+    'x-rogue-agent'       = 'cursor'
 }
 # Added CONDITIONALLY, and always as a pair: a subagent's events carry the
 # parent's session id plus the child's own conversation id, a main agent's carry
@@ -646,6 +832,7 @@ Dbg "POST $url actor=$actorEmail parent=$parentDbg"
 # prompt content and can reintroduce a BOM. GetBytes() never emits a BOM.
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 $resp = ''
+$postError = ''
 try {
     $r = Invoke-WebRequest -Uri $url -Method Post `
         -Headers $headers -ContentType 'application/json' -Body $bodyBytes `
@@ -677,40 +864,75 @@ try {
         Dbg "error status: $([int]$_.Exception.Response.StatusCode)"
     }
     if ($errBody) { Dbg "error response body: $errBody" }
+    $postError = $_.Exception.Message
     $resp = ''
 }
 
+# Exactly one line per invocation, always, so a relay/decision bug is
+# diagnosable from the hook log alone without re-instrumenting the script
+# (mirrors hook.sh's `log "rc=… raw=…"`). An empty `raw=` means fail-open: either
+# the request threw (then `error=` says why) or the server answered non-200.
+$respHead = if ($resp.Length -gt 400) { $resp.Substring(0, 400) } else { $resp }
+if ($postError) { Log "raw=$(Sanitize $respHead) error=`"$(Sanitize $postError)`"" }
+else            { Log "raw=$(Sanitize $respHead)" }
+
 Emit-Json $resp
 
-# ── presence heartbeat (sessionStart only) ──────────────────────────────────
+# ── presence heartbeat (sessionStart + stop) ────────────────────────────────
 # POSTs /api/v1/hooks/status so this install shows in the dashboard's Coding
 # Agents roster (Connected / version / host / user). Pure side-effect: response
 # ignored, fully wrapped so it can never affect the already-emitted hook
 # response. Runs AFTER Emit-Json; PowerShell has no reliable fire-and-forget
-# across process exit, so this is a sync POST (10s cap) on sessionStart only.
-# Creds/actor were already resolved above.
-if ($EventName -eq 'sessionStart') {
-    try {
-        # Plugin version from the manifest.
-        $hbVer = 'unknown'
-        $hbPj = Join-Path $pluginRoot '.cursor-plugin/plugin.json'
-        if (Test-Path -LiteralPath $hbPj) {
-            try {
-                $v = (Get-Content -Raw -LiteralPath $hbPj | ConvertFrom-Json).version
-                if ($v -match '^[0-9]+\.[0-9]+\.[0-9]+') { $hbVer = $Matches[0] }
-            } catch { Dbg "plugin.json parse failed: $($_.Exception.Message)" }
-        }
-        $hbHost = $env:COMPUTERNAME
-        if (-not $hbHost) { $hbHost = 'unknown' }
+# across process exit, so this is a sync POST (10s cap). Creds/actor were already
+# resolved above.
+#
+# TWO TRIGGERS, matching hook.sh. `sessionStart` fires once per session; `stop` fires
+# once per TURN, and it exists because a session left open for days used to produce
+# exactly one beacon and one log upload for its whole lifetime - the roster row went
+# stale and the hook log sat on disk unshipped.
+#
+# There is no heartbeat.ps1 here to carry the trigger, so the throttle is applied
+# inline via scripts/beacon.ps1 - a byte-identical copy of scripts/shared/beacon.ps1,
+# the same library the other four PowerShell heartbeats load. `sessionStart` stays
+# unthrottled. THE SYNC POST IS EXACTLY WHY THE THROTTLE MATTERS MORE HERE than
+# anywhere else: on this plugin the beacon is not detached, so an unthrottled
+# per-turn beacon would add its latency to every single turn.
+$hbUnthrottled = $null
+if     ($EventName -eq 'sessionStart') { $hbUnthrottled = $true }
+elseif ($EventName -eq 'stop')         { $hbUnthrottled = $false }
+if ($null -ne $hbUnthrottled) {
+    # Loaded as a SCRIPTBLOCK from the file's text, at SCRIPT scope: dot-sourcing runs
+    # in the caller's scope, so loading it inside a function would define the library
+    # there and lose it on return. Never -File or a path dot-source - both are subject
+    # to ExecutionPolicy and to a GPO-enforced policy that Bypass cannot override.
+    #
+    # A missing or unparseable library degrades to an UNTHROTTLED beacon - today's
+    # behaviour, and the safe direction.
+    $beaconLib = Join-Path $pluginRoot 'scripts\beacon.ps1'
+    if (Test-Path -LiteralPath $beaconLib) {
+        try { . ([scriptblock]::Create((Get-Content -Raw -LiteralPath $beaconLib))) }
+        catch { Dbg "beacon library not loaded: $($_.Exception.Message)" }
+    }
+    if (-not (Get-Command Request-RogueBeaconSlot -ErrorAction SilentlyContinue)) {
+        function Initialize-RogueBeacon { param([hashtable]$Creds = @{}) }
+        function Request-RogueBeaconSlot { param([string]$Slug, [bool]$Unthrottled = $false) return $true }
+    }
+    # From the CREDENTIAL MAP, not $env: - the map is what carries the env files'
+    # resolved precedence, and ROGUE_HEARTBEAT_MIN_INTERVAL rides its process-env
+    # override list above so process env still wins.
+    Initialize-RogueBeacon $creds
 
+    try {
         # `agent` is "cursor" (not a display label): the server keys its
         # latest-version lookup (PLUGIN_REPOS) on this value, so the roster can
-        # flag outdated installs.
+        # flag outdated installs. host/version come from the shared block above
+        # so this body and the per-event headers describe the same install
+        # (same fingerprint, one row).
         $hbBody = @{
             agent_family = 'cursor'
             agent        = 'cursor'
-            version      = $hbVer
-            host         = $hbHost
+            version      = $pluginVersion
+            host         = $hostName
             actor_email  = $actorEmail
             actor_name   = $actorName
         } | ConvertTo-Json -Compress
@@ -720,14 +942,78 @@ if ($EventName -eq 'sessionStart') {
             'x-rogue-source'  = 'cursor'
         }
         $hbUrl = "$baseUrl/api/v1/hooks/status"
-        Dbg "heartbeat POST $hbUrl ver=$hbVer host=$hbHost"
+        # Request-RogueBeaconSlot writes the stamp itself, BEFORE the request -
+        # deciding and stamping are one call so a caller cannot leave the window
+        # permanently open by forgetting the second half.
+        if (Request-RogueBeaconSlot -Slug 'cursor' -Unthrottled $hbUnthrottled) {
+            Dbg "heartbeat POST $hbUrl ver=$hbVer host=$hbHost"
+            $hbBytes = [System.Text.Encoding]::UTF8.GetBytes($hbBody)
+            $r = Invoke-WebRequest -Uri $hbUrl -Method Post `
+                -Headers $hbHeaders -ContentType 'application/json' -Body $hbBytes `
+                -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            Dbg "heartbeat HTTP $($r.StatusCode)"
+            Log "heartbeat=$($r.StatusCode) ver=$hbVer"
+        } else {
+            # Logged, unlike the other plugins' silent throttle, because this is the
+            # only plugin whose beacon decision happens in the dispatcher - so the
+            # hook log is where an operator can see it at all. Matches hook.sh.
+            Dbg 'heartbeat throttled'
+            Log "heartbeat=throttled ver=$hbVer"
+        }
+        Dbg "heartbeat POST $hbUrl ver=$pluginVersion host=$hostName"
         $hbBytes = [System.Text.Encoding]::UTF8.GetBytes($hbBody)
         $r = Invoke-WebRequest -Uri $hbUrl -Method Post `
             -Headers $hbHeaders -ContentType 'application/json' -Body $hbBytes `
             -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         Dbg "heartbeat HTTP $($r.StatusCode)"
+        Log "heartbeat=$($r.StatusCode) ver=$pluginVersion"
     } catch {
         Dbg "heartbeat POST failed: $($_.Exception.Message)"
+        Log "heartbeat=fail ver=$pluginVersion error=`"$(Sanitize $_.Exception.Message)`""
+    }
+
+    # ── ship the hook log ────────────────────────────────────────────────────
+    # A SEPARATE, HIDDEN PROCESS, and here that is doing two jobs at once. As in
+    # the other PowerShell callers, in-process would let the shipper's `$script:`
+    # writes land on this dispatcher's variables and its `exit 0` end the
+    # dispatcher before it prints the relayed response. On top of that, unlike
+    # heartbeat.ps1 this file IS the synchronous dispatcher - Cursor is waiting on
+    # our stdout - so the upload must not be awaited at all. Start-Process without
+    # -Wait returns immediately.
+    #
+    # After the heartbeat, so the roster row the log attaches to exists first.
+    #
+    # Runs on BOTH triggers and deliberately OUTSIDE the beacon throttle above: a
+    # throttled beacon still means a turn happened, and the log is worth draining
+    # either way. This is the whole point of the `stop` trigger - on `sessionStart`
+    # alone, a long session's log never left the disk.
+    #
+    # Every value travels as an environment variable, so the command is a constant
+    # with nothing to escape. The actor is passed in, never re-resolved: Cursor's
+    # cascade ends at "$env:USERNAME@$env:COMPUTERNAME" where actor.sh ends at the
+    # hostname, so a second cascade would key the log's source row differently
+    # from the roster row just posted.
+    $shipScript = Join-Path $pluginRoot 'scripts\ship-logs.ps1'
+    if (Test-Path -LiteralPath $shipScript) {
+        try {
+            $env:ROGUE_ACTOR_EMAIL     = [string]$actorEmail
+            $env:ROGUE_ACTOR_NAME      = [string]$actorName
+            $env:ROGUE_SHIPPER_SCRIPT  = $shipScript
+            $env:ROGUE_SHIPPER_ROOT    = $pluginRoot
+            $env:ROGUE_SHIPPER_SLUG    = 'cursor'
+            $env:ROGUE_SHIPPER_VERSION = [string]$hbVer
+            $env:ROGUE_SHIPPER_FAMILY  = 'cursor'
+            $inner = '& ([scriptblock]::Create((Get-Content -Raw -LiteralPath $env:ROGUE_SHIPPER_SCRIPT)))' +
+                     ' $env:ROGUE_SHIPPER_ROOT $env:ROGUE_SHIPPER_SLUG' +
+                     ' $env:ROGUE_SHIPPER_VERSION $env:ROGUE_SHIPPER_FAMILY'
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+            $psExe = 'powershell'
+            try { if ((Get-Process -Id $PID).Path) { $psExe = (Get-Process -Id $PID).Path } } catch {}
+            Start-Process -FilePath $psExe `
+                -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded `
+                -WindowStyle Hidden -ErrorAction Stop | Out-Null
+            Dbg 'log shipper started'
+        } catch { Dbg "log shipper not started: $($_.Exception.Message)" }
     }
 }
 
