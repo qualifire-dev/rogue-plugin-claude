@@ -320,8 +320,10 @@ installed), then the newest **non-orphaned** copy under
 the shipper self-locates its plugin root from its own script path and reads
 `<plugin-root>/env` as the *first* file in the credential chain, so a stale tree
 supplies credentials — and while a later `~/.rogue-env` overrides the API key,
-`setup.sh` writes no `ROGUE_BASE_URL`, so a stale base URL in an orphaned tree's
-bundled `env` would win and the upload would go to the wrong host. Hence all
+`setup.sh` writes no `ROGUE_BASE_URL` of its own, so a stale base URL in an
+orphaned tree's bundled `env` would win and the upload would go to the wrong
+host. (One added to `~/.rogue-env` by hand does now survive: every writer
+merges rather than truncating, so setup and auto-update keep it.) Hence all
 three layers prefer the installed tree and skip anything carrying Claude Code's
 `.orphaned_at` marker, and the command echoes the path it chose. This is also why
 "any copy will do" is wrong even though `ship-logs.sh` is byte-identical across

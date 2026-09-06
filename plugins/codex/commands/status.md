@@ -211,10 +211,12 @@ only if that finds nothing.
 the shipper self-locates its plugin root from its own script path and reads
 `<plugin-root>/env` as the *first* file in the credential chain. A leftover tree
 from a previous install therefore supplies credentials: a later `~/.rogue-env`
-overrides the API key, but `setup.sh` writes no `ROGUE_BASE_URL`, so a stale base
-URL in that tree's bundled `env` would win and the upload would go to the wrong
-host. Codex has no equivalent of Claude Code's install registry to disambiguate
-with, so the command echoes the path it chose — check it names the plugin
+overrides the API key, but `setup.sh` writes no `ROGUE_BASE_URL` of its own, so a
+stale base URL in that tree's bundled `env` would win and the upload would go to
+the wrong host. (One added to `~/.rogue-env` by hand does now survive: every
+writer merges rather than truncating, so setup and auto-update keep it.) Codex
+has no equivalent of Claude Code's install registry to disambiguate with, so the
+command echoes the path it chose — check it names the plugin
 directory `/rogue:status` reported in Step 1, and if several copies exist, remove
 the stale ones or pass the right root explicitly. The *script* is interchangeable
 (`ship-logs.sh` is byte-identical across all five sh plugins, enforced by
