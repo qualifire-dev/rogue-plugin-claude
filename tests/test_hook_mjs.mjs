@@ -53,16 +53,21 @@ function startServer(status, body) {
   return new Promise((resolve) => {
     const seen = {};
     const server = http.createServer((req, res) => {
-      // SessionStart also spawns the DETACHED heartbeat (hook.mjs fireHeartbeat),
-      // which POSTs its own body to /api/v1/hooks/status and races the event
-      // POST. Answer it, but never let it overwrite what the event POST recorded,
-      // or a SessionStart assertion reads the heartbeat's body instead.
-      const isHeartbeat = (req.url || "").endsWith("/hooks/status");
-      if (!isHeartbeat) seen.headers = req.headers;
+      // SessionStart and AfterAgent also spawn the DETACHED heartbeat (hook.mjs
+      // fireHeartbeat), which POSTs to /api/v1/hooks/status and, riding along
+      // inside it, the log shipper, which POSTs to /api/v1/hooks/logs. Both race
+      // the event POST on this same server. Answer them, but record ONLY the
+      // event endpoint, or an assertion reads a side channel's body instead.
+      //
+      // A whitelist, not a list of the side channels to skip: excluding
+      // /hooks/status alone left the shipper recording over the event, which is
+      // a byte-identity failure that only shows up under load.
+      const isEvent = (req.url || "").endsWith("/hooks/gemini");
+      if (isEvent) seen.headers = req.headers;
       const chunks = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
-        if (!isHeartbeat) {
+        if (isEvent) {
           seen.raw = Buffer.concat(chunks);
           seen.body = seen.raw.toString("utf8");
         }
@@ -292,12 +297,16 @@ test("SessionEnd → POSTs with x-rogue-event SessionEnd", async () => {
 });
 
 // ── Subagent attribution (x-rogue-agent-id) ─────────────────────────────────
-// The dispatcher resolves the running delegation as (subagent files present)
+// The dispatcher resolves the reporting delegation as (subagent files present)
 // minus (delegations the parent transcript records as finished), and sends the
-// single remaining session UUID as x-rogue-agent-id. These fixtures are literal
-// transcript records copied in shape from a real Gemini 0.55.1 session; NO
-// timestamp, mtime or ordering is manipulated anywhere, because the rule reads
-// none.
+// single remaining session UUID as x-rogue-agent-id on `AfterTool invoke_agent`
+// alone. These fixtures are literal transcript records copied in shape from a
+// real Gemini session; NO timestamp, mtime or ordering is manipulated anywhere,
+// because the rule reads none.
+//
+// The event restriction is the load-bearing correctness property here, so it is
+// asserted from both sides: the delegation report gets the id, and every
+// ordinary tool event gets nothing however live the delegation looks.
 
 const SESSION_ID = "d0fc529c-7537-40db-8302-ae175ef23655";
 const SUB_A = "f2401533-ab7c-4e7c-9a75-603c29d9e9c6";
@@ -397,17 +406,43 @@ function toolPayload(transcript, toolName) {
   });
 }
 
-test("one live delegation → sends its UUID as x-rogue-agent-id", async () => {
+test("the delegation report carries the live subagent's UUID", async () => {
   const { root, transcript } = makeChats([], [[SUB_A, PROMPT_A]]);
   try {
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
       SUB_A,
+      "AfterTool invoke_agent IS the delegation's own completion",
     );
-    assert.equal(
-      await agentIdFor("BeforeTool", toolPayload(transcript, "run_shell_command")),
-      SUB_A,
-    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("no ordinary tool event is tagged, however live the delegation looks", async () => {
+  // The live set says which delegations are unfinished, NOT who fired the event.
+  // The main agent keeps running tools inside that window: invoke_agent is
+  // parallelizable, so a batch of [invoke_agent, run_shell_command] runs the
+  // shell alongside it, and the parent's completion record — the only "finished"
+  // marker — is written once per model response, after the whole scheduler run,
+  // so every later batch in that response sees the delegation live too. Tagging
+  // any of those events attributes a MAIN-agent tool call to the subagent.
+  const { root, transcript } = makeChats([], [[SUB_A, PROMPT_A]]);
+  try {
+    for (const tool of ["run_shell_command", "read_file", "replace", "invoke_agent"]) {
+      assert.equal(
+        await agentIdFor("BeforeTool", toolPayload(transcript, tool)),
+        undefined,
+        `BeforeTool ${tool}`,
+      );
+    }
+    for (const tool of ["run_shell_command", "read_file", "replace"]) {
+      assert.equal(
+        await agentIdFor("AfterTool", toolPayload(transcript, tool)),
+        undefined,
+        `AfterTool ${tool}`,
+      );
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -423,7 +458,7 @@ test("two live delegations → no header (concurrency is unattributable)", async
   );
   try {
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
       undefined,
     );
   } finally {
@@ -438,7 +473,7 @@ test("delegation recorded in the parent (agentId) → finished, no header", asyn
   );
   try {
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
       undefined,
     );
   } finally {
@@ -456,7 +491,29 @@ test("finished delegation + one live one → only the live UUID", async () => {
   );
   try {
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
+      SUB_B,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rerunning a completed delegation's prompt keeps the rerun's own id", async () => {
+  // SUB_A finished normally, so its record carries an agentId and the substring
+  // test alone resolves it. SUB_B is a live rerun of the SAME prompt. Collecting
+  // prompts from records that already have an agentId would let SUB_A's record
+  // mark SUB_B finished and drop the header for a delegation that is running.
+  const { root, transcript } = makeChats(
+    [completionRecord(PROMPT_A, SUB_A)],
+    [
+      [SUB_A, PROMPT_A],
+      [SUB_B, PROMPT_A],
+    ],
+  );
+  try {
+    assert.equal(
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
       SUB_B,
     );
   } finally {
@@ -467,14 +524,14 @@ test("finished delegation + one live one → only the live UUID", async () => {
 test("abnormal termination (record without agentId) → prompt marks it finished", async () => {
   // The delegation is recorded but carries no agentId (errored / cancelled /
   // max-turns). Without the args.prompt fallback it would look live forever and
-  // mis-tag every later main-agent tool call.
+  // suppress every later delegation's report.
   const { root, transcript } = makeChats(
     [completionRecord(PROMPT_A, null)],
     [[SUB_A, PROMPT_A]],
   );
   try {
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
       undefined,
     );
   } finally {
@@ -486,7 +543,7 @@ test("no subagent directory → no header", async () => {
   const { root, transcript } = makeChats([], [], { noSubDir: true });
   try {
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
       undefined,
     );
   } finally {
@@ -499,10 +556,7 @@ test("parent transcript missing or oversized → no header", async () => {
   try {
     fs.rmSync(missing.transcript);
     assert.equal(
-      await agentIdFor(
-        "AfterTool",
-        toolPayload(missing.transcript, "run_shell_command"),
-      ),
+      await agentIdFor("AfterTool", toolPayload(missing.transcript, "invoke_agent")),
       undefined,
       "unreadable parent → finished is uncomputable → no header",
     );
@@ -515,31 +569,11 @@ test("parent transcript missing or oversized → no header", async () => {
     // Sparse grow past the 32 MB cap; only statSync().size is consulted.
     fs.truncateSync(big.transcript, 32 * 1024 * 1024 + 1);
     assert.equal(
-      await agentIdFor("AfterTool", toolPayload(big.transcript, "run_shell_command")),
+      await agentIdFor("AfterTool", toolPayload(big.transcript, "invoke_agent")),
       undefined,
     );
   } finally {
     fs.rmSync(big.root, { recursive: true, force: true });
-  }
-});
-
-test("invoke_agent: BeforeTool sends no header, AfterTool sends the id", async () => {
-  // BeforeTool invoke_agent is the MAIN agent's delegation request, and in a
-  // parallel batch the first delegation's file already exists when the second's
-  // BeforeTool fires — tagging it would attribute agent 1's id to agent 2.
-  const { root, transcript } = makeChats([], [[SUB_A, PROMPT_A]]);
-  try {
-    assert.equal(
-      await agentIdFor("BeforeTool", toolPayload(transcript, "invoke_agent")),
-      undefined,
-    );
-    assert.equal(
-      await agentIdFor("AfterTool", toolPayload(transcript, "invoke_agent")),
-      SUB_A,
-      "the delegation report IS the subagent's own output",
-    );
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -561,9 +595,12 @@ test("non-tool events never carry the tag", async () => {
 
 test("malformed / minimal payloads resolve to no header, never a failed POST", async () => {
   assert.equal(await agentIdFor("AfterTool", "not json at all"), undefined);
-  assert.equal(await agentIdFor("AfterTool", '{"tool_name":"x"}'), undefined);
+  assert.equal(await agentIdFor("AfterTool", '{"tool_name":"invoke_agent"}'), undefined);
   assert.equal(
-    await agentIdFor("AfterTool", '{"session_id":123,"transcript_path":null}'),
+    await agentIdFor(
+      "AfterTool",
+      '{"tool_name":"invoke_agent","session_id":123,"transcript_path":null}',
+    ),
     undefined,
   );
 });
@@ -576,8 +613,8 @@ test("body stays byte-identical even when a header is added", async () => {
     {
       session_id: SESSION_ID,
       transcript_path: transcript,
-      tool_name: "run_shell_command",
-      tool_input: { command: "echo 'héllo — 世界' # \\u0041" },
+      tool_name: "invoke_agent",
+      tool_input: { agent_name: "cli_help", prompt: "héllo — 世界 # \\u0041" },
     },
     null,
     2,

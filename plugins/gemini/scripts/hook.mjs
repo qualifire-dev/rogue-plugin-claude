@@ -200,11 +200,17 @@ function describeOutcome(bodyText) {
 
 // ── Subagent attribution (x-rogue-agent-id) ─────────────────────────────────
 //
-// A Gemini subagent's OWN hook events are shape-identical to the main agent's:
-// createBaseInput emits only session_id / transcript_path / cwd /
-// hook_event_name / timestamp, and nothing in the payload names the delegation
-// that is running. But Gemini's own transcript records do, and the rule is a
-// BOOKKEEPING one rather than a timing one:
+// A Gemini subagent's OWN hook events are shape-identical to the main agent's,
+// and worse, they are shape-IDENTICAL in their identifying fields too:
+// LocalAgentExecutor.executionContext (:347508-347510) hands the subagent the
+// PARENT's Config and geminiClient and changes only promptId, so createBaseInput
+// (:362493-362495) reads `session_id` off the parent's Config and
+// `transcript_path` off the parent's recording service. A subagent's BeforeTool
+// and the main agent's BeforeTool are byte-comparable. Nothing in the payload
+// separates them, and nothing derived from it can.
+//
+// What the transcripts DO record is which delegations exist, on a bookkeeping
+// rule rather than a timing one:
 //
 //   a delegation appears in the subagent directory when it STARTS,
 //   and in the parent transcript when it ENDS,
@@ -220,50 +226,59 @@ function describeOutcome(bodyText) {
 // timestamps. The answer is the same however long a hook takes and whatever the
 // filesystem does with timestamp resolution.
 //
-// Bundle citations (Gemini CLI 0.55.1, @google/gemini-cli chunk-TBDX7VEE.js):
-//   :285510-285531  ChatRecordingService.initialize — a subagent's transcript is
+// THAT SET IS NOT WHO FIRED THE EVENT. It is only which delegations are
+// unfinished, and the main agent keeps running tools inside that window:
+//
+//   1. invoke_agent is parallelizable (_isParallelizable, :346515-346525,
+//      returns false only for edit tools, update_topic and an explicit
+//      wait_for_previous: true), and the scheduler dequeues a maximal run of
+//      parallelizable calls and executes them together (:346493). A batch of
+//      [invoke_agent, run_shell_command] runs the shell concurrently with the
+//      delegation, and the shell's AfterTool fires while the delegation is live.
+//   2. The parent's completion record — the ONLY "finished" marker — is written
+//      once per MODEL RESPONSE, after the whole scheduler run resolves
+//      (:387589 then :387623), not once per batch. A response whose calls split
+//      into several batches (any edit tool forces a split) leaves the delegation
+//      "live" for every later batch in that response, BeforeTool included.
+//
+// So `live.length === 1` is not evidence that this event came from inside that
+// subagent, and tagging an ordinary tool event on it hands a main-agent
+// run_shell_command or replace the subagent's UUID. A wrong id is worse than a
+// missing one — it is a false attribution in an audit trail — so ordinary tool
+// events carry no tag at all. Recovering per-tool attribution needs a signal
+// upstream does not currently emit; it cannot be inferred here.
+//
+// Bundle citations (Gemini CLI 0.58.0, @google/gemini-cli chunk-MFLFXOVQ.js):
+//   :285586-285603  ChatRecordingService.initialize — a subagent's transcript is
 //                   `<chats>/<sanitizeFilenamePart(parentSessionId)>/<sessionId>.jsonl`,
 //                   while the main session file sits directly in `<chats>/`.
-//   :253978-253980  sanitizeFilenamePart = part.replace(/[^a-zA-Z0-9_-]/g, "_").
-//   :331296         recordCompletedToolCalls stamps `agentId` (the subagent's
-//                   session UUID, i.e. its filename) on the parent's completed
-//                   invoke_agent record. That record is the "finished" marker.
-//
-// THE ONE ASSUMPTION: the parent's completion record must land BEFORE the main
-// agent's next tool hook. It does structurally, not by timing margin —
-// recordCompletedToolCalls is documented (:331283-331284) as running "before
-// sending responses to Gemini" and its caller (:347827) invokes it as soon as
-// scheduleAgentTools resolves, so the model roundtrip that produces the next
-// tool call cannot precede it. If upstream ever reordered that, a finished
-// delegation would stay "live" and a MAIN-agent tool row would be tagged with a
-// subagent's UUID. That is the only route in this design to a WRONG id; every
-// other failure yields no header at all. A main-agent row carrying a subagent
-// UUID is the signature to look for after a Gemini version bump.
-//
-// The same ordering is what makes the delegation report itself work: the
-// AfterTool invoke_agent hook fires before the completion record is written, so
-// the finishing delegation is still "live" and its report row gets the id.
-
-// Cost guards. A session that never delegates pays one ENOENT and stops.
+//   :347622         the subagent's sessionId IS its agentId (randomUUID), so the
+//                   filename is a real per-instance id, not a slug two runs share.
+//   :331632         recordCompletedToolCalls stamps `agentId` on the parent's
+//                   completed invoke_agent record. That record is "finished".
+//   :340820-340824  the AfterTool payload carries only llmContent/returnDisplay/
+//                   error — the tool response's `data.agentId` (:348714) is NOT
+//                   relayed, which is why the id is resolved from disk at all.
 const PARENT_MAX_BYTES = 32 * 1024 * 1024; // over this, send no header
 const CANDIDATE_HEAD_BYTES = 64 * 1024; // enough for a subagent's first record
 
-// Which events may carry the tag. Only a tool event can be fired BY a subagent.
-// BeforeAgent/AfterAgent/BeforeModel/SessionStart/... are never a subagent's,
-// and BeforeAgent carries the developer's prompt, where a wrong tag is worst.
+// The one event the live set can legitimately name: `AfterTool invoke_agent`,
+// the delegation's own completion. It is a delegation event by its tool_name, so
+// no main-agent tool call can wear the tag, and the id it takes is the id of a
+// delegation that is by construction unfinished at that moment — its own.
 //
-// `BeforeTool invoke_agent` (the main agent's delegation REQUEST) is excluded as
-// a CORRECTNESS GUARD, not merely for semantics: in a parallel batch of two
-// invoke_agent calls the first delegation's file already exists when the
-// second's BeforeTool fires, so the rule would hand the FIRST agent's id to the
-// SECOND agent's request. Suppressing the event removes the case entirely.
-// (Delegations are parallelizable: _isParallelizable, :346148, returns false
-// only for edit tools, update_topic, and an explicit wait_for_previous: true.)
-// `AfterTool invoke_agent` is included — that one IS the subagent's own report.
+// The two-delegation case resolves conservatively rather than wrongly: a
+// parallel batch of two invoke_agent calls leaves both live when either report
+// fires, so `live.length !== 1` sends nothing rather than handing agent 1's id
+// to agent 2's report.
+//
+// Every other event is excluded. Non-tool events (BeforeAgent, AfterAgent,
+// BeforeModel, SessionStart, …) are never a subagent's, and BeforeAgent carries
+// the developer's prompt, where a wrong tag is worst. Ordinary tool events are
+// excluded because the live set does not identify who fired them — see the
+// window analysis above.
 function isAgentTaggableEvent(parsed) {
-  if (EVENT === "AfterTool") return true;
-  if (EVENT === "BeforeTool") return parsed.tool_name !== "invoke_agent";
-  return false;
+  return EVENT === "AfterTool" && parsed.tool_name === "invoke_agent";
 }
 
 // Read a file as UTF-8, or null if it is missing, unreadable or over `maxBytes`.
@@ -279,6 +294,14 @@ function readCapped(file, maxBytes) {
 // The delegated prompts recorded in the parent, JSON-escaped for a raw-text
 // substring test against a subagent file (see hasDelegatedPrompt). Only lines
 // mentioning invoke_agent are parsed; the rest of the transcript is never JSON.
+//
+// ONLY records that lack an agentId contribute. A record that has one is already
+// matched by the substring test on the id itself, so collecting its prompt adds
+// no delegation to `finished` — it only widens what the prompt test matches, and
+// a prompt is not unique to a delegation. Rerun the same prompt and the OLD
+// completed record would mark the NEW live delegation finished, dropping the
+// attribution of a delegation that is plainly running. A prompt collected here
+// is instead the only trace an errored / cancelled / max-turns delegation left.
 function delegatedPrompts(parentText) {
   const out = [];
   for (const line of parentText.split("\n")) {
@@ -290,8 +313,10 @@ function delegatedPrompts(parentText) {
       continue;
     }
     for (const call of record?.toolCalls ?? []) {
+      if (call?.name !== "invoke_agent") continue;
+      if (typeof call?.agentId === "string" && call.agentId) continue;
       const prompt = call?.args?.prompt;
-      if (call?.name === "invoke_agent" && typeof prompt === "string" && prompt) {
+      if (typeof prompt === "string" && prompt) {
         out.push(JSON.stringify(prompt).slice(1, -1));
       }
     }
@@ -302,7 +327,7 @@ function delegatedPrompts(parentText) {
 // Fallback "finished" key for a delegation that ended WITHOUT an agentId: that
 // value is read out of the tool RESPONSE, so an errored / cancelled / max-turns
 // agent can be recorded without one, and it would otherwise stay "live" for the
-// rest of the session and mis-tag every later main-agent tool call. `args` comes
+// rest of the session and suppress every later delegation's report. `args` comes
 // from the REQUEST and is always there, and the subagent's first `user` record
 // embeds the delegated prompt verbatim inside its context preamble.
 //
@@ -310,6 +335,12 @@ function delegatedPrompts(parentText) {
 // truncated head is needed and a multi-line prompt still matches. An unreadable
 // head returns false, i.e. the candidate stays live and the usual
 // unique-or-nothing guard applies.
+//
+// A prompt is not an identifier, so this cannot prove WHICH delegation it
+// finished: rerun a prompt whose earlier delegation ended without an agentId and
+// the live rerun matches it too. That direction is deliberate — it costs the
+// rerun its header, where the opposite default would leave a dead delegation
+// live and hand ITS id to the rerun's report.
 function hasDelegatedPrompt(file, escapedPrompts) {
   if (escapedPrompts.length === 0) return false;
   let head = "";
@@ -328,9 +359,13 @@ function hasDelegatedPrompt(file, escapedPrompts) {
   return escapedPrompts.some((p) => head.includes(p));
 }
 
-// Returns the running delegation's session UUID, or undefined. NEVER throws:
+// Returns the reporting delegation's session UUID, or undefined. NEVER throws:
 // every failure path is "no header", because a wrong agent id is worse than a
 // missing one and a throw here would cost the POST itself.
+//
+// Only reached for `AfterTool invoke_agent` — the delegation's own completion,
+// which fires before the parent's record of it is written, so the delegation
+// that is reporting is still one of the unfinished ones. See isAgentTaggableEvent.
 function resolveSubagentId(parsed) {
   try {
     if (!parsed || typeof parsed !== "object") return undefined;
@@ -341,7 +376,7 @@ function resolveSubagentId(parsed) {
     if (typeof transcript !== "string" || !transcript) return undefined;
     if (typeof session !== "string" || !session) return undefined;
 
-    // Upstream's own sanitizer (:253978-253980); it also makes the joined path
+    // Upstream's own sanitizer (:254005-254007); it also makes the joined path
     // traversal-proof, since "/" and "." both become "_".
     const dir = path.join(
       path.dirname(transcript),
@@ -372,8 +407,9 @@ function resolveSubagentId(parsed) {
       (id) => !hasDelegatedPrompt(path.join(dir, `${id}.jsonl`), prompts),
     );
 
-    // Zero → a main-agent event. Two or more → concurrent delegations, which the
-    // rule cannot separate. Both send nothing.
+    // Zero → the reporting delegation was already resolved by the prompt
+    // fallback. Two or more → a parallel batch of delegations, which the rule
+    // cannot separate. Both send nothing.
     if (live.length !== 1) return undefined;
     // The id is a filename, i.e. arbitrary bytes from disk. An invalid header
     // value makes fetch THROW, which would fail-open the whole POST — far worse
