@@ -202,6 +202,14 @@ jobs:
           SH=dash sh tests/test_hook_logs.sh
           SH=bash bash tests/test_hook_logs.sh
 
+      - name: Gemini dispatcher contract (node)
+        # The only suite that exercises hook.mjs end to end against a real server,
+        # and until now the only dispatcher suite CI never ran — the file existed
+        # and nothing invoked it. It carries the subagent-attribution rules, whose
+        # failure mode is a WRONG x-rogue-agent-id on a main-agent tool row: a
+        # false attribution in an audit trail, which no other gate can see.
+        run: node --test tests/test_hook_mjs.mjs
+
       - name: Log-shipper contract (sh)
         # The shipper is a byte-offset state machine over a file another process is
         # appending to and rotating underneath it, so its failure modes are silent by

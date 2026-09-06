@@ -7,6 +7,11 @@
 //   decision shapes ({"decision":"deny"|"block", "reason":...} / toolConfig), so
 //   this dispatcher is a PURE RELAY — Gemini renders the block itself.
 //
+// The POSTed body is BYTE-FOR-BYTE the bytes read from stdin. The dispatcher
+// does parse those bytes (into a local, for subagent attribution — see
+// resolveSubagentId), but the parse result never reaches the request: everything
+// it derives travels as a HEADER. Never re-serialize the payload into `body`.
+//
 // One cross-platform script replaces the sh + PowerShell dual-dispatcher used by
 // the Claude/Codex/Cursor plugins: Gemini CLI guarantees Node 20+ on PATH (every
 // install method requires it; Homebrew declares `node` as a dependency), so we
@@ -193,6 +198,230 @@ function describeOutcome(bodyText) {
   return "outcome=allow";
 }
 
+// ── Subagent attribution (x-rogue-agent-id) ─────────────────────────────────
+//
+// A Gemini subagent's OWN hook events are shape-identical to the main agent's,
+// and worse, they are shape-IDENTICAL in their identifying fields too:
+// LocalAgentExecutor.executionContext (:347508-347510) hands the subagent the
+// PARENT's Config and geminiClient and changes only promptId, so createBaseInput
+// (:362493-362495) reads `session_id` off the parent's Config and
+// `transcript_path` off the parent's recording service. A subagent's BeforeTool
+// and the main agent's BeforeTool are byte-comparable. Nothing in the payload
+// separates them, and nothing derived from it can.
+//
+// What the transcripts DO record is which delegations exist, on a bookkeeping
+// rule rather than a timing one:
+//
+//   a delegation appears in the subagent directory when it STARTS,
+//   and in the parent transcript when it ENDS,
+//   so (started minus finished) is what is running right now.
+//
+//   dir      = dirname(transcript_path) / sanitize(session_id)
+//   started  = the .jsonl basenames in dir   (each IS a subagent session UUID)
+//   finished = those recorded in the parent transcript
+//   agentId  = the single remaining one, or nothing
+//
+// Both sides are append-only records upstream writes for its own reasons, so
+// NO timestamp of any kind is read or compared: not file mtimes, not record
+// timestamps. The answer is the same however long a hook takes and whatever the
+// filesystem does with timestamp resolution.
+//
+// THAT SET IS NOT WHO FIRED THE EVENT. It is only which delegations are
+// unfinished, and the main agent keeps running tools inside that window:
+//
+//   1. invoke_agent is parallelizable (_isParallelizable, :346515-346525,
+//      returns false only for edit tools, update_topic and an explicit
+//      wait_for_previous: true), and the scheduler dequeues a maximal run of
+//      parallelizable calls and executes them together (:346493). A batch of
+//      [invoke_agent, run_shell_command] runs the shell concurrently with the
+//      delegation, and the shell's AfterTool fires while the delegation is live.
+//   2. The parent's completion record — the ONLY "finished" marker — is written
+//      once per MODEL RESPONSE, after the whole scheduler run resolves
+//      (:387589 then :387623), not once per batch. A response whose calls split
+//      into several batches (any edit tool forces a split) leaves the delegation
+//      "live" for every later batch in that response, BeforeTool included.
+//
+// So `live.length === 1` is not evidence that this event came from inside that
+// subagent, and tagging an ordinary tool event on it hands a main-agent
+// run_shell_command or replace the subagent's UUID. A wrong id is worse than a
+// missing one — it is a false attribution in an audit trail — so ordinary tool
+// events carry no tag at all. Recovering per-tool attribution needs a signal
+// upstream does not currently emit; it cannot be inferred here.
+//
+// Bundle citations (Gemini CLI 0.58.0, @google/gemini-cli chunk-MFLFXOVQ.js):
+//   :285586-285603  ChatRecordingService.initialize — a subagent's transcript is
+//                   `<chats>/<sanitizeFilenamePart(parentSessionId)>/<sessionId>.jsonl`,
+//                   while the main session file sits directly in `<chats>/`.
+//   :347622         the subagent's sessionId IS its agentId (randomUUID), so the
+//                   filename is a real per-instance id, not a slug two runs share.
+//   :331632         recordCompletedToolCalls stamps `agentId` on the parent's
+//                   completed invoke_agent record. That record is "finished".
+//   :340820-340824  the AfterTool payload carries only llmContent/returnDisplay/
+//                   error — the tool response's `data.agentId` (:348714) is NOT
+//                   relayed, which is why the id is resolved from disk at all.
+const PARENT_MAX_BYTES = 32 * 1024 * 1024; // over this, send no header
+const CANDIDATE_HEAD_BYTES = 64 * 1024; // enough for a subagent's first record
+
+// The one event the live set can legitimately name: `AfterTool invoke_agent`,
+// the delegation's own completion. It is a delegation event by its tool_name, so
+// no main-agent tool call can wear the tag, and the id it takes is the id of a
+// delegation that is by construction unfinished at that moment — its own.
+//
+// The two-delegation case resolves conservatively rather than wrongly: a
+// parallel batch of two invoke_agent calls leaves both live when either report
+// fires, so `live.length !== 1` sends nothing rather than handing agent 1's id
+// to agent 2's report.
+//
+// Every other event is excluded. Non-tool events (BeforeAgent, AfterAgent,
+// BeforeModel, SessionStart, …) are never a subagent's, and BeforeAgent carries
+// the developer's prompt, where a wrong tag is worst. Ordinary tool events are
+// excluded because the live set does not identify who fired them — see the
+// window analysis above.
+function isAgentTaggableEvent(parsed) {
+  return EVENT === "AfterTool" && parsed.tool_name === "invoke_agent";
+}
+
+// Read a file as UTF-8, or null if it is missing, unreadable or over `maxBytes`.
+function readCapped(file, maxBytes) {
+  try {
+    if (fs.statSync(file).size > maxBytes) return null;
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// The delegated prompts recorded in the parent, JSON-escaped for a raw-text
+// substring test against a subagent file (see hasDelegatedPrompt). Only lines
+// mentioning invoke_agent are parsed; the rest of the transcript is never JSON.
+//
+// ONLY records that lack an agentId contribute. A record that has one is already
+// matched by the substring test on the id itself, so collecting its prompt adds
+// no delegation to `finished` — it only widens what the prompt test matches, and
+// a prompt is not unique to a delegation. Rerun the same prompt and the OLD
+// completed record would mark the NEW live delegation finished, dropping the
+// attribution of a delegation that is plainly running. A prompt collected here
+// is instead the only trace an errored / cancelled / max-turns delegation left.
+function delegatedPrompts(parentText) {
+  const out = [];
+  for (const line of parentText.split("\n")) {
+    if (!line.includes("invoke_agent")) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const call of record?.toolCalls ?? []) {
+      if (call?.name !== "invoke_agent") continue;
+      if (typeof call?.agentId === "string" && call.agentId) continue;
+      const prompt = call?.args?.prompt;
+      if (typeof prompt === "string" && prompt) {
+        out.push(JSON.stringify(prompt).slice(1, -1));
+      }
+    }
+  }
+  return out;
+}
+
+// Fallback "finished" key for a delegation that ended WITHOUT an agentId: that
+// value is read out of the tool RESPONSE, so an errored / cancelled / max-turns
+// agent can be recorded without one, and it would otherwise stay "live" for the
+// rest of the session and suppress every later delegation's report. `args` comes
+// from the REQUEST and is always there, and the subagent's first `user` record
+// embeds the delegated prompt verbatim inside its context preamble.
+//
+// Compared JSON-escaped against the raw head, so no parse of a possibly
+// truncated head is needed and a multi-line prompt still matches. An unreadable
+// head returns false, i.e. the candidate stays live and the usual
+// unique-or-nothing guard applies.
+//
+// A prompt is not an identifier, so this cannot prove WHICH delegation it
+// finished: rerun a prompt whose earlier delegation ended without an agentId and
+// the live rerun matches it too. That direction is deliberate — it costs the
+// rerun its header, where the opposite default would leave a dead delegation
+// live and hand ITS id to the rerun's report.
+function hasDelegatedPrompt(file, escapedPrompts) {
+  if (escapedPrompts.length === 0) return false;
+  let head = "";
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(CANDIDATE_HEAD_BYTES);
+      const n = fs.readSync(fd, buf, 0, CANDIDATE_HEAD_BYTES, 0);
+      head = buf.subarray(0, n).toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  return escapedPrompts.some((p) => head.includes(p));
+}
+
+// Returns the reporting delegation's session UUID, or undefined. NEVER throws:
+// every failure path is "no header", because a wrong agent id is worse than a
+// missing one and a throw here would cost the POST itself.
+//
+// Only reached for `AfterTool invoke_agent` — the delegation's own completion,
+// which fires before the parent's record of it is written, so the delegation
+// that is reporting is still one of the unfinished ones. See isAgentTaggableEvent.
+function resolveSubagentId(parsed) {
+  try {
+    if (!parsed || typeof parsed !== "object") return undefined;
+    if (!isAgentTaggableEvent(parsed)) return undefined;
+
+    const transcript = parsed.transcript_path;
+    const session = parsed.session_id;
+    if (typeof transcript !== "string" || !transcript) return undefined;
+    if (typeof session !== "string" || !session) return undefined;
+
+    // Upstream's own sanitizer (:254005-254007); it also makes the joined path
+    // traversal-proof, since "/" and "." both become "_".
+    const dir = path.join(
+      path.dirname(transcript),
+      session.replace(/[^a-zA-Z0-9_-]/g, "_"),
+    );
+    // No delegation in this session → ENOENT → no header, the common case.
+    const started = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => f.slice(0, -".jsonl".length));
+    if (started.length === 0) return undefined;
+
+    // Unreadable / absent (recording disabled, conversationFile nulled after
+    // ENOSPC) or oversized: `finished` is uncomputable and every candidate would
+    // look live, so send nothing.
+    const parent = readCapped(transcript, PARENT_MAX_BYTES);
+    if (parent === null) return undefined;
+
+    // A subagent UUID appears in the parent on exactly one line, its completion
+    // record, so the primary key is a plain substring test that needs no JSON
+    // parsing at all. Everything recorded → nothing is running.
+    const unresolved = started.filter((id) => !parent.includes(id));
+    if (unresolved.length === 0) return undefined;
+
+    // Only what the substring test missed pays for the prompt fallback.
+    const prompts = delegatedPrompts(parent);
+    const live = unresolved.filter(
+      (id) => !hasDelegatedPrompt(path.join(dir, `${id}.jsonl`), prompts),
+    );
+
+    // Zero → the reporting delegation was already resolved by the prompt
+    // fallback. Two or more → a parallel batch of delegations, which the rule
+    // cannot separate. Both send nothing.
+    if (live.length !== 1) return undefined;
+    // The id is a filename, i.e. arbitrary bytes from disk. An invalid header
+    // value makes fetch THROW, which would fail-open the whole POST — far worse
+    // than no attribution. It must look like the vendor UUID it is, and the
+    // backend rejects (never truncates) an id over 64 chars.
+    const id = live[0];
+    return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Read all of stdin ────────────────────────────────────────────────────────
 function readStdin() {
   return new Promise((resolve) => {
@@ -266,6 +495,17 @@ async function main() {
   // the fleet roster, which is worth seeing in the hook log.
   if (install.error) log(`error=install-id ${install.error}`);
 
+  // Inspect the relayed bytes in a LOCAL. The parse result is only ever read
+  // from — `body: payload` below stays the exact bytes Gemini piped in.
+  let parsed = null;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    parsed = null;
+  }
+  const agentId = resolveSubagentId(parsed);
+  const agentLog = `agent=${agentId || "none"}`;
+
   let bodyText = "{}";
   try {
     const resp = await fetch(url, {
@@ -279,6 +519,11 @@ async function main() {
         "x-rogue-host": install.host,
         "x-rogue-version": install.version,
         "x-rogue-agent": install.agent,
+        // Only the id. The agent NAME is already inside the relayed bytes on the
+        // one event that has one (AfterTool invoke_agent's tool_input.agent_name)
+        // and the backend reads it from there, so a name header would duplicate a
+        // field for zero information.
+        ...(agentId ? { "x-rogue-agent-id": agentId } : {}),
       },
       body: payload,
       signal: AbortSignal.timeout(15000),
@@ -293,13 +538,13 @@ async function main() {
           bodyText = "{}";
         }
       }
-      log(`http=${resp.status} ${describeOutcome(bodyText)}`);
+      log(`http=${resp.status} ${agentLog} ${describeOutcome(bodyText)}`);
     } else {
-      log(`http=${resp.status} outcome=fail-open`);
+      log(`http=${resp.status} ${agentLog} outcome=fail-open`);
       bodyText = "{}";
     }
   } catch (e) {
-    log(`error="${sanitize(e && e.message)}" outcome=fail-open`);
+    log(`error="${sanitize(e && e.message)}" ${agentLog} outcome=fail-open`);
     bodyText = "{}";
   }
 
