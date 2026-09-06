@@ -307,6 +307,7 @@ jobs:
           set -euo pipefail
           pwsh -NoProfile -File tests/test_hook_ps1.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_copilot.ps1
+          pwsh -NoProfile -File tests/test_hook_ps1_cursor.ps1
           pwsh -NoProfile -File tests/test_hook_ps1_antigravity.ps1
           pwsh -NoProfile -File tests/test_hook_logs.ps1
           pwsh -NoProfile -File tests/test_ship_logs.ps1
